@@ -1084,6 +1084,11 @@ function Builder:WaitForMode2Gate(p)
 end
 
 function Builder:CollectForPlatoon(platoon)
+    -- Ensure a platoon exists; create one if missing (sustain mode safety)
+    if (not platoon) or (not (self.brain and self.brain.PlatoonExists and self.brain:PlatoonExists(platoon))) then
+        local name = self.attackName or (self.tag .. '_Attack_' .. tostring((self.wave or 1)))
+        platoon = self.brain:MakePlatoon(name, '')
+    end
     if not platoon or not self.wanted then return end
 
     -- Count what we already have in the platoon by blueprint id
@@ -1132,6 +1137,7 @@ function Builder:CollectForPlatoon(platoon)
             end
         end
     end
+    return platoon
 end
 
 function Builder:Mode3Loop(p)
@@ -1140,7 +1146,7 @@ function Builder:Mode3Loop(p)
         local exists = p and self.brain:PlatoonExists(p)
         if exists then
             -- try a quick collect to scoop any fresh roll-offs/rally units
-            self:CollectForPlatoon(p)
+            p = self:CollectForPlatoon(p)
         end
 
         local haveTbl = exists and countCompleteByBp(p:GetPlatoonUnits() or {}) or {}
@@ -1164,7 +1170,7 @@ function Builder:Mode3Loop(p)
                 needTotal = deficitTotal(needTbl)
                 if needTotal <= 0 then break end
                 self:QueueNeededBuilds(haveTbl)
-                self:CollectForPlatoon(p)
+                p = self:CollectForPlatoon(p)
                 WaitSeconds(0.5)
             end
             -- wait at rally
@@ -1199,13 +1205,13 @@ function Builder:Mode3Loop(p)
                     self:RequestLease()
                 end
                 self:QueueNeededBuilds(haveTbl)
-                self:CollectForPlatoon(p)
+                p = self:CollectForPlatoon(p)
                 if not self.holdBuild then
                     if not self.leaseId then
                         self:RequestLease()
                     end
                     self:QueueNeededBuilds(haveTbl)
-                    self:CollectForPlatoon(p)
+                    p = self:CollectForPlatoon(p)
                 else
                     -- ensure we're not accidentally building while held
                     if self.leaseId then
