@@ -1,4 +1,4 @@
--- /maps/faf_coop_U01.v0001/manager_UnitBuilder.lua
+-- Created by Ruanuku/Cavthena
 -- AI Unit Build Manager (rally-only, wave + sustain modes)
 --
 -- What it does

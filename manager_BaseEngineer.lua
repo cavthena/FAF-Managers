@@ -1,108 +1,52 @@
---[[
-manager_BaseEngineer.lua  — consolidated header (updated 2025-09-19)
-
-Summary
-  Base Engineer Manager that:
-    • Owns base engineers/SCUs for a base (by builderTag) and replaces losses via leased factories
-    • Rebuilds structures using BaseManager build groups or manual AddBuildGroup()
-    • Assists actively-building factories within scanRadius
-    • Builds experimentals at a marker, hands them off (incl. platoon_AttackFunctions), and respects cooldown
-    • Idles extras to wander within patrolRadius with opportunistic repair/reclaim
-    • Clean Stop() tears down threads and returns factory leases
-
-New in this version
-  • BaseManager integration: pass `baseManager` (and optional `fetchRebuildGroups`) to auto-ingest rebuild groups.
-  • platoon_AttackFunctions handoff: pass a string AI name (e.g., 'Raid', 'WaveAttack') or a table
-    `{ ai='Raid', data={...} }` to create a platoon and fork that AI for the finished experimental.
-
-Parameters (Start)
-  brain (AIBrain)                 — owner brain (ArmyBrains[...])
-  baseMarker (string)             — editor marker for base location
-  difficulty (1..3)               — used to pick wantT1/2/3/SCU from {easy, med, hard} arrays
-  builderTag (string)             — tag to reserve engineers/SCUs for this manager
-  spawnFirst (bool)               — spawn initial roster instantly at baseMarker
-  wantFactories (int)             — number of factories to lease for replacements (0 = no leasing)
-  radius (number)                 — factory search radius around base
-  scanRadius (number)             — radius for assist/repair/reclaim/rebuild scanning
-  patrolRadius (number)           — idle wander radius
-  wantT1|wantT2|wantT3|wantSCU    — tables {e,m,h} for alive counts per difficulty
-  taskMin, taskMax (tables)       — minima/maxima for Rebuild/Assist/Experimental (Idle has no max)
-  experimentalBp (string|nil)     — BP id of experimental to build (optional)
-  experimentalMarker (string|nil) — marker where the experimental is placed (optional)
-  experimentalCooldown (number)   — delay after completion before the next experimental
-  experimentalHandoff             — one of:
-                                    * function(unit) — custom callback (legacy)
-                                    * 'Raid'|'WaveAttack' — AI name in platoon_AttackFunctions
-                                    * { ai='Raid', data={...} } — AI name plus PlatoonData table
-  experimentalAIFile (string|nil) — override path to platoon_AttackFunctions.lua (optional)
-  baseManager (table|nil)         — BaseManager handle to mirror rebuild groups from (optional)
-  fetchRebuildGroups (func|nil)   — custom getter: function(bm)->{{bp=...,pos=...,heading=...}} (optional)
-  priority (number)               — factory allocator priority
-  debug (bool)                    — verbose logs
-
-Public API
-  local BE = import('/maps/.../manager_BaseEngineer.lua')
-  local h = BE.Start{ ...params... }
-  BE.AddBuildGroup(h, tbl)    -- still supported; merges with BaseManager feed
-  BE.Stop(h)
-
-Tasking Priority & Assignment
-  Rebuild > Assist > Experimental > Idle
-  1) Fill each task to taskMin (from Idle)
-  2) Top to taskMax (from Idle)
-  3) Only excess goes Idle; Idlers wander and opportunistically repair/reclaim
-
-Experimental Handoff examples
-  -- Name only (requires platoon_AttackFunctions.lua discoverable)
-  experimentalHandoff = 'Raid',
-
-  -- Name + PlatoonData (passed into platoon.PlatoonData)
-  experimentalHandoff = { ai='WaveAttack', data={ areaRadius=60, moveInFormation=true } },
-
-  -- Custom function (legacy)
-  experimentalHandoff = function(exp) LOG('Custom handoff for '.. exp.UnitId) end,
-
-BaseManager usage (example)
-  ScenarioInfo.CFNBEngi = EngiMgr.Start{
-    brain = ArmyBrains[ScenarioInfo.Cybran],
-    baseMarker = 'Cybran_ForwardNorthBase_Zone',
-    difficulty = Difficulty,
-    builderTag = 'CFNB',
-    spawnFirst = true,
-    wantFactories = 1, radius = 30, scanRadius = 30, patrolRadius = 35,
-    wantT1={1,1,2}, wantT2={0,0,0}, wantT3={0,0,0}, wantSCU={0,0,0},
-    taskMin={Rebuild=1, Assist=0, Experimental=0},
-    taskMax={Rebuild=1, Assist=2, Experimental=0},
-    baseManager = ScenarioInfo.Cybran_FNB,
-    -- optional if file not on MapPath: experimentalAIFile = '/maps/.../platoon_AttackFunctions.lua',
-  }
-
-Stop()
-  Cancels loops, returns any active factory lease, and ends the BaseManager watcher.
-
-]]
+-- /maps/faf_coop_U01.v0001/manager_BaseEngineer.lua
+-- Base Engineer Manager (Part 1) — v4 (callback‑free)
+--
+-- Why v4?
+--   • Removes ALL factory AddUnitCallback hooks to avoid nil‑category crashes in DoOnUnitBuiltCallbacks.
+--   • Still isolates ownership: we only tag engineers rolled off our currently leased factories
+--     that match a pending build we queued AND only while there is a deficit for that tier.
+--   • Keeps headcount/rebuild + periodic debug headcount.
+--   • Lua 5.0 safe (no '#', '%', or 'goto').
+--
+-- Public API
+--   local BaseEng = import('/maps/.../manager_BaseEngineer.lua')
+--   local handle = BaseEng.Start{
+--     brain=..., baseMarker='...', difficulty=1..3, baseManager=nil, baseTag='...',
+--     counts={{1,2,3},{1,2,3},{1,2,3},{0,0,1}}, radius=60, priority=120, wantFactories=1,
+--     spawnSpread=2, debug=false, _alloc=nil }
+--   BaseEng.Stop(handle)
 
 local ScenarioUtils     = import('/lua/sim/ScenarioUtilities.lua')
-local FactoryAllocMod   = import('/maps/faf_coop_U01.v0001/manager_FactoryHandler.lua')  -- allocator API  :contentReference[oaicite:2]{index=2}
+local FactoryAllocMod   = import('/maps/faf_coop_U01.v0001/manager_FactoryHandler.lua')
 
--- Shared allocator per-brain (same pattern as UnitBuilder)
 ScenarioInfo.AllocByBrain = ScenarioInfo.AllocByBrain or {}
 local function GetAllocator(brain)
-    local a = ScenarioInfo.AllocByBrain[brain]
-    if not a then
-        a = FactoryAllocMod.New(brain)
-        ScenarioInfo.AllocByBrain[brain] = a
+    local alloc = ScenarioInfo.AllocByBrain[brain]
+    if not alloc then
+        alloc = FactoryAllocMod.New(brain)
+        ScenarioInfo.AllocByBrain[brain] = alloc
     end
-    return a
+    return alloc
 end
 
--- ===== helpers =====
-local function markerPos(mark) return mark and ScenarioUtils.MarkerToPosition(mark) or nil end
+-- faction maps (1 UEF, 2 Aeon, 3 Cybran, 4 Seraphim)
+local EngBp = {
+    [1] = { T1='uel0105', T2='uel0208', T3='uel0309', SCU='uel0301' },
+    [2] = { T1='ual0105', T2='ual0208', T3='ual0309', SCU='ual0301' },
+    [3] = { T1='url0105', T2='url0208', T3='url0309', SCU='url0301' },
+    [4] = { T1='xsl0105', T2='xsl0208', T3='xsl0309', SCU='xsl0301' },
+}
 
-local function dist2d(a, b)
-    if not a or not b then return 1e9 end
-    local dx, dz = (a[1] or 0)-(b[1] or 0), (a[3] or 0)-(b[3] or 0)
-    return math.sqrt(dx*dx + dz*dz)
+local function clampDifficulty(d)
+    if not d then return 2 end
+    if d < 1 then return 1 end
+    if d > 3 then return 3 end
+    return d
+end
+
+local function markerPos(mark)
+    if not mark then return nil end
+    return ScenarioUtils.MarkerToPosition(mark)
 end
 
 local function isComplete(u)
@@ -112,114 +56,456 @@ local function isComplete(u)
     return true
 end
 
-local function now() return GetGameTimeSeconds() end
-
-local function clamp01(x) return math.max(0, math.min(1, x or 0)) end
-
-local function pickDifficulty(v, d)
-    if type(v) == 'table' then return v[math.max(1, math.min(3, d or 2))] or 0 end
-    return v or 0
-end
-
-local function factionIndex(brain)
-    local idx = (brain.GetFactionIndex and brain:GetFactionIndex()) or (brain.FactionIndex) or 1
-    return math.max(1, math.min(4, idx))
-end
-
-local EngineerBp = {
-    -- T1, T2, T3, SCU
-    [1] = { T1='uel0105', T2='uel0208', T3='uel0309', SCU='uel0301' }, -- UEF
-    [2] = { T1='ual0105', T2='ual0208', T3='ual0309', SCU='ual0301' }, -- Aeon
-    [3] = { T1='url0105', T2='url0208', T3='url0309', SCU='url0301' }, -- Cybran
-    [4] = { T1='xsl0105', T2='xsl0208', T3='xsl0309', SCU='xsl0301' }, -- Seraphim
-}
-
-local function unitId(u)
-    local id = (u.BlueprintID or (u.GetBlueprint and u:GetBlueprint() and u:GetBlueprint().BlueprintId))
-    if type(id) == 'string' then
-        id = string.lower(id)
-        return string.match(id, '/units/([^/]+)/') or id
+local function unitBpId(u)
+    if not u then return nil end
+    local id = u.BlueprintID
+    if (not id) and u.GetBlueprint then
+        local bp = u:GetBlueprint()
+        if bp then id = bp.BlueprintId end
     end
-    return nil
+    if not id then return nil end
+    id = string.lower(id)
+    local short = string.match(id, '/units/([^/]+)/') or id
+    return short
 end
 
-local function isOurEngineer(u, brain, tag)
-    if not u or u.Dead then return false end
-    if u:GetAIBrain() ~= brain then return false end
-    if not (u.BlueprintID or (u.GetBlueprint and u:GetBlueprint())) then return false end
-    if not (u:IsInCategory(categories.ENGINEER) or u:IsInCategory(categories.SUBCOMMANDER)) then return false end
-    local okTag = (not u.be_tag) or (u.be_tag == tag)
-    return okTag
+local function tgetn(t)
+    return table.getn(t or {})
 end
 
--- ===== class =====
 local M = {}
 M.__index = M
 
-function M:Log(m) LOG(('[BE:%s] %s'):format(self.tag, m)) end
-function M:Warn(m) WARN(('[BE:%s] %s'):format(self.tag, m)) end
-function M:Dbg(m) if self.debug then self:Log(m) end end
+function M:Log(msg) LOG(('[BE:%s] %s'):format(self.tag, msg)) end
+function M:Warn(msg) WARN(('[BE:%s] %s'):format(self.tag, msg)) end
+function M:Dbg(msg) if self.params.debug then self:Log(msg) end end
 
-local function _normalize(p)
+local function _sum(tbl)
+    local s = 0; for _,n in pairs(tbl or {}) do s = s + (n or 0) end; return s
+end
+
+function M:_AliveCountTier(tier)
+    local count = 0
+    local set = self.tracked[tier]
+    if not set then return 0 end
+    for id, u in pairs(set) do
+        if u and not u.Dead and isComplete(u) and u:GetAIBrain() == self.brain then
+            count = count + 1
+        else
+            set[id] = nil
+        end
+    end
+    return count
+end
+
+function M:_WantedByBp()
+    local bpmap = {}
+    local map = EngBp[self.faction] or EngBp[1]
+    if (self.desired.T1 or 0) > 0 then bpmap[map.T1] = (bpmap[map.T1] or 0) + (self.desired.T1 or 0) end
+    if (self.desired.T2 or 0) > 0 then bpmap[map.T2] = (bpmap[map.T2] or 0) + (self.desired.T2 or 0) end
+    if (self.desired.T3 or 0) > 0 then bpmap[map.T3] = (bpmap[map.T3] or 0) + (self.desired.T3 or 0) end
+    if (self.desired.SCU or 0) > 0 then bpmap[map.SCU] = (bpmap[map.SCU] or 0) + (self.desired.SCU or 0) end
+    return bpmap
+end
+
+function M:_AliveByBp()
+    local out = {}
+    local map = EngBp[self.faction] or EngBp[1]
+    local function add(bp, n) out[bp] = (out[bp] or 0) + (n or 0) end
+    add(map.T1, self:_AliveCountTier('T1'))
+    add(map.T2, self:_AliveCountTier('T2'))
+    add(map.T3, self:_AliveCountTier('T3'))
+    add(map.SCU, self:_AliveCountTier('SCU'))
+    return out
+end
+
+function M:_ComputeDeficit()
+    local want = self:_WantedByBp()
+    local have = self:_AliveByBp()
+    local d = {}
+    for bp, w in pairs(want) do
+        local h = have[bp] or 0
+        if h < (w or 0) then d[bp] = (w or 0) - h end
+    end
+    return d
+end
+
+function M:_OnEngineerGone(u)
+    if not u then return end
+    local id = u:GetEntityId()
+    local tier = u._be_tier
+    if tier and self.tracked[tier] then
+        self.tracked[tier][id] = nil
+        self:Dbg(('Engineer lost: id=%d tier=%s'):format(id, tostring(tier)))
+    end
+end
+
+function M:_TagAndTrack(u, tier)
+    if not u then return end
+    u.be_tag  = self.tag
+    u._be_tier = tier
+    local id = u:GetEntityId()
+    self.tracked[tier] = self.tracked[tier] or {}
+    self.tracked[tier][id] = u
+    if u.AddUnitCallback then
+        u:AddUnitCallback(function(unit) self:_OnEngineerGone(unit) end, 'OnKilled')
+        u:AddUnitCallback(function(unit) self:_OnEngineerGone(unit) end, 'OnCaptured')
+        u:AddUnitCallback(function(unit) self:_OnEngineerGone(unit) end, 'OnReclaimed')
+    end
+end
+
+function M:_SpawnInitial()
+    local pos = self.basePos
+    if not pos then
+        self:Warn('SpawnInitial: invalid basePos')
+        return
+    end
+    local spread = self.params.spawnSpread or 0
+    local map = EngBp[self.faction] or EngBp[1]
+
+    local function spawnMany(bp, tier, n)
+        local i = 1
+        while i <= (n or 0) do
+            local ox = (spread > 0) and (Random()*2 - 1) * spread or 0
+            local oz = (spread > 0) and (Random()*2 - 1) * spread or 0
+            local u = CreateUnitHPR(bp, self.brain:GetArmyIndex(), pos[1]+ox, pos[2], pos[3]+oz, 0,0,0)
+            if u then self:_TagAndTrack(u, tier) end
+            i = i + 1
+        end
+    end
+
+    spawnMany(map.T1, 'T1',  self.desired.T1 or 0)
+    spawnMany(map.T2, 'T2',  self.desired.T2 or 0)
+    spawnMany(map.T3, 'T3',  self.desired.T3 or 0)
+    spawnMany(map.SCU, 'SCU', self.desired.SCU or 0)
+
+    self:Dbg(('Initial spawn done: T1=%d T2=%d T3=%d SCU=%d')
+        :format(self.desired.T1 or 0, self.desired.T2 or 0, self.desired.T3 or 0, self.desired.SCU or 0))
+end
+
+-- ===================== Factory lease + build =====================
+
+function M:_LeaseParams()
     return {
-        brain         = p.brain,
-        baseMarker    = p.baseMarker,
-        difficulty    = p.difficulty or 2,
-        builderTag    = p.builderTag or ('BE_'.. math.floor(100000*Random())),
-        spawnFirst    = p.spawnFirst and true or false,
-        wantFactories = math.max(0, p.wantFactories or 0),
-        radius        = p.radius or 60,
-        scanRadius    = p.scanRadius or 70,
-        patrolRadius  = p.patrolRadius or 30,
-        wantT1        = p.wantT1 or {0,0,0},
-        wantT2        = p.wantT2 or {0,0,0},
-        wantT3        = p.wantT3 or {0,0,0},
-        wantSCU       = p.wantSCU or {0,0,0},
-        taskMin       = p.taskMin or { Rebuild=1, Assist=1, Experimental=0 },
-        taskMax       = p.taskMax or { Rebuild=6, Assist=6, Experimental=6 },
-        experimentalBp       = p.experimentalBp,
-        experimentalMarker   = p.experimentalMarker,
-        experimentalCooldown = p.experimentalCooldown or 0,
-        experimentalHandoff  = p.experimentalHandoff,
-        priority      = p.priority or 200,
-        debug         = p.debug and true or false,
-        _alloc        = p._alloc,
+        markerName = self.params.baseMarker,
+        markerPos  = self.basePos,
+        radius     = self.params.radius or 60,
+        domain     = 'AUTO',
+        wantFactories = self.params.wantFactories or 1,
+        priority   = self.params.priority or 120,
+        onGrant    = function(f, id) self:OnLeaseGranted(f, id) end,
+        onUpdate   = function(f, id) self:OnLeaseUpdated(f, id) end,
+        onRevoke   = function(l, id, why) self:OnLeaseRevoked(l, id, why) end,
+        onComplete = function(id) end,
     }
 end
 
--- allocator lease params
-function M:_MakeLease()
-    return {
-        markerName   = self.params.baseMarker,
-        markerPos    = self.basePos,
-        radius       = self.params.radius or 60,
-        domain       = 'LAND',                 -- engineers are produced at land factories
-        wantFactories= self.params.wantFactories or 0,
-        priority     = self.params.priority or 200,
-        onGrant      = function(list, id) self:OnLeaseGranted(list, id) end,
-        onUpdate     = function(list, id) self:OnLeaseUpdated(list, id) end,
-        onRevoke     = function(rev, id, why) self:OnLeaseRevoked(rev, id, why) end,
-        onComplete   = function(id) end,
-    }
+function M:RequestLease()
+    self.leaseId = self.alloc:RequestFactories(self:_LeaseParams())
+    return self.leaseId
 end
 
--- ===== lifecycle =====
+function M:OnLeaseGranted(factories, leaseId)
+    if self.stopped then return end
+    self.leased = {}
+    self.pending = {}
+    local i = 1
+    while i <= tgetn(factories) do
+        local f = factories[i]
+        if f and not f.Dead then
+            self.leased[f:GetEntityId()] = f
+            self.pending[f:GetEntityId()] = {}
+        end
+        i = i + 1
+    end
+    self:Dbg(('Lease granted: %d factories'):format(tgetn(factories)))
+    self:QueueNeededBuilds()
+end
+
+function M:OnLeaseUpdated(factories, leaseId)
+    if self.stopped then return end
+    self.leased = self.leased or {}
+    self.pending = self.pending or {}
+    local i = 1
+    while i <= tgetn(factories) do
+        local f = factories[i]
+        if f and not f.Dead then
+            local id = f:GetEntityId()
+            self.leased[id] = f
+            self.pending[id] = self.pending[id] or {}
+        end
+        i = i + 1
+    end
+    self:QueueNeededBuilds()
+end
+
+function M:OnLeaseRevoked(list, leaseId, reason)
+    if self.stopped then return end
+    for entId, _ in pairs(list or {}) do
+        self.leased[entId] = nil
+        self.pending[entId] = nil
+    end
+end
+
+function M:_QueuedCounts()
+    local byBp = {}
+    for _, f in pairs(self.leased or {}) do
+        if f and not f.Dead and f.GetCommandQueue then
+            local q = f:GetCommandQueue() or {}
+            local j = 1
+            while j <= tgetn(q) do
+                local cmd = q[j]
+                local bid = nil
+                if type(cmd) == 'table' then
+                    if type(cmd.blueprintId) == 'string' then
+                        bid = cmd.blueprintId
+                    elseif type(cmd.blueprint) == 'table' and type(cmd.blueprint.BlueprintId) == 'string' then
+                        bid = cmd.blueprint.BlueprintId
+                    elseif type(cmd.unitId) == 'string' then
+                        bid = cmd.unitId
+                    elseif type(cmd.id) == 'string' then
+                        bid = cmd.id
+                    end
+                end
+                if type(bid) == 'string' then
+                    bid = string.lower(bid)
+                    local short = string.match(bid, '/units/([^/]+)/') or bid
+                    byBp[short] = (byBp[short] or 0) + 1
+                end
+                j = j + 1
+            end
+        end
+    end
+    return byBp
+end
+
+function M:_FactoriesList(usableOnly)
+    local flist = {}
+    for _, f in pairs(self.leased or {}) do
+        if f and not f.Dead then
+            if usableOnly then
+                local up = (f.IsUnitState and f:IsUnitState('Upgrading'))
+                local gd = (f.IsUnitState and f:IsUnitState('Guarding'))
+                local ps = (f.IsPaused and f:IsPaused())
+                if not (up or gd or ps) then table.insert(flist, f) end
+            else
+                table.insert(flist, f)
+            end
+        end
+    end
+    return flist
+end
+
+function M:QueueNeededBuilds()
+    if self.holdBuild then return end
+
+    if not self.leaseId then
+        self:RequestLease()
+        return
+    end
+
+    local flist = self:_FactoriesList(true)
+    if tgetn(flist) == 0 then
+        return
+    end
+
+    local want = self:_ComputeDeficit()
+    local queued = self:_QueuedCounts()
+
+    local pipeline = {}
+    for bp, need in pairs(want) do
+        local q = queued[bp] or 0
+        if need > q then pipeline[bp] = need - q end
+    end
+
+    local any = false
+    local rr = self._rr or 1
+
+    for bp, need in pairs(pipeline) do
+        local left = need
+        local spins = 0
+        while left > 0 and tgetn(flist) > 0 do
+            local idx = rr
+            if idx < 1 or idx > tgetn(flist) then idx = 1 end
+            local f = flist[idx]
+            local landed = false
+            if f and not f.Dead then
+                local cq0 = 0
+                if f.GetCommandQueue then
+                    local q0 = f:GetCommandQueue() or {}
+                    cq0 = tgetn(q0)
+                end
+                IssueBuildFactory({f}, bp, 1)
+                local cq1 = cq0
+                if f.GetCommandQueue then
+                    local q1 = f:GetCommandQueue() or {}
+                    cq1 = tgetn(q1)
+                end
+                landed = (cq1 > cq0)
+                if landed then
+                    local id = f:GetEntityId()
+                    self.pending[id] = self.pending[id] or {}
+                    self.pending[id][bp] = (self.pending[id][bp] or 0) + 1
+                    if self.params.debug then
+                        self:Log(('Queued %s at f=%d; pending for that bp now %d'):format(bp, id, self.pending[id][bp]))
+                    end
+                end
+            end
+
+            if landed then
+                any = true
+                left = left - 1
+                spins = 0
+            else
+                spins = spins + 1
+            end
+
+            rr = idx + 1
+            if rr > tgetn(flist) then rr = 1 end
+
+            if spins >= tgetn(flist) then
+                break
+            end
+        end
+    end
+
+    self._rr = rr
+
+    if not any then
+        local d = self:_ComputeDeficit()
+        local missing = 0
+        for _, n in pairs(d) do missing = missing + (n or 0) end
+        if missing <= 0 and self.leaseId then
+            self.alloc:ReturnLease(self.leaseId)
+            self.leaseId = nil
+            self:Dbg('Headcount satisfied; lease returned')
+        end
+    end
+end
+
+-- Only verify/tag already‑tagged engineers, and also claim ONLY our pending roll‑offs
+function M:_CollectorSweep()
+    -- Merge search lists around leased factories and base
+    local near = {}
+    for _, f in pairs(self.leased or {}) do
+        if f and not f.Dead then
+            local around = self.brain:GetUnitsAroundPoint(categories.MOBILE, f:GetPosition(), 35, 'Ally') or {}
+            local i = 1
+            while i <= tgetn(around) do table.insert(near, around[i]); i = i + 1 end
+        end
+    end
+    if self.basePos then
+        local aroundB = self.brain:GetUnitsAroundPoint(categories.MOBILE, self.basePos, 35, 'Ally') or {}
+        local j = 1
+        while j <= tgetn(aroundB) do table.insert(near, aroundB[j]); j = j + 1 end
+    end
+
+    local map = EngBp[self.faction] or EngBp[1]
+    local wantedBp = { [map.T1]=true, [map.T2]=true, [map.T3]=true, [map.SCU]=true }
+
+    local k = 1
+    while k <= tgetn(near) do
+        local u = near[k]
+        if u and not u.Dead and isComplete(u) and u:GetAIBrain() == self.brain then
+            local bp = unitBpId(u)
+            if bp and wantedBp[bp] then
+                local tier = (bp==map.T1 and 'T1') or (bp==map.T2 and 'T2') or (bp==map.T3 and 'T3') or (bp==map.SCU and 'SCU') or nil
+                if tier then
+                    -- Case A: already ours, ensure tracked
+                    if u.be_tag == self.tag then
+                        local id = u:GetEntityId()
+                        self.tracked[tier] = self.tracked[tier] or {}
+                        if not self.tracked[tier][id] then
+                            self.tracked[tier][id] = u
+                            self:Dbg(('Collector verify ours: id=%d tier=%s'):format(id, tier))
+                        end
+                    -- Case B: untagged AND we have a pending slot for this bp at any leased factory
+                    elseif not u.be_tag then
+                        local needNow = (self:_AliveCountTier(tier) < (self.desired[tier] or 0))
+                        if needNow then
+                            -- Check if this unit is near any factory with pending count for this bp
+                            local claimed = false
+                            for fid, f in pairs(self.leased or {}) do
+                                if f and not f.Dead then
+                                    local fp = f:GetPosition()
+                                    local up = u:GetPosition()
+                                    local dx = (fp[1] or 0) - (up[1] or 0)
+                                    local dz = (fp[3] or 0) - (up[3] or 0)
+                                    local d2 = dx*dx + dz*dz
+                                    if d2 <= (40*40) then
+                                        local ptab = self.pending and self.pending[fid]
+                                        local pend = ptab and ptab[bp] or 0
+                                        if pend > 0 then
+                                            -- Claim it for this manager
+                                            self:_TagAndTrack(u, tier)
+                                            ptab[bp] = pend - 1
+                                            claimed = true
+                                            if self.params.debug then
+                                                self:Log(('Claimed roll-off bp=%s near f=%d; pending now %d'):format(bp, fid, ptab[bp]))
+                                            end
+                                            break
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        k = k + 1
+    end
+end
+
+-- DEBUG: periodic headcount summary
+function M:_DebugHeadcount()
+    if not self.params.debug then return end
+    self._dbgTick = (self._dbgTick or 0) + 1
+    if self._dbgTick >= 5 then -- roughly every 5 seconds (loop sleeps 1s)
+        self._dbgTick = 0
+        local a1 = self:_AliveCountTier('T1')
+        local a2 = self:_AliveCountTier('T2')
+        local a3 = self:_AliveCountTier('T3')
+        local as = self:_AliveCountTier('SCU')
+        self:Log(('Headcount T1:%d/%d T2:%d/%d T3:%d/%d SCU:%d/%d (missing=%d)')
+            :format(a1, self.desired.T1 or 0, a2, self.desired.T2 or 0, a3, self.desired.T3 or 0, as, self.desired.SCU or 0,
+                    _sum(self:_ComputeDeficit())))
+    end
+end
+
+-- ===================== Threads =====================
+function M:MonitorLoop()
+    self:Dbg('MonitorLoop start')
+    while not self.stopped do
+        local def = self:_ComputeDeficit()
+        local missing = 0
+        for _, n in pairs(def) do missing = missing + (n or 0) end
+
+        if missing > 0 and (not self.leaseId) then
+            self:RequestLease()
+        end
+
+        if missing > 0 then
+            self:QueueNeededBuilds()
+        end
+
+        self:_CollectorSweep()
+        self:_DebugHeadcount()
+
+        if missing <= 0 and self.leaseId then
+            self.alloc:ReturnLease(self.leaseId)
+            self.leaseId = nil
+            self:Dbg('Monitor: satisfied -> lease returned')
+        end
+
+        WaitSeconds(1)
+    end
+    self:Dbg('MonitorLoop end')
+end
+
 function M:Start()
-    -- initial spawn
-    if self.params.spawnFirst then
-        self:SpawnInitial()
-    end
-    -- threads
-    self.collectThread = self.brain:ForkThread(function() self:CollectLoop() end)
-    self.mainThread    = self.brain:ForkThread(function() self:MainLoop() end)
-    if self.params.experimentalBp and self.params.experimentalMarker then
-        self.expThread = self.brain:ForkThread(function() self:ExperimentalLoop() end)
-    end
-
-if self.params.baseManager or self.params.fetchRebuildGroups then
-    self.rebuildThread = self.brain:ForkThread(function() self:RebuildSourceLoop() end)
-end
-
+    self:_SpawnInitial()
+    self.monitorThread = self.brain:ForkThread(function() self:MonitorLoop() end)
 end
 
 function M:Stop()
@@ -229,634 +515,76 @@ function M:Stop()
         self.alloc:ReturnLease(self.leaseId)
         self.leaseId = nil
     end
-    if self.collectThread then KillThread(self.collectThread) self.collectThread = nil end
-    if self.mainThread    then KillThread(self.mainThread)    self.mainThread    = nil end
-    if self.expThread     then KillThread(self.expThread)     self.expThread     = nil end
-    if self.rebuildThread then KillThread(self.rebuildThread) self.rebuildThread = nil end
-
+    if self.monitorThread then
+        KillThread(self.monitorThread)
+        self.monitorThread = nil
+    end
 end
 
--- ===== counts / wants =====
-function M:_WantedCounts()
-    local d = self.params.difficulty or 2
+local function NormalizeParams(p)
+    local d = clampDifficulty(p.difficulty or 2)
+    local counts = p.counts or { {0,0,0}, {0,0,0}, {0,0,0}, {0,0,0} }
+    local function tri(t)
+        local a = t[1] or 0
+        local b = t[2] or a
+        local c = t[3] or b
+        return {a,b,c}
+    end
+    local C1 = tri(counts[1] or {})
+    local C2 = tri(counts[2] or {})
+    local C3 = tri(counts[3] or {})
+    local CS = tri(counts[4] or {})
+
     return {
-        T1  = pickDifficulty(self.params.wantT1, d),
-        T2  = pickDifficulty(self.params.wantT2, d),
-        T3  = pickDifficulty(self.params.wantT3, d),
-        SCU = pickDifficulty(self.params.wantSCU, d),
+        brain        = p.brain,
+        baseMarker   = p.baseMarker,
+        difficulty   = d,
+        baseManager  = p.baseManager,
+        baseTag      = p.baseTag,
+        counts       = {C1, C2, C3, CS},
+        radius       = p.radius or 60,
+        priority     = p.priority or 120,
+        wantFactories= p.wantFactories or 1,
+        spawnSpread  = (p.spawnSpread ~= nil) and p.spawnSpread or 2,
+        debug        = p.debug and true or false,
+        _alloc       = p._alloc,
     }
 end
 
-function M:_CountOwned()
-    local c = { T1=0, T2=0, T3=0, SCU=0 }
-    for _, u in pairs(self.owned or {}) do
-        if u and not u.Dead then
-            if u:IsInCategory(categories.SUBCOMMANDER) then
-                c.SCU = c.SCU + 1
-            elseif u:IsInCategory(categories.ENGINEER) then
-                -- classify by tech
-                if u:IsInCategory(categories.TECH3) then c.T3 = c.T3 + 1
-                elseif u:IsInCategory(categories.TECH2) then c.T2 = c.T2 + 1
-                else c.T1 = c.T1 + 1 end
-            end
-        end
-    end
-    return c
-end
+function Start(params)
+    assert(params and params.brain and params.baseMarker and params.counts, 'brain, baseMarker, counts are required')
 
-local function _sum(tbl) local s=0; for _,n in pairs(tbl or {}) do s=s+(n or 0) end return s end
-
--- ===== initial spawn =====
-function M:SpawnInitial()
-    local f = EngineerBp[self.faction]
-    local want = self:_WantedCounts()
-    local spawnAt = self.basePos
-    local function _make(bp, n)
-        for i=1, n or 0 do
-            local u = CreateUnitHPR(bp, self.brain:GetArmyIndex(), spawnAt[1], spawnAt[2], spawnAt[3], 0,0,0)
-            if u then
-                u.be_tag = self.tag
-                self.owned[u:GetEntityId()] = u
-            end
-        end
-    end
-    _make(f.T1,  want.T1)
-    _make(f.T2,  want.T2)
-    _make(f.T3,  want.T3)
-    _make(f.SCU, want.SCU)
-    self:Dbg(('SpawnInitial: T1=%d T2=%d T3=%d SCU=%d'):format(want.T1, want.T2, want.T3, want.SCU))
-end
-
--- ===== leasing & replacements =====
-function M:_EnsureLease()
-    if (self.params.wantFactories or 0) == 0 then return end
-    if self.leaseId then return end
-    self.leaseId = self.alloc:RequestFactories(self:_MakeLease())
-end
-
-function M:OnLeaseGranted(list, id)
-    self.leased = self.leased or {}
-    local rp = self.basePos
-    for _, f in ipairs(list or {}) do
-        if f and not f.Dead then
-            self.leased[f:GetEntityId()] = f
-            IssueClearFactoryCommands({f})
-            if rp then IssueFactoryRallyPoint({f}, rp) end
-        end
-    end
-    self:QueueNeededBuilds()
-end
-
-function M:OnLeaseUpdated(list, id)
-    self.leased = self.leased or {}
-    local rp = self.basePos
-    for _, f in ipairs(list or {}) do
-        if f and not f.Dead then
-            self.leased[f:GetEntityId()] = f
-            IssueClearFactoryCommands({f})
-            if rp then IssueFactoryRallyPoint({f}, rp) end
-        end
-    end
-    self:QueueNeededBuilds()
-end
-
-function M:OnLeaseRevoked(rev, id, why)
-    if not self.leased then return end
-    for entId, _ in pairs(rev or {}) do self.leased[entId] = nil end
-    -- if none remain, drop leaseId so we can request again later
-    local any = false
-    for _, f in pairs(self.leased) do if f and not f.Dead then any = true break end end
-    if not any then self.leaseId = nil end
-end
-
-function M:_LiveFactories(usableOnly)
-    local out = {}
-    for _, f in pairs(self.leased or {}) do
-        if f and not f.Dead then
-            if not usableOnly then
-                table.insert(out, f)
-            else
-                local up = f.IsUnitState and f:IsUnitState('Upgrading')
-                local gd = f.IsUnitState and f:IsUnitState('Guarding')
-                local ps = f.IsPaused and f:IsPaused()
-                if not (up or gd or ps) then table.insert(out, f) end
-            end
-        end
-    end
-    return out
-end
-
-function M:QueueNeededBuilds()
-    -- compute deficit
-    local want = self:_WantedCounts()
-    local have = self:_CountOwned()
-    local d = {
-        T1  = math.max(0, (want.T1 or 0) - (have.T1 or 0)),
-        T2  = math.max(0, (want.T2 or 0) - (have.T2 or 0)),
-        T3  = math.max(0, (want.T3 or 0) - (have.T3 or 0)),
-        SCU = math.max(0, (want.SCU or 0) - (have.SCU or 0)),
-    }
-    local total = _sum(d)
-    if total <= 0 then
-        -- release lease if we hold one
-        if self.leaseId then
-            IssueClearFactoryCommands(self:_LiveFactories(false))
-            self.alloc:ReturnLease(self.leaseId)
-            self.leaseId = nil
-        end
-        return
-    end
-
-    self:_EnsureLease()
-    local flist = self:_LiveFactories(true)
-    if table.getn(flist) == 0 then return end
-
-    -- RR queue builders
-    local rr = 1
-    local f   = EngineerBp[self.faction]
-    local order = {
-        { f.SCU, d.SCU },
-        { f.T3,  d.T3  },
-        { f.T2,  d.T2  },
-        { f.T1,  d.T1  },
-    }
-    for _, pair in ipairs(order) do
-        local bp, need = pair[1], pair[2]
-        while need > 0 and table.getn(flist) > 0 do
-            if rr > table.getn(flist) then rr = 1 end
-            local fac = flist[rr]
-            if fac and not fac.Dead then
-                local q0 = 0
-                if fac.GetCommandQueue then q0 = table.getn(fac:GetCommandQueue() or {}) end
-                IssueBuildFactory({fac}, bp, 1)  -- same approach as UnitBuilder  :contentReference[oaicite:3]{index=3}
-                local q1 = q0
-                if fac.GetCommandQueue then q1 = table.getn(fac:GetCommandQueue() or {}) end
-                if q1 > q0 then need = need - 1 end
-                rr = rr + 1
-            else
-                rr = rr + 1
-            end
-        end
-    end
-end
-
--- ===== adoption loop (collect roll-offs + adopt locals) =====
-function M:CollectLoop()
-    self:Dbg('CollectLoop: start')
-    while not self.stopped do
-        -- scoop untagged engies/SCUs near factories and base
-        local near = {}
-        -- around leased factories
-        for _, f in pairs(self.leased or {}) do
-            if f and not f.Dead then
-                local around = self.brain:GetUnitsAroundPoint(categories.MOBILE, f:GetPosition(), 35, 'Ally') or {}
-                for _, u in ipairs(around) do table.insert(near, u) end
-            end
-        end
-        -- around base
-        local aroundBase = self.brain:GetUnitsAroundPoint(categories.MOBILE, self.basePos, 35, 'Ally') or {}
-        for _, u in ipairs(aroundBase) do table.insert(near, u) end
-
-        for _, u in ipairs(near) do
-            if isOurEngineer(u, self.brain, self.params.builderTag) then
-                if not self.owned[u:GetEntityId()] and isComplete(u) then
-                    u.be_tag = self.tag
-                    self.owned[u:GetEntityId()] = u
-                end
-            end
-        end
-
-        -- periodically nudge builds if short
-        self:QueueNeededBuilds()
-        WaitSeconds(1)
-    end
-    self:Dbg('CollectLoop: end')
-end
-
--- ===== tasking =====
-function M:_TaskSnapshot()
-    local snap = { Rebuild={}, Assist={}, Experimental={}, Idle={} }
-    for id, u in pairs(self.owned or {}) do
-        if u and not u.Dead then
-            local t = self.assignment[id] or 'Idle'
-            table.insert(snap[t], u)
-        end
-    end
-    return snap
-end
-
-function M:_Assign(units, task)
-    for _, u in ipairs(units or {}) do
-        if u and not u.Dead then
-            self.assignment[u:GetEntityId()] = task
-            self:_PushOrders(u, task)
-        end
-    end
-end
-
--- find a factory currently building to assist
-function M:_PickFactoryToAssist()
-    local list = self.brain:GetListOfUnits(categories.FACTORY) or {}
-    local best, bestd = nil, 1e9
-    for _, fac in ipairs(list) do
-        if fac and not fac.Dead and fac:GetAIBrain()==self.brain then
-            if dist2d(fac:GetPosition(), self.basePos) <= (self.params.scanRadius or 60) then
-                local building = fac.IsUnitState and fac:IsUnitState('Building')
-                local upgrading= fac.IsUnitState and fac:IsUnitState('Upgrading')
-                if building or upgrading then
-                    local d = dist2d(fac:GetPosition(), self.basePos)
-                    if d < bestd then best, bestd = fac, d end
-                end
-            end
-        end
-    end
-    return best
-end
-
--- get next missing structure from rebuild plans
-function M:_NextRebuildTarget()
-    for i, e in ipairs(self.rebuild or {}) do
-        if not e.done then
-            -- check present structure
-            local here = self.brain:GetUnitsAroundPoint(categories.STRUCTURE, e.pos, 3, 'Ally') or {}
-            local exists = false
-            for _, su in ipairs(here) do
-                if not su.Dead then
-                    local bid = unitId(su)
-                    if type(bid)=='string' and string.find(bid, string.lower(e.bp), 1, true) then
-                        exists = true; break
-                    end
-                end
-            end
-            if not exists then
-                return i, e
-            else
-                self.rebuild[i].done = true
-            end
-        end
-    end
-    return nil, nil
-end
-
-function M:_PushOrders(u, task)
-    if task == 'Assist' then
-        local fac = self:_PickFactoryToAssist()
-        if fac then
-            IssueClearCommands({u})
-            IssueGuard({u}, fac)
-        end
-    elseif task == 'Rebuild' then
-        local idx, entry = self:_NextRebuildTarget()
-        if entry then
-            IssueClearCommands({u})
-            -- Build placement: typical call is IssueBuildMobile({eng}, bp, pos, 0)
-            -- If your build helper swaps params, feel free to flip them here.
-            IssueBuildMobile({u}, entry.bp, entry.pos, 0)
-        else
-            -- nothing to rebuild, demote to Assist this tick
-            local fac = self:_PickFactoryToAssist()
-            if fac then
-                IssueClearCommands({u})
-                IssueGuard({u}, fac)
-            end
-        end
-    elseif task == 'Experimental' then
-        -- Orders are orchestrated by ExperimentalLoop (lead builder + assists).
-        -- Here we just “stage” them at the pad so ExpLoop can find/use them.
-        local pad = self.expPos
-        if pad then
-            local q = u.GetCommandQueue and u:GetCommandQueue() or {}
-            if table.getn(q) == 0 then
-                IssueMove({u}, pad)
-            end
-        end
-    else -- Idle
-        -- short wander; opportunistic repair/reclaim is handled in MainLoop tick
-        local r = self.params.patrolRadius or 30
-        local ang = Random() * 2 * math.pi
-        local off = { self.basePos[1] + math.cos(ang)*r*Random(),
-                      self.basePos[2],
-                      self.basePos[3] + math.sin(ang)*r*Random() }
-        IssueMove({u}, off)
-    end
-end
-
--- Opportunistic repair/reclaim for a single unit near base (cheap & safe)
-function M:_OpportunisticWork(u)
-    if not u or u.Dead then return end
-    -- quick repair try
-    local hurt = self.brain:GetUnitsAroundPoint(categories.STRUCTURE, u:GetPosition(), 18, 'Ally') or {}
-    for _, t in ipairs(hurt) do
-        if t and not t.Dead and (t.GetHealth and t.GetMaxHealth and t:GetHealth() < t:GetMaxHealth()) then
-            IssueRepair({u}, t)
-            return
-        end
-    end
-    -- quick reclaim (if engine exposes a helper; guard with pcall)
-    local ok, rect = pcall(GetReclaimablesInRect, Rect(self.basePos[1]-self.params.scanRadius, self.basePos[3]-self.params.scanRadius, self.basePos[1]+self.params.scanRadius, self.basePos[3]+self.params.scanRadius))
-    if ok and rect and table.getn(rect) > 0 then
-        -- pick the closest reclaim to this engineer
-        local up = u:GetPosition()
-        local best, bd = nil, 1e9
-        for _, r in ipairs(rect) do
-            if r and r.CanBeReclaimed and r:CanBeReclaimed() then
-                local p = r.CachePosition or r:GetPosition()
-                local d = dist2d(up, p)
-                if d < bd then best, bd = r, d end
-            end
-        end
-        if best then IssueReclaim({u}, best) return end
-    end
-end
-
--- ===== experimental loop =====
-
-
--- ===== experimental handoff helpers (platoon_AttackFunctions compatibility) =====
--- Supports:
---   • params.experimentalHandoff = function(unit) ... end            -- custom
---   • params.experimentalHandoff = 'Raid' | 'WaveAttack'             -- AI name from module
---   • params.experimentalHandoff = { ai='Raid', data={...} }         -- AI + PlatoonData
--- Optional:
---   • params.experimentalAIFile = '/maps/.../platoon_AttackFunctions.lua'
-function M:_ImportPlatoonAI()
-    local path = self.params.experimentalAIFile or '/maps/.../platoon_AttackFunctions.lua'
-    local ok, mod = pcall(import, path)
-    if ok and type(mod) == 'table' then return mod end
-    -- fallback: try relative map path if available
-    if type(ScenarioInfo) == 'table' and type(ScenarioInfo.MapPath) == 'string' then
-        local alt = ScenarioInfo.MapPath .. 'platoon_AttackFunctions.lua'
-        local ok2, mod2 = pcall(import, alt)
-        if ok2 and type(mod2) == 'table' then return mod2 end
-    end
-    return nil
-end
-
-function M:_HandoffExperimentalViaPlatoon(expUnit, spec)
-    if not expUnit or expUnit.Dead then return end
-    local aiName = nil
-    local pData  = nil
-    if type(spec) == 'string' then aiName = spec
-    elseif type(spec) == 'table' then aiName = spec.ai; pData = spec.data end
-    if not aiName then return end
-
-    local aiMod = self:_ImportPlatoonAI()
-    if not aiMod then
-        self:Warn('Experimental handoff requested platoon AI "'.. tostring(aiName) ..'", but platoon_AttackFunctions could not be imported')
-        return
-    end
-    local aiFunc = aiMod[aiName]
-    if type(aiFunc) ~= 'function' then
-        self:Warn('Experimental handoff: AI "'.. tostring(aiName) ..'" not found in platoon_AttackFunctions')
-        return
-    end
-
-    -- Create a fresh platoon and assign the experimental to it
-    local brain = self.brain
-    local okMake, platoon = pcall(function() return brain:MakePlatoon('', '') end)
-    if not okMake or not platoon then
-        self:Warn('Experimental handoff: failed to MakePlatoon')
-        return
-    end
-
-    -- Assign and set a benign formation (GrowthFormation works well with our AI)
-    pcall(function() brain:AssignUnitsToPlatoon(platoon, { expUnit }, 'Attack', 'GrowthFormation') end)
-    pcall(function() platoon:SetPlatoonLabel('BE_Experimental') end)
-
-    -- Attach user-specified PlatoonData if provided
-    if type(pData) == 'table' then
-        platoon.PlatoonData = pData
-    else
-        platoon.PlatoonData = {}
-    end
-
-    -- Kick the AI (forked so our manager thread is not blocked)
-    platoon:ForkThread(function(p) aiFunc(p) end, platoon)
-end
-function M:ExperimentalLoop()
-    self:Dbg('ExperimentalLoop: start')
-    self.expPos = markerPos(self.params.experimentalMarker) or self.basePos
-    local bp    = self.params.experimentalBp
-    local cd    = math.max(0, self.params.experimentalCooldown or 0)
-    local nextOk= now()
-
-    local function _findExpUnderConstruction()
-        local near = self.brain:GetUnitsAroundPoint(categories.EXPERIMENTAL, self.expPos, 12, 'Ally') or {}
-        for _, u in ipairs(near) do
-            if u and not u.Dead and u:GetAIBrain()==self.brain then
-                local id = unitId(u) or ''
-                if string.find(id, string.lower(bp), 1, true) then
-                    return u
-                end
-            end
-        end
-        return nil
-    end
-
-    while not self.stopped do
-        local assigned = 0
-        for _, u in pairs(self.owned or {}) do
-            if self.assignment[u:GetEntityId()] == 'Experimental' then
-                assigned = assigned + (isComplete(u) and 1 or 0)
-            end
-        end
-
-        if assigned > 0 and now() >= nextOk then
-            local current = _findExpUnderConstruction()
-            if not current then
-                -- pick a lead builder and start it, others will help
-                local lead = nil
-                for _, u in pairs(self.owned or {}) do
-                    if self.assignment[u:GetEntityId()] == 'Experimental' and isComplete(u) then
-                        lead = u; break
-                    end
-                end
-                if lead then
-                    IssueClearCommands({lead})
-                    IssueBuildMobile({lead}, bp, self.expPos, 0)
-                    -- helpers guard the construction after a moment
-                    self.brain:ForkThread(function()
-                        WaitSeconds(1)
-                        local target = _findExpUnderConstruction()
-                        if target then
-                            for _, u in pairs(self.owned or {}) do
-                                if u ~= lead and self.assignment[u:GetEntityId()] == 'Experimental' and isComplete(u) then
-                                    IssueClearCommands({u})
-                                    IssueGuard({u}, target)
-                                end
-                            end
-                        end
-                    end)
-                end
-            else
-                -- if it exists, watch for completion
-                if current.GetFractionComplete and current:GetFractionComplete() >= 1 then
-                    -- handoff
-                    local fn = self.params.experimentalHandoff
-                    if type(fn) == 'string' then fn = rawget(_G, fn) end
-                    if type(fn) == 'function' then pcall(fn, current) elseif type(self.params.experimentalHandoff) == 'string' or type(self.params.experimentalHandoff) == 'table' then self:_HandoffExperimentalViaPlatoon(current, self.params.experimentalHandoff) end nextOk = now() + cd
-                end
-            end
-        end
-        WaitSeconds(1)
-    end
-    self:Dbg('ExperimentalLoop: end')
-end
-
--- ===== main balance loop =====
-function M:MainLoop()
-    self:Dbg('MainLoop: start')
-    while not self.stopped do
-        -- prune dead / out of brain
-        for id, u in pairs(self.owned or {}) do
-            if (not u) or u.Dead or u:GetAIBrain() ~= self.brain then
-                self.owned[id] = nil
-                self.assignment[id] = nil
-            end
-        end
-
-        -- compute need and keep replacement pipeline alive
-        self:QueueNeededBuilds()
-
-        -- task rebalance
-        local snap = self:_TaskSnapshot()
-        local min  = self.params.taskMin or {}
-        local max  = self.params.taskMax or {}
-        local order = { 'Rebuild', 'Assist', 'Experimental' }
-
-        local idle = snap.Idle
-        local function take(n)
-            local out = {}
-            n = math.max(0, n or 0)
-            while n > 0 and table.getn(idle) > 0 do
-                table.insert(out, table.remove(idle)) n = n - 1
-            end
-            return out
-        end
-
-        -- 1) ensure minima
-        for _, name in ipairs(order) do
-            local cur = table.getn(snap[name] or {})
-            local need = math.max(0, (min[name] or 0) - cur)
-            if need > 0 then
-                self:_Assign(take(need), name)
-            end
-        end
-
-        -- refresh snapshot (some Idles moved)
-        snap = self:_TaskSnapshot()
-        idle = snap.Idle
-
-        -- 2) top up to maxima (purely from Idle)
-        for _, name in ipairs(order) do
-            local cur = table.getn(snap[name] or {})
-            local room = math.max(0, (max[name] or 0) - cur)
-            if room > 0 then
-                self:_Assign(take(room), name)
-            end
-        end
-
-        -- 3) opportunistic work for idlers (lightweight)
-        for _, u in ipairs(idle or {}) do
-            self:_OpportunisticWork(u)
-        end
-
-        WaitSeconds(1)
-    end
-    self:Dbg('MainLoop: end')
-end
-
--- ===== ctor / API =====
-local function Start(p)
-    assert(p and p.brain and p.baseMarker, 'brain and baseMarker are required')
     local o = setmetatable({}, M)
-    o.params     = _normalize(p)
-    o.brain      = o.params.brain
-    o.tag        = o.params.builderTag or ('BE_'.. math.floor(100000*Random()))
-    o.basePos    = markerPos(o.params.baseMarker)
+    o.params   = NormalizeParams(params)
+    o.brain    = o.params.brain
+    o.basePos  = markerPos(o.params.baseMarker)
     if not o.basePos then error('Invalid baseMarker: '.. tostring(o.params.baseMarker)) end
-    o.alloc      = o.params._alloc or GetAllocator(o.brain)
-    o.debug      = o.params.debug
-    o.faction    = factionIndex(o.brain)
-    o.owned      = {}
-    o.assignment = {}
-    o.rebuild    = {}         -- filled via AddBuildGroup
-    o.stopped    = false
+
+    o.tag      = params.baseTag or ('BE_'.. math.floor(100000 * Random()))
+    o.alloc    = params._alloc or GetAllocator(o.brain)
+    o.stopped  = false
+    o.tracked  = { T1={}, T2={}, T3={}, SCU={} }
+    o.faction  = (o.brain.GetFactionIndex and o.brain:GetFactionIndex()) or 1
+
+    local C = o.params.counts
+    local d = o.params.difficulty
+    o.desired = {
+        T1  = (C[1] and C[1][d]) or 0,
+        T2  = (C[2] and C[2][d]) or 0,
+        T3  = (C[3] and C[3][d]) or 0,
+        SCU = (C[4] and C[4][d]) or 0,
+    }
+
+    o.leased   = {}
+    o.pending  = {}
+    o.leaseId  = nil
+
     o:Start()
     return o
 end
 
-local function AddBuildGroup(handle, groupTbl)
-    if not (handle and handle.rebuild) then return end
-    if type(groupTbl) ~= 'table' then return end
-    for _, e in ipairs(groupTbl) do
-        if e and e.bp and e.pos then
-            table.insert(handle.rebuild, { bp=e.bp, pos=e.pos, heading=e.heading or 0, done=false })
-        end
-    end
+function Stop(handle)
+    if handle and handle.Stop then handle:Stop() end
 end
 
-local function Stop(handle) if handle and handle.Stop then handle:Stop() end end
-
-
--- ===== external rebuild groups (BaseManager integration) =====
-function M:_FetchExternalRebuildGroups()
-    -- Prefer explicit fetcher
-    if type(self.params.fetchRebuildGroups) == 'function' then
-        local ok, list = pcall(self.params.fetchRebuildGroups, self.params.baseManager)
-        if ok and type(list) == 'table' then return list end
-    end
-    local bm = self.params.baseManager
-    if not bm then return nil end
-
-    -- Try method forms
-    if type(bm.GetRebuildGroups) == 'function' then
-        local ok, list = pcall(bm.GetRebuildGroups, bm)
-        if ok and type(list) == 'table' then return list end
-    end
-    if type(bm.GetBuildGroups) == 'function' then
-        local ok, list = pcall(bm.GetBuildGroups, bm)
-        if ok and type(list) == 'table' then return list end
-    end
-
-    -- Try common fields
-    if type(bm.RebuildGroups) == 'table' then return bm.RebuildGroups end
-    if type(bm.BuildGroups)   == 'table' then return bm.BuildGroups   end
-
-    return nil
-end
-
-function M:RebuildSourceLoop()
-    self:Dbg('RebuildSourceLoop: start')
-    local seen = {}
-    local function key(e)
-        if not e or not e.bp or not e.pos then return nil end
-        local x = math.floor((e.pos[1] or 0) + 0.5)
-        local z = math.floor((e.pos[3] or 0) + 0.5)
-        return string.format('%s@%d@%d', string.lower(e.bp), x, z)
-    end
-
-    while not self.stopped do
-        local ext = self:_FetchExternalRebuildGroups()
-        if type(ext) == 'table' then
-            for _, e in ipairs(ext) do
-                if e and e.bp and e.pos then
-                    local k = key(e)
-                    if k and not seen[k] then
-                        table.insert(self.rebuild, { bp=e.bp, pos=e.pos, heading=e.heading or 0, done=false })
-                        seen[k] = true
-                    end
-                end
-            end
-        end
-        WaitSeconds(2)
-    end
-    self:Dbg('RebuildSourceLoop: end')
-end
-
-
--- export
-function StartManager(params) return Start(params) end
-Start = StartManager
-AddBuildGroup = AddBuildGroup
-Stop = Stop
+return { Start = Start, Stop = Stop }

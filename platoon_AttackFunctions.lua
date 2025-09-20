@@ -1,4 +1,4 @@
--- /maps/.../platoon_AttackFunctions.lua
+-- Created by Ruanuku/Cavthena
 -- Platoon Attack Manager: Wave & Raid attacks (autonomous target finding)
 --
 -- WaveAttack: clears areas of enemy structures by clustering (closest or concentration).

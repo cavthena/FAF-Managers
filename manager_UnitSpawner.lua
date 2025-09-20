@@ -1,4 +1,4 @@
--- /maps/.../manager_UnitSpawner.lua
+-- Created by Ruanuku/Cavthena
 -- AI Unit Spawner (direct spawn, wave & loss-gated modes)
 --
 -- What it does
