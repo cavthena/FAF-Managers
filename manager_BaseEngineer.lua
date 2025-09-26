@@ -1,20 +1,32 @@
--- /maps/faf_coop_U01.v0001/manager_BaseEngineer.lua
--- Base Engineer Manager (Part 1) — v4 (callback‑free)
---
--- Why v4?
---   • Removes ALL factory AddUnitCallback hooks to avoid nil‑category crashes in DoOnUnitBuiltCallbacks.
---   • Still isolates ownership: we only tag engineers rolled off our currently leased factories
---     that match a pending build we queued AND only while there is a deficit for that tier.
---   • Keeps headcount/rebuild + periodic debug headcount.
---   • Lua 5.0 safe (no '#', '%', or 'goto').
---
--- Public API
---   local BaseEng = import('/maps/.../manager_BaseEngineer.lua')
---   local handle = BaseEng.Start{
---     brain=..., baseMarker='...', difficulty=1..3, baseManager=nil, baseTag='...',
---     counts={{1,2,3},{1,2,3},{1,2,3},{0,0,1}}, radius=60, priority=120, wantFactories=1,
---     spawnSpread=2, debug=false, _alloc=nil }
---   BaseEng.Stop(handle)
+-- Created by Ruanuku/Cavthena
+-- Base Engineer Manager
+
+-- local handle = BaseEngineer.Start{
+--     brain           = ArmyBrains[Army],
+--     baseMarker      = 'marker',
+--     baseTag         = 'tag',
+--     radius          = 65,
+--     difficulty      = Difficulty,
+--     structGroups    = {'UnitGroup'},
+
+--     counts          = {{0,0,0}, {0,0,0}, {0,0,0}, {0,0,0}} -- T1, T2, T3, SCU. {Easy, Normal, Hard}
+--     priority        = 120,
+--     wantFactories   = 1,
+--     spawnSpread     = 2,
+--     _alloc          = self.GetAllocator(ArmyBrains[Army]),
+
+--     tasks = {
+--         min         = {BUILD = 0, ASSIST = 0, EXP = 0},
+--         max         = {BUILD = 1, ASSIST = 1, EXP = 1},
+--         exp = {
+--             marker  = 'marker',
+--             cooldown= 180,
+--             bp      = 'bp',
+--             attackFn= Function,
+--             attackData= {},
+--         },
+--     },
+-- }
 
 local ScenarioUtils     = import('/lua/sim/ScenarioUtilities.lua')
 local FactoryAllocMod   = import('/maps/faf_coop_U01.v0001/manager_FactoryHandler.lua')
@@ -71,6 +83,36 @@ end
 
 local function tgetn(t)
     return table.getn(t or {})
+end
+
+local function _ArmyNameFromBrain(brain)
+    if not brain then return nil end
+    local idx = brain.GetArmyIndex and brain:GetArmyIndex()
+    if not idx then return nil end
+    if ArmyBrains and ArmyBrains[idx] and ArmyBrains[idx].Name then
+        return ArmyBrains[idx].Name    -- fallback
+    end
+    return ('ARMY_' .. tostring(idx))  -- last-ditch
+end
+
+local function _TryGetUnitsFromGroup(name)
+    if not name then return {} end
+    local list = {}
+
+    local ok, g = pcall(function() return ScenarioUtils.GetUnitGroup(name) end)
+    if ok and type(g) == 'table' then
+        for _, u in pairs(g) do table.insert(list, u) end
+    end
+
+    if (table.getn(list) == 0) and ScenarioInfo and ScenarioInfo.Groups and ScenarioInfo.Groups[name] then
+        local gg = ScenarioInfo.Groups[name]
+        if gg and gg.Units then
+            for _, rec in ipairs(gg.Units) do
+                if rec and rec.Unit then table.insert(list, rec.Unit) end
+            end
+        end
+    end
+    return list
 end
 
 local M = {}
@@ -136,21 +178,63 @@ function M:_OnEngineerGone(u)
     local tier = u._be_tier
     if tier and self.tracked[tier] then
         self.tracked[tier][id] = nil
+        self.engTask[id] = nil
         self:Dbg(('Engineer lost: id=%d tier=%s'):format(id, tostring(tier)))
     end
 end
 
 function M:_TagAndTrack(u, tier)
     if not u then return end
-    u.be_tag  = self.tag
+    u.be_tag   = self.tag
     u._be_tier = tier
     local id = u:GetEntityId()
     self.tracked[tier] = self.tracked[tier] or {}
     self.tracked[tier][id] = u
+    self.engTask = self.engTask or {}
+    self.engTask[id] = self.engTask[id] or 'IDLE'
+
     if u.AddUnitCallback then
         u:AddUnitCallback(function(unit) self:_OnEngineerGone(unit) end, 'OnKilled')
         u:AddUnitCallback(function(unit) self:_OnEngineerGone(unit) end, 'OnCaptured')
         u:AddUnitCallback(function(unit) self:_OnEngineerGone(unit) end, 'OnReclaimed')
+    end
+end
+
+function M:_CreateStructGroups()
+    local groups = self.params.structGroups or {}
+    if table.getn(groups) == 0 then return end
+
+    local armyName = _ArmyNameFromBrain(self.brain)
+    if not armyName then
+        self:Warn('StructGroups: unable to resolve army from brain; skip spawning')
+        return
+    end
+
+    for _, gname in ipairs(groups) do
+        -- Skip if the group is already present in the world (e.g., spawned earlier)
+        local existing = _TryGetUnitsFromGroup(gname)
+        if table.getn(existing) > 0 then
+            if self.params.debug then
+                self:Dbg(('StructGroups: "%s" already present (%d units); skip create')
+                    :format(gname, table.getn(existing)))
+            end
+        else
+            -- Create the group for our brain's army
+            local ok, units = pcall(function()
+                return ScenarioUtils.CreateArmyGroup(armyName, gname, false)
+            end)
+            if ok then
+                -- NEW: remember the actual unit instances we just created
+                self.structGroupUnits = self.structGroupUnits or {}
+                self.structGroupUnits[gname] = units or {}
+                if self.params.debug then
+                    local count = (units and table.getn(units)) or 0
+                    self:Dbg(('StructGroups: created "%s" (%d units)'):format(gname, count))
+                end
+            else
+                self:Warn(('StructGroups: failed to create "%s"'):format(tostring(gname)))
+            end
+        end
     end
 end
 
@@ -417,6 +501,7 @@ function M:_CollectorSweep()
                         self.tracked[tier] = self.tracked[tier] or {}
                         if not self.tracked[tier][id] then
                             self.tracked[tier][id] = u
+    self.engTask[id] = self.engTask[id] or 'IDLE'
                             self:Dbg(('Collector verify ours: id=%d tier=%s'):format(id, tier))
                         end
                     -- Case B: untagged AND we have a pending slot for this bp at any leased factory
@@ -473,10 +558,718 @@ function M:_DebugHeadcount()
     end
 end
 
+-- === Structure template from editor groups; hardcoded rebuild+upgrade-to-target ===
+local function _unitIsStructure(u)
+    if not (u and (not u.Dead)) then return false end
+    if not u.GetBlueprint then return false end
+    -- count true structures AND wall sections
+    return EntityCategoryContains(categories.STRUCTURE, u)
+        or EntityCategoryContains(categories.WALL, u)
+end
+
+local function _posOf(u)
+    if not u or not u.GetPosition then return nil end
+    local p = u:GetPosition(); return p and {p[1], p[2], p[3]} or nil
+end
+
+local function _headingOf(u)
+    if not u or not u.GetOrientation then return 0 end
+    local o = u:GetOrientation(); return (type(o) == 'number') and o or 0
+end
+
+local function _bpIdFromUnit(u)
+    if unitBpId then return unitBpId(u) end
+    if _shortBpId then return _shortBpId(u) end
+    local bp = u and u.GetBlueprint and u:GetBlueprint()
+    return bp and string.lower(bp.BlueprintId or '') or nil
+end
+
+local function _FindStructureNear(brain, pos, bp, radius)
+    if not (brain and pos) then return nil end
+    local r = radius or 2.5
+    local cats = categories.STRUCTURE + categories.WALL
+    local around = brain:GetUnitsAroundPoint(cats, pos, r, 'Ally') or {}
+    for i = 1, table.getn(around) do
+        local s = around[i]
+        if s and (not s.Dead) and _unitIsStructure(s) then
+            if (not bp) or (_bpIdFromUnit(s) == string.lower(bp)) then
+                return s
+            end
+        end
+    end
+    return nil
+end
+
+-- === Upgrade-chain helpers (hardcoded policy: match target blueprint) ===
+local function _Bp(bpId) return __blueprints and __blueprints[bpId] end
+
+local function _ChainRoot(bpId)
+    if not bpId then return nil end
+    local cur = string.lower(bpId)
+    local seen = {}
+    while cur and _Bp(cur) and not seen[cur] do
+        seen[cur] = true
+        local prev = _Bp(cur).General and _Bp(cur).General.UpgradesFrom
+        if type(prev) == 'string' then
+            prev = string.lower(prev)
+            -- STOP if empty or 'none'
+            if prev ~= '' and prev ~= 'none' then
+                cur = prev
+            else
+                break
+            end
+        else
+            break
+        end
+    end
+    -- safety: never return 'none'
+    if cur == 'none' then return nil end
+    return cur
+end
+
+local function _ChainNext(bpId)
+    if not bpId then return nil end
+    local up = _Bp(bpId) and _Bp(bpId).General and _Bp(bpId).General.UpgradesTo
+    return (type(up) == 'string' and up ~= '') and string.lower(up) or nil
+end
+
+-- Is cur in the same chain and not higher than target? (cur == target or below it)
+local function _IsSameChainAndNotAbove(cur, target)
+    if not (cur and target) then return false end
+    cur, target = string.lower(cur), string.lower(target)
+    -- Walk backwards from target via UpgradesFrom; if we hit cur, cur is <= target in same chain
+    local seen, t = {}, target
+    while t and _Bp(t) and not seen[t] do
+        if t == cur then return true end
+        seen[t] = true
+        local prev = _Bp(t).General and _Bp(t).General.UpgradesFrom
+        if type(prev) == 'string' and prev ~= '' then t = string.lower(prev) else break end
+    end
+    return false
+end
+
+local function _FindStructureForSlot(brain, slot)
+    if not (brain and slot and slot.pos) then return nil end
+    local r = 2.0  -- tighter than 2.5 to reduce neighbors; adjust if needed
+    local around = brain:GetUnitsAroundPoint(categories.STRUCTURE + categories.WALL, slot.pos, r, 'Ally') or {}
+    local exact, chainOK = nil, nil
+    local target = string.lower(slot.bpTarget)
+
+    for i = 1, table.getn(around) do
+        local s = around[i]
+        if s and (not s.Dead) and _unitIsStructure(s) then
+            local cur = _bpIdFromUnit(s)
+            if cur then
+                if cur == target then
+                    exact = s
+                    break
+                elseif _IsSameChainAndNotAbove(cur, target) then
+                    chainOK = chainOK or s
+                end
+            end
+        end
+    end
+
+    return exact or chainOK
+end
+
+
+-- ===================== Tasking (IDLE / BUILD / ASSIST / EXP) =====================
+-- (Hardcoded options per user request)
+--  * IDLE timings & radius are fixed; moveRadius == self.params.radius
+--  * ASSIST always includes factories and experimentals
+--  * EXP requires explicit tasks.exp.bp (no faction table). Engineers return to pool during cooldown.
+--  * BUILD uses BaseManager BuildGroup info via standard methods; falls back to queue providers.
+--  * Priority: BUILD > ASSIST > EXP > IDLE; IDLE is the pool (no max).
+
+local function _copy(t)
+    local o = {}
+    for k,v in pairs(t or {}) do o[k] = v end
+    return o
+end
+
+local function _NormalizeTasks(p)
+    local t = p.tasks or {}
+    local min = _copy(t.min or {})
+    local max = _copy(t.max or {})
+    if min.IDLE  == nil then min.IDLE = 0 end
+    if min.BUILD == nil then min.BUILD = 0 end
+    if min.ASSIST== nil then min.ASSIST= 0 end
+    if min.EXP   == nil then min.EXP   = 0 end
+    if max.BUILD == nil then max.BUILD = 999 end
+    if max.ASSIST== nil then max.ASSIST= 999 end
+    if max.EXP   == nil then max.EXP   = 1 end
+
+    local exp = t.exp or {}
+    exp.marker = exp.marker or p.baseMarker
+    exp.cooldown = exp.cooldown or 0
+    -- exp.bp must be provided manually by caller
+    exp.bp = exp.bp
+
+    local assist = t.assist or {}
+    local idle = t.idle or {}
+
+    local build = t.build or {}
+
+    return { min=min, max=max, exp=exp, assist=assist, idle=idle, build=build }
+end
+
+local function _shortBpId(u)
+    if unitBpId then return unitBpId(u) end
+    if not u then return nil end
+    local id = (u.BlueprintID or (u.GetBlueprint and u:GetBlueprint() and u:GetBlueprint().BlueprintId))
+    if not id then return nil end
+    id = string.lower(id)
+    local short = string.match(id, '/units/([^/]+)/') or id
+    return short
+end
+
+local function _TryIssueBuildMobile(u, bp, pos, facing)
+    if not (u and (not u.Dead)) then return false end
+    if not bp then return false end
+
+    -- Accept marker names defensively
+    if type(pos) == 'string' then
+        pos = ScenarioUtils.MarkerToPosition(pos)
+    end
+    if type(pos) ~= 'table' or not pos[1] or not pos[3] then
+        return false
+    end
+
+    local cq0 = 0
+    if u.GetCommandQueue then
+        cq0 = table.getn(u:GetCommandQueue() or {})
+    end
+
+    -- NOTE: FAF expects (units, POS, BP, facing)
+    IssueBuildMobile({u}, pos, bp, {})
+
+    local cq1 = cq0
+    if u.GetCommandQueue then
+        cq1 = table.getn(u:GetCommandQueue() or {})
+    end
+    return cq1 > cq0
+end
+
+
+local function _ForkAttackUnit(brain, unit, attackFn, attackData, tag)
+    if not (brain and unit and (not unit.Dead)) then return end
+    local name = (tag or 'BE') .. '_ExpAttack_' .. tostring(unit:GetEntityId())
+    local p = brain:MakePlatoon(name, '')
+    brain:AssignUnitsToPlatoon(p, {unit}, 'Attack', 'GrowthFormation')
+    if attackFn then
+        local fn = attackFn
+        if type(fn) == 'string' then fn = rawget(_G, fn) end
+        if type(fn) == 'function' then
+            p.PlatoonData = attackData or {}
+            p:ForkAIThread(function(pl) return fn(pl, pl.PlatoonData) end)
+        end
+    end
+end
+
+function M:_InitTasking()
+    self.tasks = _NormalizeTasks(self.params)
+    self.engTask = {}   
+    self.expState = { active=false, lastDoneAt=0, startedAt=0, bp=nil, pos=nil }
+    self.buildQueue = {}  
+end
+
+function M:UpdateTaskPrefs(newPrefs)
+    self.params.tasks = self.params.tasks or {}
+    for k,v in pairs(newPrefs or {}) do self.params.tasks[k] = v end
+    self.tasks = _NormalizeTasks(self.params)
+end
+
+function M:PushBuildTask(bp, pos, facing)
+    table.insert(self.buildQueue, {bp=bp, pos=pos, facing=facing or 0})
+end
+
+function M:ClearBuildQueue() self.buildQueue = {} end
+
+function M:_EnumerateEngineers()
+    local list = {}
+    for tier, set in pairs(self.tracked or {}) do
+        for id, u in pairs(set or {}) do
+            if u and (not u.Dead) and isComplete(u) and u:GetAIBrain()==self.brain then
+                u._be_tier = tier
+                table.insert(list, {id=id, u=u, tier=tier})
+            end
+        end
+    end
+    return list
+end
+
+function M:_AssignEngineer(id, u, task)
+    local prev = self.engTask[id]
+    if prev ~= task then
+        self.engTask[id] = task
+        if u and not u.Dead then
+            IssueClearCommands({u})
+        end
+    end
+end
+
+function M:_InitStructTemplate()
+    self.struct = { slots = {} }
+    local seen = {}
+
+    for _, gname in ipairs(self.params.structGroups or {}) do
+        -- NEW: prefer the live units we spawned; fall back to editor group lookup
+        local units = (self.structGroupUnits and self.structGroupUnits[gname]) or _TryGetUnitsFromGroup(gname) or {}
+        for i = 1, table.getn(units) do
+            local u = units[i]
+            if _unitIsStructure(u) then
+                local targetBp = _bpIdFromUnit(u)
+                local pos      = _posOf(u)
+                if targetBp and pos then
+                    local slot = {
+                        bpTarget = targetBp,
+                        bpRoot   = _ChainRoot(targetBp) or targetBp,
+                        pos      = pos,
+                        facing   = _headingOf(u),
+                    }
+                    local key = string.format('%s@%.1f,%.1f,%.1f', slot.bpTarget, pos[1], pos[2], pos[3])
+                    if not seen[key] then
+                        table.insert(self.struct.slots, slot)
+                        seen[key] = true
+                    end
+                end
+            end
+        end
+    end
+
+    if self.params.debug then
+        self:Dbg(('StructTemplate: %d slots captured from %d group(s)')
+            :format(table.getn(self.struct.slots or {}), table.getn(self.params.structGroups or {})))
+    end
+end
+
+function M:_SyncStructureDemand()
+    if not (self.struct and self.struct.slots) then return end
+
+    for _, slot in ipairs(self.struct.slots) do
+        local present = _FindStructureForSlot(self.brain, slot)
+
+        if not present then
+            -- Missing/destroyed -> build chain root
+            self:PushBuildTask(slot.bpRoot, slot.pos, slot.facing or 0)
+            if self.params.debug then
+                self:Dbg(('Rebuild queued: want=%s (root=%s) at (%.1f,%.1f,%.1f)')
+                    :format(slot.bpTarget, slot.bpRoot, slot.pos[1], slot.pos[2], slot.pos[3]))
+            end
+        else
+            local cur = _bpIdFromUnit(present)
+            if cur ~= slot.bpTarget then
+                -- Same chain and below -> upgrade one step
+                if _IsSameChainAndNotAbove(cur, slot.bpTarget) then
+                    if present.IsUnitState and not present:IsUnitState('Upgrading') then
+                        local nxt = _ChainNext(cur)
+                        if nxt then
+                            IssueUpgrade({present}, nxt)
+                            if self.params.debug then
+                                self:Dbg(('Upgrade issued: %s → %s at (%.1f,%.1f,%.1f)')
+                                    :format(cur or '?', nxt, slot.pos[1], slot.pos[2], slot.pos[3]))
+                            end
+                        end
+                    end
+                else
+                    -- Different chain/type very near the slot — likely a neighbor; ignore.
+                    -- (No warning spam.)
+                end
+            end
+        end
+    end
+end
+
+
+function M:_FindDamagedStructure()
+    local pos = self.basePos
+    if not pos then return nil end
+    local r = self.params.radius or 60
+    local around = self.brain:GetUnitsAroundPoint(categories.STRUCTURE, pos, r, 'Ally') or {}
+    local i = 1
+    while i <= table.getn(around) do
+        local s = around[i]
+        if s and (not s.Dead) and s.GetHealth and s.GetMaxHealth then
+            local hp = s:GetHealth()
+            local mx = s:GetMaxHealth()
+            if hp and mx and mx > 0 and hp < mx then
+                return s
+            end
+        end
+        i = i + 1
+    end
+    return nil
+end
+
+function M:_FindAssistTargets()
+    local targ = {}
+    local pos = self.basePos
+    local r = self.params.radius or 60
+
+    do -- includeFactories always true
+        local fac = self.brain:GetUnitsAroundPoint(categories.FACTORY, pos, r, 'Ally') or {}
+        local i = 1
+        while i <= table.getn(fac) do
+            local f = fac[i]
+            if f and (not f.Dead) then
+                local active = false
+                if f.IsUnitState and f:IsUnitState('Building') then active = true end
+                if (not active) and f.GetCommandQueue then
+                    local q = f:GetCommandQueue() or {}
+                    if table.getn(q) > 0 then active = true end
+                end
+                if active then table.insert(targ, f) end
+            end
+            i = i + 1
+        end
+    end
+
+    do -- includeExperimentals always true
+        if self.expState.active and self.expState.builder and (not self.expState.builder.Dead) then
+            table.insert(targ, self.expState.builder)
+        else
+            local ex = self.brain:GetUnitsAroundPoint(categories.EXPERIMENTAL, pos, r + 20, 'Ally') or {}
+            local j = 1
+            while j <= table.getn(ex) do
+                local u = ex[j]
+                if u and (not u.Dead) and u.IsUnitState and u:IsUnitState('BeingBuilt') then
+                    table.insert(targ, u)
+                end
+                j = j + 1
+            end
+        end
+    end
+
+    return targ
+end
+
+function M:_TickIdle(u, id, now)
+    if not u or u.Dead then return end
+    local s = self:_FindDamagedStructure()
+    if s then
+        IssueRepair({u}, s)
+        return
+    end
+    local q = (u.GetCommandQueue and u:GetCommandQueue()) or {}
+    if table.getn(q) == 0 then
+        local pos = self.basePos
+        if not pos then return end
+        local rr = (self.params.radius or 60) -- hardcoded moveRadius == base radius
+        local ox = (Random()*2 - 1) * rr
+        local oz = (Random()*2 - 1) * rr
+        IssueMove({u}, {pos[1] + ox, pos[2], pos[3] + oz})
+    end
+end
+
+function M:_TickAssist(u, id, now, targets, distrib)
+    if not u or u.Dead then return end
+    if table.getn(targets) == 0 then
+        self:_AssignEngineer(id, u, 'IDLE')
+        return
+    end
+    local pickIdx = 1
+    local bestCount = 999999
+    local i = 1
+    while i <= table.getn(targets) do
+        local t = targets[i]
+        if t and (not t.Dead) then
+            local tid = t:GetEntityId()
+            local c = (distrib[tid] or 0)
+            if c < bestCount then
+                bestCount = c
+                pickIdx = i
+            end
+        end
+        i = i + 1
+    end
+    local tgt = targets[pickIdx]
+    if tgt and (not tgt.Dead) then
+        distrib[tgt:GetEntityId()] = (distrib[tgt:GetEntityId()] or 0) + 1
+        IssueGuard({u}, tgt)
+    else
+        self:_AssignEngineer(id, u, 'IDLE')
+    end
+end
+
+function M:_TickBuild(u, id, now)
+    if not u or u.Dead then return end
+    if u.IsUnitState and u:IsUnitState('Building') then return end
+
+    local task = table.remove(self.buildQueue, 1)
+    if not task then
+        self:_AssignEngineer(id, u, 'IDLE')
+        return
+    end
+
+    local bp = task.bp or task.blueprint or task.bpId
+    local pos = task.pos or task.position
+    local face = task.facing or 0
+    if not (bp and pos) then
+        self:Warn('BUILD task missing bp or pos; skipping')
+        return
+    end
+
+    local landed = _TryIssueBuildMobile(u, bp, pos, face)
+    if not landed then
+        table.insert(self.buildQueue, 1, {bp=bp, pos=pos, facing=face})
+        self:_AssignEngineer(id, u, 'IDLE')
+        return
+    end
+
+    self.brain:ForkThread(function()
+        local waited = 0
+        local timeout = 1200
+        while not (u.Dead) and waited < timeout do
+            WaitSeconds(1)
+            waited = waited + 1
+            if u.IsUnitState and (not u:IsUnitState('Building')) then
+                break
+            end
+        end
+    end)
+end
+
+function M:_TickExp(u, id, now)
+    if not u or u.Dead then return end
+    if not (u._be_tier == 'T3' or u._be_tier == 'SCU') then
+        self:_AssignEngineer(id, u, 'IDLE')
+        return
+    end
+
+    local ex = self.expState
+    if (not ex.active) then
+        local elapsed = now - (ex.lastDoneAt or 0)
+        if elapsed < (self.tasks.exp.cooldown or 0) then
+            self:_AssignEngineer(id, u, 'IDLE')
+            return
+        end
+        local marker = self.tasks.exp.marker or self.params.baseMarker
+        local pos = marker and ScenarioUtils.MarkerToPosition(marker) or self.basePos
+        if not pos then
+            self:Warn('EXP: invalid marker/pos; returning engineers to pool')
+            self:_AssignEngineer(id, u, 'IDLE')
+            return
+        end
+        if not self.tasks.exp.bp then
+            self:_AssignEngineer(id, u, 'IDLE')
+            return
+        end
+        ex.bp = self.tasks.exp.bp
+        ex.pos = pos
+        ex.startedAt = now
+        ex.active = true
+        ex.builder = u
+    end
+
+    if ex.active and ex.bp and ex.pos then
+        _TryIssueBuildMobile(u, ex.bp, ex.pos, 0)
+    end
+end
+
+function M:_ExpWatcher()
+    while not self.stopped do
+        if self.expState.active and self.expState.bp and self.expState.pos then
+            local pos = self.expState.pos
+            local r = 18
+            local around = self.brain:GetUnitsAroundPoint(categories.EXPERIMENTAL, pos, r, 'Ally') or {}
+            local i = 1
+            while i <= table.getn(around) do
+                local u = around[i]
+                if u and (not u.Dead) and isComplete(u) then
+                    local bid = _shortBpId(u)
+                    if bid == string.lower(self.expState.bp) then
+                        _ForkAttackUnit(self.brain, u, self.tasks.exp.attackFn, self.tasks.exp.attackData, self.tag)
+                        self:Dbg('EXP: build complete; handoff + start cooldown')
+                        self.expState.active = false
+                        self.expState.lastDoneAt = GetGameTimeSeconds and GetGameTimeSeconds() or 0
+                        self.expState.bp, self.expState.pos, self.expState.builder = nil, nil, nil
+                        for id, task in pairs(self.engTask or {}) do
+                            if task == 'EXP' then
+                                local e = nil
+                                local tierSet = self.tracked
+                                if tierSet then
+                                    if tierSet.T1 and tierSet.T1[id] then e = tierSet.T1[id] end
+                                    if (not e) and tierSet.T2 and tierSet.T2[id] then e = tierSet.T2[id] end
+                                    if (not e) and tierSet.T3 and tierSet.T3[id] then e = tierSet.T3[id] end
+                                    if (not e) and tierSet.SCU and tierSet.SCU[id] then e = tierSet.SCU[id] end
+                                end
+                                if e then
+                                    self:_AssignEngineer(id, e, 'IDLE')
+                                end
+                            end
+                        end
+                        break
+                    end
+                end
+                i = i + 1
+            end
+        end
+        WaitSeconds(1)
+    end
+end
+
+function M:TaskLoop()
+    self:Dbg('TaskLoop start')
+    self:_InitTasking()
+    self.brain:ForkThread(function() self:_ExpWatcher() end)
+
+    while not self.stopped do
+        local now = GetGameTimeSeconds and GetGameTimeSeconds() or 0
+        local all = self:_EnumerateEngineers()
+
+        -- demand signals (keep local inside TaskLoop)
+        local function hasAssistDemand()
+            local t = self:_FindAssistTargets() or {}
+            return table.getn(t) > 0
+        end
+
+        local function hasBuildDemand()
+            return (table.getn(self.buildQueue or {}) > 0)
+        end
+
+        local function hasExpDemand(now)
+            local ex = self.expState or {}
+            if ex.active then return true end
+            local cfg = (self.tasks and self.tasks.exp) or {}
+            if not cfg.bp then return false end
+            local elapsed = now - (ex.lastDoneAt or 0)
+            if elapsed < (cfg.cooldown or 0) then return false end
+            local marker = cfg.marker or self.params.baseMarker
+            local pos = marker and ScenarioUtils.MarkerToPosition(marker) or self.basePos
+            return pos ~= nil
+        end
+
+        local cnt = { IDLE=0, BUILD=0, ASSIST=0, EXP=0 }
+        for _, rec in ipairs(all) do
+            local id = rec.id
+            local t = self.engTask[id] or 'IDLE'
+            cnt[t] = (cnt[t] or 0) + 1
+        end
+
+        local function steal(fromList, need)
+            if need <= 0 then return 0 end
+            local taken = 0
+            local idx = 1
+            while idx <= table.getn(fromList) do
+                local fromTask = fromList[idx]
+                for _, rec in ipairs(all) do
+                    if taken >= need then break end
+                    local id = rec.id
+                    if (self.engTask[id] or 'IDLE') == fromTask then
+                        self:_AssignEngineer(id, rec.u, 'IDLE')
+                        cnt[fromTask] = (cnt[fromTask] or 0) - 1
+                        cnt.IDLE = (cnt.IDLE or 0) + 1
+                        taken = taken + 1
+                    end
+                end
+                if taken >= need then break end
+                idx = idx + 1
+            end
+            return taken
+        end
+
+        -- helper: move up to `need` IDLE engineers into `task`
+        local function promote(task, need, filterFn)
+            if need <= 0 then return 0 end
+            local moved = 0
+            for _, rec in ipairs(all) do
+                if moved >= need then break end
+                local id, u, tier = rec.id, rec.u, rec.tier
+                local cur = self.engTask[id] or 'IDLE'
+                if cur == 'IDLE' and (not filterFn or filterFn(rec)) then
+                    self:_AssignEngineer(id, u, task)
+                    moved = moved + 1
+                    if self.params.debug then self:Dbg(('Promote %s -> %s'):format(id, task)) end
+                end
+            end
+            return moved
+        end
+
+        -- ---------- ensure minimums (Build > Assist > Exp), but only if there is demand ----------
+        local min = self.tasks.min
+
+        local needBuild  = math.max(0, (min.BUILD  or 0) - (cnt.BUILD  or 0))
+        if needBuild > 0 and hasBuildDemand() then
+            promote('BUILD', needBuild)
+        end
+        cnt = { IDLE=0, BUILD=0, ASSIST=0, EXP=0 }
+        for _, rec in ipairs(all) do cnt[self.engTask[rec.id] or 'IDLE'] = (cnt[self.engTask[rec.id] or 'IDLE'] or 0) + 1 end
+
+        local needAssist = math.max(0, (min.ASSIST or 0) - (cnt.ASSIST or 0))
+        if needAssist > 0 and hasAssistDemand() then
+            promote('ASSIST', needAssist)
+        end
+        cnt = { IDLE=0, BUILD=0, ASSIST=0, EXP=0 }
+        for _, rec in ipairs(all) do cnt[self.engTask[rec.id] or 'IDLE'] = (cnt[self.engTask[rec.id] or 'IDLE'] or 0) + 1 end
+
+        local needExp    = math.max(0, (min.EXP    or 0) - (cnt.EXP    or 0))
+        if needExp > 0 and hasExpDemand(now) then
+            -- gate EXP to T3/SCU only
+            promote('EXP', needExp, function(rec) return rec.tier == 'T3' or rec.tier == 'SCU' end)
+        end
+        cnt = { IDLE=0, BUILD=0, ASSIST=0, EXP=0 }
+        for _, rec in ipairs(all) do cnt[self.engTask[rec.id] or 'IDLE'] = (cnt[self.engTask[rec.id] or 'IDLE'] or 0) + 1 end
+
+        -- ---------- if minimums are met, top up to caps, still demand-gated ----------
+        local minsMet = (cnt.BUILD >= (min.BUILD or 0)) and (cnt.ASSIST >= (min.ASSIST or 0)) and (cnt.EXP >= (min.EXP or 0))
+        if minsMet then
+            local max = self.tasks.max
+
+            local capBuild  = math.max(0, (max.BUILD  or 0) - (cnt.BUILD  or 0))
+            if capBuild > 0 and hasBuildDemand() then
+                promote('BUILD', math.min(capBuild, cnt.IDLE or 0))
+                cnt = { IDLE=0, BUILD=0, ASSIST=0, EXP=0 }
+                for _, rec in ipairs(all) do cnt[self.engTask[rec.id] or 'IDLE'] = (cnt[self.engTask[rec.id] or 'IDLE'] or 0) + 1 end
+            end
+
+            local capAssist = math.max(0, (max.ASSIST or 0) - (cnt.ASSIST or 0))
+            if capAssist > 0 and hasAssistDemand() then
+                promote('ASSIST', math.min(capAssist, cnt.IDLE or 0))
+                cnt = { IDLE=0, BUILD=0, ASSIST=0, EXP=0 }
+                for _, rec in ipairs(all) do cnt[self.engTask[rec.id] or 'IDLE'] = (cnt[self.engTask[rec.id] or 'IDLE'] or 0) + 1 end
+            end
+
+            local capExp    = math.max(0, (max.EXP    or 0) - (cnt.EXP    or 0))
+            if capExp > 0 and hasExpDemand(now) then
+                promote('EXP', math.min(capExp, cnt.IDLE or 0), function(rec) return rec.tier == 'T3' or rec.tier == 'SCU' end)
+                cnt = { IDLE=0, BUILD=0, ASSIST=0, EXP=0 }
+                for _, rec in ipairs(all) do cnt[self.engTask[rec.id] or 'IDLE'] = (cnt[self.engTask[rec.id] or 'IDLE'] or 0) + 1 end
+            end
+        end
+
+        local assistTargets = self:_FindAssistTargets()
+        local distrib = {}
+        for _, rec in ipairs(all) do
+            local id, u = rec.id, rec.u
+            local t = self.engTask[id] or 'IDLE'
+            if t == 'BUILD' then
+                self:_TickBuild(u, id, now)
+            elseif t == 'ASSIST' then
+                self:_TickAssist(u, id, now, assistTargets, distrib)
+            elseif t == 'EXP' then
+                self:_TickExp(u, id, now)
+            else
+                self:_TickIdle(u, id, now)
+            end
+        end
+
+        for _, rec in ipairs(all) do
+            local id = rec.id
+            if not self.engTask[id] then
+                self:_AssignEngineer(id, rec.u, 'IDLE')
+            end
+        end
+
+        WaitSeconds(1)
+    end
+    self:Dbg('TaskLoop end')
+end
 -- ===================== Threads =====================
 function M:MonitorLoop()
     self:Dbg('MonitorLoop start')
     while not self.stopped do
+        self:_SyncStructureDemand()
         local def = self:_ComputeDeficit()
         local missing = 0
         for _, n in pairs(def) do missing = missing + (n or 0) end
@@ -505,7 +1298,10 @@ end
 
 function M:Start()
     self:_SpawnInitial()
+    self:_CreateStructGroups()
+    self:_InitStructTemplate()
     self.monitorThread = self.brain:ForkThread(function() self:MonitorLoop() end)
+    self.taskThread = self.brain:ForkThread(function() self:TaskLoop() end)
 end
 
 function M:Stop()
@@ -518,6 +1314,10 @@ function M:Stop()
     if self.monitorThread then
         KillThread(self.monitorThread)
         self.monitorThread = nil
+    end
+    if self.taskThread then
+        KillThread(self.taskThread)
+        self.taskThread = nil
     end
 end
 
@@ -539,7 +1339,7 @@ local function NormalizeParams(p)
         brain        = p.brain,
         baseMarker   = p.baseMarker,
         difficulty   = d,
-        baseManager  = p.baseManager,
+        structGroups = p.structGroups,
         baseTag      = p.baseTag,
         counts       = {C1, C2, C3, CS},
         radius       = p.radius or 60,
@@ -578,6 +1378,8 @@ function Start(params)
     o.leased   = {}
     o.pending  = {}
     o.leaseId  = nil
+
+    o.structGroupUnits = {}
 
     o:Start()
     return o

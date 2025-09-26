@@ -781,7 +781,7 @@ function Builder:MonitorLoop()
 
             self:QueueNeededBuilds(haveTbl or {})
 
-            -- stall watchdog (15 min) + NEW early-handoff idle tracker (30s)
+            -- stall watchdog (30s) + NEW early-handoff idle tracker (10s)
             local allIdle = self:_AllFactoriesIdle()
             if self._haveSum ~= haveTotal then
                 self._haveSum = haveTotal
@@ -791,14 +791,14 @@ function Builder:MonitorLoop()
                 if allIdle then
                     self._stuckCounter = (self._stuckCounter or 0) + 1
                     self._idleAllCounter = (self._idleAllCounter or 0) + 1
-                    if self._stuckCounter >= 900 then
+                    if self._stuckCounter >= 30 then
                         self:Warn(('Monitor: STALL (idle, no completed increase for %ds) -> resetting inProd and requeue'):format(self._stuckCounter))
                         self.inProd = {}
                         self._stuckCounter = 0
                         self:QueueNeededBuilds(haveTbl or {})
                     end
-                    -- NEW: Early handoff after 30 consecutive idle seconds
-                    if self._idleAllCounter >= 30 then
+                    -- NEW: Early handoff after 10 consecutive idle seconds
+                    if self._idleAllCounter >= 10 then
                         self:Warn(('Monitor: factories idle for %ds -> EarlyHandoff with %d/%d units')
                             :format(self._idleAllCounter, haveTotal, wantTotal))
                         self.stagingPlatoon = self.stagingPlatoon
@@ -816,7 +816,7 @@ function Builder:MonitorLoop()
             -- Before handoff, require ALL expected units are assembled at the rally point
             local rpos    = getRallyPos(self.params) or self.basePos
             local radius  = 12
-            local timeout = 900
+            local timeout = 30
             local waited  = 0
             local ready   = false
 
@@ -1174,7 +1174,7 @@ function Builder:Mode3Loop(p)
                 WaitSeconds(0.5)
             end
             -- wait at rally
-            local rpos, radius, timeout = getRallyPos(self.params) or self.basePos, 12, 900
+            local rpos, radius, timeout = getRallyPos(self.params) or self.basePos, 12, 30
             local waited = 0
             while not self.stopped and self.brain:PlatoonExists(p) do
                 local at = 0
