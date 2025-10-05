@@ -7,6 +7,17 @@ local ScenarioUtils = import('/lua/sim/ScenarioUtilities.lua')
 local Alloc = {}
 Alloc.__index = Alloc
 
+ScenarioInfo.AllocByBrain = ScenarioInfo.AllocByBrain or {}
+function GetAllocator(brain)
+    if not brain then return nil end
+    local alloc = ScenarioInfo.AllocByBrain[brain]
+    if not alloc then
+        alloc = Alloc.New(brain)
+        ScenarioInfo.AllocByBrain[brain] = alloc
+    end
+    return alloc
+end
+
 local function FactoryDomainCats(domain)
     if domain == 'LAND' then
         return categories.FACTORY * categories.LAND
@@ -18,6 +29,20 @@ local function FactoryDomainCats(domain)
     else
         return categories.FACTORY
     end
+end
+
+local AGE_RATE   = 0.33  -- points per second (20 per minute)
+local PRI_MIN, PRI_MAX = 0, 200
+local function EffectivePriority(req, now)
+    if not req then return 0 end
+    local base = math.max(PRI_MIN, math.min(PRI_MAX, req.priority or 0))
+    local age  = 0
+    if req.enqueuedAt and now then
+        age = math.max(0, now - req.enqueuedAt)
+    end
+    local eff = base + (age * AGE_RATE)
+    if eff > PRI_MAX then eff = PRI_MAX end
+    return eff
 end
 
 function Alloc.New(armyBrain)
@@ -73,6 +98,7 @@ function Alloc:RequestFactories(params)
     end
 
     self.Requests[id] = req
+    req.enqueuedAt = GetGameTimeSeconds and GetGameTimeSeconds() or 0
     self:Enqueue(id)
     return id
 end
@@ -113,6 +139,24 @@ end
 
 -- ================= Internals =================
 
+function Alloc:HasHigherPriorityWaiter(myPriority)
+    local now = GetGameTimeSeconds and GetGameTimeSeconds() or 0
+    for _, id in ipairs(self.Queue or {}) do
+        local req = self.Requests[id]
+        if req then
+            local have = 0
+            for _ in pairs(req.granted or {}) do have = have + 1 end
+            local target = (req.want == 0) and math.huge or (req.want or 0)
+            local need = math.max(0, target - have)
+            local eff = EffectivePriority(req, now)
+            if need > 0 and eff > (myPriority or 0) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
 function Alloc:Enqueue(id)
     table.insert(self.Queue, id)
     table.sort(self.Queue, function(a, b)
@@ -144,6 +188,16 @@ function Alloc:Tick()
             self.FactoryState[entId] = nil
         end
     end
+
+    -- Re-sort queue each tick by aged priority (higher first)
+    local now = GetGameTimeSeconds and GetGameTimeSeconds() or 0
+    table.sort(self.Queue, function(a, b)
+        local ra, rb = self.Requests[a], self.Requests[b]
+        if not ra or not rb then return (a or 0) < (b or 0) end
+        local pa, pb = EffectivePriority(ra, now), EffectivePriority(rb, now)
+        if pa == pb then return (ra.id or 0) < (rb.id or 0) end -- FIFO among equals
+        return pa > pb
+    end)
 
     -- Service requests in priority order
     for _, id in ipairs(self.Queue) do
@@ -195,61 +249,30 @@ function Alloc:Service(req)
 
     local target = (req.want == 0) and math.huge or req.want
     local need = math.max(0, target - have)
-    if need == 0 then return end
 
-    -- Lease unleased candidates
-    local grantedNow = {}
-    for _, u in ipairs(candidates) do
-        if need <= 0 then break end
-        local entId = u:GetEntityId()
-        local fs = self.FactoryState[entId]
-        if fs and not fs.leased then
-            fs.leased = true
-            fs.leaseId = req.id
-            req.granted[entId] = u
-            table.insert(grantedNow, u)
-            need = need - 1
-        end
-    end
-
-    if table.getn(grantedNow) > 0 then
-        if have == 0 and req.onGrant then
-            pcall(req.onGrant, grantedNow, req.id)
-        elseif req.onUpdate then
-            pcall(req.onUpdate, grantedNow, req.id)
-        end
-    end
-
-    -- Optional strict preemption is available below if you want it later
-end
-
-function Alloc:PreemptLower(highReq, target)
-    local have = 0
-    for _ in pairs(highReq.granted) do have = have + 1 end
-    if have >= target then return end
-    local need = target - have
-
-    for entId, fs in pairs(self.FactoryState) do
-        if need <= 0 then break end
-        if fs.leased and fs.leaseId and self.Requests[fs.leaseId] then
-            local lowReq = self.Requests[fs.leaseId]
-            if lowReq.priority < highReq.priority then
-                local u = fs.unit
-                if u and not u:IsDead() and self:IsNear(u, highReq.markerPos, highReq.radius) then
-                    lowReq.granted[entId] = nil
-                    if lowReq.onRevoke then pcall(lowReq.onRevoke, { [entId] = u }, lowReq.id, 'preempted') end
-                    fs.leaseId = highReq.id
-                    highReq.granted[entId] = u
-                    need = need - 1
-                end
+    -- Try to lease any unleased candidates first (existing code)
+    if need > 0 then
+        local grantedNow = {}
+        for _, u in ipairs(candidates) do
+            if need <= 0 then break end
+            local entId = u:GetEntityId()
+            local fs = self.FactoryState[entId]
+            if fs and not fs.leased then
+                fs.leased = true
+                fs.leaseId = req.id
+                req.granted[entId] = u
+                table.insert(grantedNow, u)
+                need = need - 1
             end
         end
-    end
-
-    if need <= 0 and next(highReq.granted) and highReq.onUpdate then
-        local add = {}
-        for _, u in pairs(highReq.granted) do table.insert(add, u) end
-        pcall(highReq.onUpdate, add, highReq.id)
+        if table.getn(grantedNow) > 0 then
+            if have == 0 and req.onGrant then
+                pcall(req.onGrant, grantedNow, req.id)
+            elseif req.onUpdate then
+                pcall(req.onUpdate, grantedNow, req.id)
+            end
+            have = have + table.getn(grantedNow)
+        end
     end
 end
 
@@ -259,6 +282,8 @@ function Alloc:IsNear(unit, pos, radius)
     return (dx*dx + dz*dz) <= (radius*radius)
 end
 
-function New(armyBrain)
-    return Alloc.New(armyBrain)
-end
+
+return {
+    New = Alloc.New,
+    GetAllocator = GetAllocator,
+}
