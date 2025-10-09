@@ -1,13 +1,15 @@
 -- Created by Ruanuku/Cavthena
--- AI Unit Spawner (direct spawn, wave & loss-gated modes)
+-- AI Unit Spawner (direct spawn, wave, loss-gated & wave-count modes)
 --
 -- What it does
---   • Spawns a platoon at a given marker using a composition { {bp, {e,n,h}, [label]}, ... }
+--   • Spawns a platoon at a given marker using a composition { {bp, {e,n,h}, [label], [waveStart]}, ... }
 --   • Hands the platoon to your attack function immediately (ForkAIThread)
---   • Two modes:
+--   • Three modes:
 --       1) Wave: spawn → handoff → wait waveCooldown → next wave
 --       2) Loss-gated: spawn → handoff → wait until the platoon has lost >= mode2LossThreshold → next wave,
 --          and if (and only if) the current platoon has been wiped out, apply waveCooldown before spawning again.
+--       3) Limited waves: spawn → handoff → wait a shrinking waveCooldown → next wave, until mode3WaveCount is reached.
+--          Composition entries can specify the wave they join via a 4th field (wave start, 1-indexed).
 --   • Can be cancelled at any time via Stop(handle)
 --   • Safe to run multiple spawners in parallel (unique tag per instance; no shared state)
 --
@@ -17,15 +19,15 @@
 --     brain              = ArmyBrains[ScenarioInfo.Cybran],
 --     spawnMarker        = 'AREA2_NORTHATTACK_SPAWNER',
 --     composition        = {
---         {'url0106', {3, 4, 5}, 'LABs'},
---         {'url0107', {2, 3, 4}, 'LTs'},
+--         {'url0106', {3, 4, 5}, 'LABs', 1},
+--         {'url0107', {2, 3, 4}, 'LTs', 2},
 --     },
 --     difficulty         = ScenarioInfo.Options.Difficulty or 2,  -- 1..3
 --     attackFn           = 'Platoon_BasicAttack',                 -- function or global function name
---     attackData         = {},
 --     waveCooldown       = 15,                                    -- seconds; in mode 2 it is applied only after a wipe
---     mode               = 1,                                     -- 1: cooldown, 2: gate by losses
+--     mode               = 1,                                     -- 1: cooldown, 2: gate by losses, 3: finite waves
 --     mode2LossThreshold = 0.50,                                  -- fraction lost to trigger next wave
+--     mode3WaveCount     = 5,                                     -- number of waves for mode 3
 --     spawnerTag         = 'NorthWaves',                          -- optional unique tag
 --     spawnSpread        = 6,                                     -- random XY spread around marker
 --     formation          = 'GrowthFormation',                     -- assigned formation
@@ -36,54 +38,29 @@
 local ScenarioUtils = import('/lua/sim/ScenarioUtilities.lua')
 
 -- ========== small helpers ==========
-local function copyComposition(comp)
+local function normalizeCounts(cnt)
+    if type(cnt) == 'table' then
+        return { cnt[1] or 0, cnt[2] or (cnt[1] or 0), cnt[3] or (cnt[2] or cnt[1] or 0) }
+    end
+    local value = cnt or 0
+    return { value, value, value }
+end
+
+local function normalizeComposition(comp)
     local out = {}
     for i, entry in ipairs(comp or {}) do
-        local bp    = entry[1]
-        local cnt   = entry[2]
-        local label = entry[3]
-        local cntcopy = cnt
-        if type(cnt) == 'table' then
-            cntcopy = { cnt[1] or 0, cnt[2] or (cnt[1] or 0), cnt[3] or (cnt[2] or cnt[1] or 0) }
-        end
-        out[i] = { bp, cntcopy, label }
+        local bp        = entry[1]
+        local cnt       = normalizeCounts(entry[2])
+        local label     = entry[3]
+        local waveStart = entry[4] or 1
+        out[i] = {
+            blueprint = bp,
+            counts    = cnt,
+            label     = label,
+            waveStart = math.max(1, math.floor(waveStart)),
+        }
     end
     return out
-end
-
-local function normalizeParams(p)
-    return {
-        brain              = p.brain,
-        spawnMarker        = p.spawnMarker,
-        composition        = copyComposition(p.composition),
-        difficulty         = p.difficulty or 2,
-        attackFn           = p.attackFn,
-        waveCooldown       = p.waveCooldown or 0,
-        mode               = p.mode or 1,
-        mode2LossThreshold = (p.mode2LossThreshold ~= nil) and p.mode2LossThreshold or 0.5,
-        spawnerTag         = p.spawnerTag,
-        spawnSpread        = (p.spawnSpread ~= nil) and p.spawnSpread or 6,
-        formation          = p.formation or 'GrowthFormation',
-        debug              = p.debug and true or false,
-    }
-end
-
-local function flattenCounts(composition, difficulty)
-    local wanted, order = {}, {}
-    local d = math.max(1, math.min(3, difficulty or 2))
-    for _, entry in ipairs(composition or {}) do
-        local bp   = entry[1]
-        local cnt  = entry[2]
-        local want = (type(cnt) == 'table') and cnt[d] or cnt
-        if want and want > 0 then
-            want = math.floor(want)
-            if want > 0 then
-                wanted[bp] = (wanted[bp] or 0) + want
-                table.insert(order, bp)
-            end
-        end
-    end
-    return wanted, order
 end
 
 local function markerPos(mark)
@@ -104,33 +81,12 @@ local function countComplete(units)
     return n
 end
 
-local function sumCounts(tbl)
-    local s = 0
-    for _, n in pairs(tbl or {}) do s = s + (n or 0) end
-    return s
-end
-
-local function _PickSpawnPos(markers)
-    if type(markers) ~= 'table' then
-        return markers and ScenarioUtils.MarkerToPosition(markers) or nil
+local function tableIsEmpty(tbl)
+    if not tbl then return true end
+    for _ in pairs(tbl) do
+        return false
     end
-
-    local n = table.getn(markers)
-    if n == 0 then return nil end
-
-    -- pick a random starting index, then scan for the first valid marker
-    local start = math.floor((Random() or 0) * n) + 1
-    if start < 1 then start = 1 end
-    if start > n then start = n end
-
-    for i = 0, n - 1 do
-        local idx = start + i
-        if idx > n then idx = idx - n end
-        local name = markers[idx]
-        local pos = name and ScenarioUtils.MarkerToPosition(name)
-        if pos then return pos, name end
-    end
-    return nil
+    return true
 end
 
 -- ========== class ==========
@@ -141,21 +97,73 @@ function Spawner:Log(msg) LOG(('[US:%s] %s'):format(self.tag, msg)) end
 function Spawner:Warn(msg) WARN(('[US:%s] %s'):format(self.tag, msg)) end
 function Spawner:Dbg(msg) if self.params.debug then self:Log(msg) end end
 
--- spawn a single wave and return the platoon
-function Spawner:SpawnWave(waveNo)
-    local pos, picked = _PickSpawnPos(self.params.spawnMarker)
-    if not pos then
-        self:Warn('SpawnWave: invalid spawnMarker (string or table); no usable marker found')
-        return nil
+function Spawner:GetEntryCount(entry)
+    local d = math.max(1, math.min(3, self.params.difficulty or 2))
+    local want = entry.counts[d] or 0
+    want = math.max(0, math.floor(want))
+    return want
+end
+
+function Spawner:BuildWantedForWave(waveNo)
+    local wanted = {}
+    for _, entry in ipairs(self.composition) do
+        if not waveNo or (self.params.mode == 3 and waveNo >= entry.waveStart) or (self.params.mode ~= 3) then
+            local count = self:GetEntryCount(entry)
+            if count > 0 then
+                wanted[entry.blueprint] = (wanted[entry.blueprint] or 0) + count
+            end
+        end
     end
-    if self.params.debug then
-        self:Dbg(('SpawnWave: using marker %s for wave %d'):format(tostring(picked or self.params.spawnMarker), waveNo or 1))
+    return wanted
+end
+
+function Spawner:CreatePlatoon(label, units)
+    local platoon = self.brain:MakePlatoon(label, '')
+    if units and table.getn(units) > 0 then
+        self.brain:AssignUnitsToPlatoon(platoon, units, 'Attack', self.params.formation or 'GrowthFormation')
+    end
+    return platoon
+end
+
+function Spawner:HandOffToAttack(platoon)
+    if not self.params.attackFn then
+        self:Warn('No attackFn provided; spawned platoon will idle.')
+        return
+    end
+
+    local function _AttackWrapper(p, fn)
+        self:Dbg(('AttackWrapper: label=%s units=%d fnType=%s')
+            :format((p.GetPlatoonLabel and p:GetPlatoonLabel()) or '?',
+                    table.getn(p:GetPlatoonUnits() or {}),
+                    type(fn)))
+        if type(fn) == 'function' then
+            return fn(p)
+        elseif type(fn) == 'string' then
+            local ref = _G and _G[fn] or nil
+            if type(ref) == 'function' then
+                return ref(p)
+            else
+                self:Warn('AttackWrapper: string attackFn not found in _G: '.. tostring(fn))
+            end
+        else
+            self:Warn('AttackWrapper: attackFn is not callable: '.. tostring(fn))
+        end
+    end
+
+    platoon:ForkAIThread(_AttackWrapper, self.params.attackFn)
+end
+
+function Spawner:SpawnWave(waveNo, wanted)
+    local pos = self.spawnPos
+    if not pos then
+        self:Warn('SpawnWave: invalid spawnMarker position')
+        return nil, 0
     end
 
     local spawned = {}
     local spread  = math.max(0, self.params.spawnSpread or 0)
-    for bp, count in pairs(self.wanted or {}) do
-        for i = 1, count do
+    for bp, count in pairs(wanted or {}) do
+        for _ = 1, count do
             local ox = (spread > 0) and (Random() * 2 - 1) * spread or 0
             local oz = (spread > 0) and (Random() * 2 - 1) * spread or 0
             local u = CreateUnitHPR(bp, self.brain:GetArmyIndex(), pos[1] + ox, pos[2], pos[3] + oz, 0, 0, 0)
@@ -169,43 +177,20 @@ function Spawner:SpawnWave(waveNo)
     end
 
     local label = string.format('%s_Wave_%d', self.tag, waveNo or 1)
-    local p = self.brain:MakePlatoon(label, '')
-    if table.getn(spawned) > 0 then
-        self.brain:AssignUnitsToPlatoon(p, spawned, 'Attack', self.params.formation or 'GrowthFormation')
-    end
-
-    -- handoff to attack AI
-    if self.params.attackFn then
-        local function _AttackWrapper(platoon, fn)
-            self:Dbg(('AttackWrapper: label=%s units=%d fnType=%s')
-                :format((platoon.GetPlatoonLabel and platoon:GetPlatoonLabel()) or '?',
-                        table.getn(platoon:GetPlatoonUnits() or {}),
-                        type(fn)))
-            if type(fn) == 'function' then
-                return fn(platoon)
-            elseif type(fn) == 'string' then
-                local ref = _G and _G[fn] or nil
-                if type(ref) == 'function' then
-                    return ref(platoon)
-                else
-                    self:Warn('AttackWrapper: string attackFn not found in _G: '.. tostring(fn))
-                end
-            else
-                self:Warn('AttackWrapper: attackFn is not callable: '.. tostring(fn))
-            end
-        end
-        p:ForkAIThread(_AttackWrapper, self.params.attackFn)
-    else
-        self:Warn('No attackFn provided; spawned platoon will idle.')
-    end
+    local platoon = self:CreatePlatoon(label, spawned)
+    self:HandOffToAttack(platoon)
 
     self:Dbg(('SpawnWave: spawned %d units as %s'):format(table.getn(spawned), label))
-    return p
+    return platoon, table.getn(spawned)
 end
 
-function Spawner:WaitForLossGate(platoon)
+function Spawner:WaitForLossGate(platoon, expectedCount)
     local thr = math.max(0, math.min(1, self.params.mode2LossThreshold or 0.5))
-    local wantTotal = sumCounts(self.wanted)
+    local wantTotal = expectedCount or 0
+    if wantTotal <= 0 then
+        return
+    end
+
     while not self.stopped do
         if not platoon or not self.brain:PlatoonExists(platoon) then
             self:Dbg('Mode2Gate: platoon gone; gate passed')
@@ -227,27 +212,74 @@ local function PlatoonIsDead(brain, platoon)
     return countComplete(units) == 0
 end
 
-function Spawner:MainLoop()
-    self:Dbg('MainLoop: start')
+function Spawner:GetMode3Cooldown(waveIndex, totalWaves)
+    local base = math.max(0, self.params.waveCooldown or 0)
+    local intervals = math.max(0, totalWaves - 1)
+    if intervals <= 0 then
+        return 0
+    end
+    local decrement = base / intervals
+    local remaining = math.max(0, base - decrement * (waveIndex - 1))
+    return remaining
+end
+
+function Spawner:RunMode1()
     while not self.stopped do
         self.wave = (self.wave or 0) + 1
-        local p = self:SpawnWave(self.wave)
+        self:SpawnWave(self.wave, self.baseWanted)
+        WaitSeconds(math.max(0, self.params.waveCooldown or 0))
+    end
+end
 
-        local mode = self.params.mode or 1
-        if mode == 2 then
-            -- Gate the *next* wave by losses of the current one
-            self:WaitForLossGate(p)
-
-            -- Only apply cooldown once the current platoon is fully dead (wiped).
-            -- This preserves overlap behavior while preventing instant respawns on wipes.
-            if PlatoonIsDead(self.brain, p) then
-                WaitSeconds(math.max(0, self.params.waveCooldown or 0))
-            end
-        else
+function Spawner:RunMode2()
+    while not self.stopped do
+        self.wave = (self.wave or 0) + 1
+        local platoon, spawned = self:SpawnWave(self.wave, self.baseWanted)
+        self:WaitForLossGate(platoon, spawned)
+        if self.stopped then break end
+        if PlatoonIsDead(self.brain, platoon) then
             WaitSeconds(math.max(0, self.params.waveCooldown or 0))
         end
     end
+end
+
+function Spawner:RunMode3()
+    local totalWaves = math.max(0, math.floor(self.params.mode3WaveCount or 0))
+    if totalWaves <= 0 then
+        self:Warn('Mode 3 selected but mode3WaveCount <= 0; stopping spawner.')
+        return
+    end
+
+    for wave = 1, totalWaves do
+        if self.stopped then break end
+        self.wave = wave
+        local wanted = self:BuildWantedForWave(wave)
+        if tableIsEmpty(wanted) then
+            self:Dbg(('Mode3: wave %d has no units to spawn'):format(wave))
+        end
+        self:SpawnWave(wave, wanted)
+        if wave < totalWaves and not self.stopped then
+            local cooldown = self:GetMode3Cooldown(wave, totalWaves)
+            if cooldown > 0 then
+                WaitSeconds(cooldown)
+            end
+        end
+    end
+    self.stopped = true
+end
+
+function Spawner:MainLoop()
+    self:Dbg('MainLoop: start')
+    local mode = self.params.mode or 1
+    if mode == 2 then
+        self:RunMode2()
+    elseif mode == 3 then
+        self:RunMode3()
+    else
+        self:RunMode1()
+    end
     self:Dbg('MainLoop: end')
+    self.mainThread = nil
 end
 
 function Spawner:Start()
@@ -263,24 +295,40 @@ function Spawner:Stop()
     end
 end
 
+local function normalizeParams(p)
+    return {
+        brain              = p.brain,
+        spawnMarker        = p.spawnMarker,
+        composition        = normalizeComposition(p.composition),
+        difficulty         = p.difficulty or 2,
+        attackFn           = p.attackFn,
+        waveCooldown       = p.waveCooldown or 0,
+        mode               = p.mode or 1,
+        mode2LossThreshold = (p.mode2LossThreshold ~= nil) and p.mode2LossThreshold or 0.5,
+        mode3WaveCount     = p.mode3WaveCount or 0,
+        spawnerTag         = p.spawnerTag,
+        spawnSpread        = (p.spawnSpread ~= nil) and p.spawnSpread or 6,
+        formation          = p.formation or 'GrowthFormation',
+        debug              = p.debug and true or false,
+    }
+end
+
 -- ========== Public API ==========
 function Start(params)
     assert(params and params.brain and params.spawnMarker, 'brain and spawnMarker are required')
     local o = setmetatable({}, Spawner)
-    o.params   = normalizeParams(params)
-    o.brain    = o.params.brain
-    o.tag      = params.spawnerTag or ('US_'.. math.floor(100000 * Random()))
-
-    local p = (type(o.params.spawnMarker) == 'table')
-            and _PickSpawnPos(o.params.spawnMarker)
-            or markerPos(o.params.spawnMarker)
-    if not p then
-        error('Invalid spawnMarker (string or table): '.. tostring(o.params.spawnMarker))
+    o.params      = normalizeParams(params)
+    o.brain       = o.params.brain
+    o.tag         = o.params.spawnerTag or ('US_'.. math.floor(100000 * Random()))
+    o.params.spawnerTag = o.tag
+    o.spawnPos    = markerPos(o.params.spawnMarker)
+    if not o.spawnPos then
+        error('Invalid spawnMarker: '.. tostring(o.params.spawnMarker))
     end
-
-    o.stopped  = false
-    o.wanted, o.bpOrder = flattenCounts(o.params.composition, o.params.difficulty)
-    o.wave = 0
+    o.stopped     = false
+    o.wave        = 0
+    o.composition = o.params.composition
+    o.baseWanted  = o:BuildWantedForWave(nil)
     o:Start()
     return o
 end
@@ -288,3 +336,5 @@ end
 function Stop(handle)
     if handle and handle.Stop then handle:Stop() end
 end
+
+return { Start = Start, Stop = Stop }
