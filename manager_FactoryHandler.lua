@@ -1,6 +1,7 @@
 -- /maps/faf_coop_U01.v0001/manager_FactoryHandler.lua
 -- Lightweight Factory Allocator (leases factories to requesters)
 -- Clean build: debug prints removed, stable API
+-- NO LONGER USED AS OF OCT 09
 
 local ScenarioUtils = import('/lua/sim/ScenarioUtilities.lua')
 
@@ -286,4 +287,5 @@ end
 return {
     New = Alloc.New,
     GetAllocator = GetAllocator,
+
 }
