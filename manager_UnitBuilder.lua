@@ -1,72 +1,102 @@
--- Created by Ruanuku/Cavthena
--- AI Unit Build Manager (rally-only, wave + sustain modes)
---
--- What it does
---   • Leases factories near a base marker via manager_FactoryHandler
---   • Queues ONLY the requested composition; units roll off and move to a single rally point
---   • Hands off a UNIQUE platoon to your attack function when all units are complete & at rally
---   • Safe to run multiple builders in parallel (per-unit ub_tag and per-wave platoon names)
---   • No patrols are used; rally-only flow
---
--- Modes
---   1: Wave (default)
---      Build requested composition → wait until all are complete & at rally → handoff → cooldown → next wave.
---   2: Wave, gated by losses
---      Same as Mode 1, but the NEXT wave only starts when the PREVIOUS wave has lost at least `mode2LossThreshold`
---      fraction of its original strength (or is destroyed).
---   3: Sustain & Reinforce
---      After handoff, keep the active platoon at full strength by rebuilding losses and adding the replacements
---      directly into the live platoon. If the platoon is wiped or disappears, reform a fresh full-strength platoon
---      and continue sustaining.
---
--- Public API
---   local Builder = import('/maps/.../manager_UnitBuilder.lua')
---   local handle = Builder.Start{
---     brain            = ArmyBrains[ScenarioInfo.Cybran],
---     baseMarker       = 'Cybran_ForwardNorthBase_Zone',
---     domain           = 'LAND',             -- 'LAND'|'AIR'|'NAVAL'|'AUTO'
---     composition      = {                   -- list of { bp, {e,n,h}, [label] }
---         {'url0106', {2, 2, 2}, 'LightBots'},
---         {'url0107', {2, 2, 2}, 'LightTanks'},
---     },
---     difficulty       = ScenarioInfo.Options.Difficulty or 2,
---     wantFactories    = 1,                  -- 0 = any available
---     priority         = 150,                -- 0..200 (higher wins)
---     rallyMarker      = 'AREA2_NORTHATTACK_SPAWNER', -- also used for direct spawn when spawnFirstDirect=true
---     waveCooldown     = 10,                 -- seconds between waves (modes 1/2)
---     attackFn         = function(platoon) ... end,  -- or 'FunctionName' to resolve from _G at runtime
---     attackData       = p.attackData,       -- Function Data
---     spawnFirstDirect = false,              -- if true, first wave spawns at rallyMarker
---     builderTag       = 'CFNB',             -- unique tag to avoid overlap with other builders
---     radius           = 60,                 -- factory search radius around baseMarker
---     debug            = false,
---     _alloc           = nil,                -- optional shared allocator instance
---     mode             = 1,                  -- 1: waves; 2: next wave gated by losses; 3: sustain & reinforce
---     mode2LossThreshold = 0.5,             -- [0..1] fraction lost before mode 2 starts next wave
---   }
---   Builder.Stop(handle)
---
--- Hard-coded behavior / constants
---   * Units must be fully built AND within 12 of rallyMarker before handoff.
---   * If composition regresses before handoff we reset inProd and requeue immediately.
---   * Stall watchdog: if no increase in completed units for 900s (15 min), reset/requeue.
---   * Rally sweep radius is 12 (unified with handoff gate).
---   * Removed/ignored params: patrolChain, spawnMarker, rallyReadyRadius, rallyReadyTimeout,
---       requeueOnRegression, stuckSeconds, scanRadius.
+--[[
+================================================================================
+ Unit Builder Manager (Lua 5.0 safe)
+================================================================================
+
+Overview
+    Factory consumer that leases production from a base created via
+    manager_BaseEngineer. Builds a fixed composition, stages the units at a
+    rally marker, and hands the completed platoon to a user-supplied attack
+    function. Supports wave, loss-gated, and sustain modes.
+
+Usage
+    local UnitBuilder = import('/maps/.../manager_UnitBuilder.lua')
+    local handle = UnitBuilder.Start{
+        brain            = ArmyBrains[armyIndex],     -- required
+        baseMarker       = 'Base_Marker',             -- required marker used for factory lookup fallback
+        domain           = 'LAND',                    -- required: 'LAND' | 'AIR' | 'NAVAL' | 'AUTO'
+        composition      = {                          -- required table of { bp, {easy,normal,hard}, [label] }
+            {'url0106', {2, 2, 2}, 'LightBots'},
+            {'url0107', {1, 1, 1}, 'LightTanks'},
+        },
+
+        baseHandle       = baseHandle,                -- optional explicit handle from BaseManager.Start
+        baseTag          = 'UEF_Main',                -- optional tag used to resolve baseHandle when not supplied
+        difficulty       = ScenarioInfo.Options.Difficulty or 2, -- optional, defaults to 2
+        wantFactories    = 0,                         -- optional, 0 = any available
+        priority         = 150,                       -- optional request priority (0..200, default 50 when nil)
+        radius           = 60,                        -- optional search radius (defaults to base radius or 60)
+        rallyMarker      = 'Attack_Rally_1',          -- optional; falls back to baseMarker
+        waveCooldown     = 0,                         -- optional seconds between waves (modes 1/2)
+        spawnFirstDirect = false,                     -- optional, true spawns first wave at rallyMarker
+        attackFn         = function(platoon) end,     -- optional; may also be a global function name
+        attackData       = {},                        -- optional table copied to platoon.PlatoonData
+        builderTag       = 'Forward_UB',              -- optional unique tag (defaults to auto-generated)
+        mode             = 1,                         -- optional: 1=waves, 2=loss-gated, 3=sustain
+        mode2LossThreshold = 0.5,                     -- optional [0..1] loss fraction before next wave in mode 2
+        debug            = false,                     -- optional verbose logging
+    }
+
+Public API
+    UnitBuilder.Start(params)
+        Validates the request, acquires a base handle, and starts the builder.
+
+    UnitBuilder.Stop(handle)
+        Stops the running builder and frees any factory leases.
+
+Behavioral notes
+    * Units must be complete and within 18 units of the rally marker before
+      handoff.
+    * Base managers revoke factory leases after prolonged idling; the builder
+      automatically re-requests a lease when notified of a stall.
+    * Factory leasing automatically nudges towards `wantFactories` while active.
+    * When `manager_BaseEngineer.lua` sits beside this script it will be imported
+      automatically; otherwise adjust the fallback path below.
+    * Legacy parameters from original FAF scripts (patrolChain, spawnMarker,
+      rallyReadyRadius, rallyReadyTimeout, requeueOnRegression, stuckSeconds,
+      scanRadius) are intentionally ignored.
+]]
 
 local ScenarioUtils      = import('/lua/sim/ScenarioUtilities.lua')
 local ScenarioFramework  = import('/lua/ScenarioFramework.lua')
-local FactoryAllocMod    = import('/maps/faf_coop_U01.v0001/manager_FactoryHandler.lua')
 
-ScenarioInfo.AllocByBrain = ScenarioInfo.AllocByBrain or {}
-function GetAllocator(brain)
-    local alloc = ScenarioInfo.AllocByBrain[brain]
-    if not alloc then
-        alloc = FactoryAllocMod.New(brain)
-        ScenarioInfo.AllocByBrain[brain] = alloc
+local function ResolveBaseManagerModule()
+    local ok, info = pcall(debug.getinfo, 1, 'S')
+    if ok and info and info.source then
+        local src = info.source
+        if type(src) == 'string' and string.sub(src, 1, 1) == '@' then
+            local dir = string.match(src, '^@(.*/)[^/]*$')
+            if dir then
+                local path = dir .. 'manager_BaseEngineer.lua'
+                local okImport, mod = pcall(import, path)
+                if okImport and mod then
+                    return mod
+                end
+            end
+        end
     end
-    return alloc
+
+    if ScenarioInfo and ScenarioInfo.MapPath then
+        local mp = ScenarioInfo.MapPath
+        if type(mp) == 'string' then
+            local dir = string.match(mp, '^(.-)/[^/]*$') or mp
+            if dir then
+                if string.sub(dir, 1, 1) ~= '/' then
+                    dir = '/' .. dir
+                end
+                local path = dir .. '/manager_BaseEngineer.lua'
+                local okImport, mod = pcall(import, path)
+                if okImport and mod then
+                    return mod
+                end
+            end
+        end
+    end
+
+    return import('/maps/faf_coop_U01.v0001/manager_BaseEngineer.lua')
 end
+
+local BaseManager        = ResolveBaseManagerModule()
 
 -- ========== small helpers ==========
 local function copyComposition(comp)
@@ -100,7 +130,8 @@ local function normalizeParams(p)
         spawnFirstDirect = p.spawnFirstDirect,
         builderTag       = p.builderTag,
         radius           = p.radius,
-        _alloc           = p._alloc,
+        baseTag          = p.baseTag,
+        baseHandle       = p.baseHandle,
         debug            = p.debug and true or false,
         mode             = p.mode or 1,
         mode2LossThreshold = (p.mode2LossThreshold ~= nil) and p.mode2LossThreshold or 0.5,
@@ -237,7 +268,7 @@ local function _RallySweep(self)
                 -- only touch unowned or ours
                 if (not u.ub_tag) or (u.ub_tag == self.tag) then
                     local pos = u:GetPosition()
-                    if dist2d(pos, rpos) > 12 then
+                    if dist2d(pos, rpos) > 18 then
                         local q = (u.GetCommandQueue and u:GetCommandQueue()) or {}
                         if table.getn(q) == 0 then
                             IssueMove({u}, rpos)
@@ -249,11 +280,11 @@ local function _RallySweep(self)
     end
 end
 
-local function countAliveByBp(units)
+local function countAliveByBp(units, tag)
     local t = {}
     if not units then return t end
     for _, u in ipairs(units) do
-        if u and not u.Dead then
+        if u and not u.Dead and (not tag or u.ub_tag == tag) then
             local bp = unitBpId(u)
             if bp then t[bp] = (t[bp] or 0) + 1 end
         end
@@ -261,11 +292,11 @@ local function countAliveByBp(units)
     return t
 end
 
-local function countCompleteByBp(units)
+local function countCompleteByBp(units, tag)
     local t = {}
     if not units then return t end
     for _, u in ipairs(units) do
-        if isComplete(u) then
+        if isComplete(u) and (not tag or u.ub_tag == tag) then
             local bp = unitBpId(u)
             if bp then t[bp] = (t[bp] or 0) + 1 end
         end
@@ -365,8 +396,13 @@ function Builder:EnsureFactoryQuota()
     if want == 0 then return end
     local have = table.getn(_LiveFactoriesList(self, false))
     if have < want then
-        self:Dbg(('EnsureFactoryQuota: have=%d want=%d -> requesting more'):format(have, want))
-        self:RequestLease()
+        if not self.leaseId then
+            self:Dbg(('EnsureFactoryQuota: have=%d want=%d -> requesting lease'):format(have, want))
+            self:RequestLease()
+        else
+            self:Dbg(('EnsureFactoryQuota: have=%d want=%d but lease %d already active; waiting for allocator rebalance')
+                :format(have, want, self.leaseId))
+        end
     end
 end
 
@@ -424,7 +460,7 @@ function Builder:EarlyHandoff(aliveList)
     end
 
     if self.leaseId then
-        self.alloc:ReturnLease(self.leaseId)
+        self.base:ReturnLease(self.leaseId)
         self.leaseId = nil
         self:Dbg('EarlyHandoff: returned factory lease')
     end
@@ -539,10 +575,10 @@ function Builder:_MakeLeaseParams()
     return {
         markerName     = self.params.baseMarker,
         markerPos      = self.basePos,
-        radius         = self.params.radius or 60,
+        radius         = self.params.radius or self.base.radius or 60,
         domain         = (self.params.domain or 'AUTO'):upper(),
         wantFactories  = math.max(0, self.params.wantFactories or 0),
-        priority       = self.params.priority or 50,
+        priority       = math.max(0, math.min(200, self.params.priority or 50)),
         onGrant        = function(f, id) self:OnLeaseGranted(f, id) end,
         onUpdate       = function(f, id) self:OnLeaseUpdated(f, id) end,
         onRevoke       = function(list, id, reason) self:OnLeaseRevoked(list, id, reason) end,
@@ -551,7 +587,7 @@ function Builder:_MakeLeaseParams()
 end
 
 function Builder:RequestLease()
-    self.leaseId = self.alloc:RequestFactories(self:_MakeLeaseParams())
+    self.leaseId = self.base:RequestFactories(self:_MakeLeaseParams())
     return self.leaseId
 end
 
@@ -588,7 +624,6 @@ function Builder:BeginWaveLoop()
     self.rrIndex        = 1
 
     -- progress watchdog
-    self._stuckCounter = 0
     self._haveSum      = 0
     self._idleAllCounter = 0   -- NEW: global idle counter for early handoff
 
@@ -650,8 +685,21 @@ end
 
 function Builder:OnLeaseRevoked(list, leaseId, reason)
     if self.stopped then return end
-    for entId, _ in pairs(list or {}) do
+    local stall = (reason == 'stall')
+    if stall then
+        self:Warn('LeaseRevoked: base detected production stall; clearing in-progress bookkeeping')
+        self.inProd = {}
+        self._idleAllCounter = 0
+    end
+    local toClear = {}
+    for entId, fac in pairs(list or {}) do
         self.leased[entId] = nil
+        if fac and not fac.Dead then
+            table.insert(toClear, fac)
+        end
+    end
+    if table.getn(toClear) > 0 then
+        IssueClearFactoryCommands(toClear)
     end
     -- if all leased factories are gone, clear leaseId so we can request a new lease
     local hasAny = false
@@ -661,6 +709,18 @@ function Builder:OnLeaseRevoked(list, leaseId, reason)
     if not hasAny then
         self.leaseId = nil
         self:Dbg('LeaseRevoked: no factories remain; leaseId cleared')
+        if stall and not self.stopped then
+            local brain = self.brain
+            if brain and brain.ForkThread then
+                brain:ForkThread(function()
+                    WaitSeconds(1)
+                    if not self.stopped and not self.leaseId then
+                        self:Dbg('LeaseRevoked: requesting new lease after stall')
+                        self:RequestLease()
+                    end
+                end)
+            end
+        end
     end
 end
 
@@ -688,13 +748,11 @@ function Builder:SpawnDirectAndSend(waveNo)
     else
         WARN(('[UB:%s] No attackFn provided; spawned platoon will idle.'):format(self.tag))
     end
+    return p
 end
 
 function Builder:CollectorLoop()
     -- Collect units produced by our leased factories, attach to staging platoon (for tracking only).
-    local neededBP = {}
-    for bp, _ in pairs(self.wanted) do neededBP[bp] = true end
-
     self:Dbg('CollectorLoop: start')
     while not self.stopped and self.stagingPlatoon do
         -- Gather nearby roll-offs (around leased factories and around rally)
@@ -709,7 +767,7 @@ function Builder:CollectorLoop()
         end
         if facCount > 0 then
             local first = getRallyPos(self.params) or self.basePos
-            local aroundRally = self.brain:GetUnitsAroundPoint(categories.MOBILE, first, 12, 'Ally') or {}
+            local aroundRally = self.brain:GetUnitsAroundPoint(categories.MOBILE, first, 18, 'Ally') or {}
             for _, u in ipairs(aroundRally) do table.insert(nearby, u) end
         end
         self:Dbg(('Collector: fac=%d nearFactories+rally=%d'):format(facCount, table.getn(nearby)))
@@ -717,7 +775,7 @@ function Builder:CollectorLoop()
         -- how many we already staged (by BP)
         local aliveTbl = {}
         if self.stagingPlatoon then
-            aliveTbl = countCompleteByBp(self.stagingPlatoon:GetPlatoonUnits() or {})
+            aliveTbl = countCompleteByBp(self.stagingPlatoon:GetPlatoonUnits() or {}, self.tag)
         end
 
         -- collect untagged roll-offs ONLY if needed
@@ -758,9 +816,9 @@ function Builder:MonitorLoop()
         -- Completed units tracked for this wave
         local aliveList = {}
         for id, u in pairs(self.stagingSet) do
-            if isComplete(u) then table.insert(aliveList, u) end
+            if isComplete(u) and u.ub_tag == self.tag then table.insert(aliveList, u) end
         end
-        local haveTbl   = countCompleteByBp(aliveList)
+        local haveTbl   = countCompleteByBp(aliveList, self.tag)
         local full      = cmpCounts(self.wanted, haveTbl)
         local wantTotal = sumCounts(self.wanted)
         local haveTotal = sumCounts(haveTbl)
@@ -775,29 +833,20 @@ function Builder:MonitorLoop()
                 self:Warn(("Monitor: REGRESSION detected (completed %d -> %d); reconciling without reset"):format(self._haveSum or 0, haveTotal))
                 self:SanitizeInProd(haveTbl)
                 self:QueueNeededBuilds(haveTbl)
-                self._stuckCounter = 0
                 self._idleAllCounter = 0
             end
 
             self:QueueNeededBuilds(haveTbl or {})
 
-            -- stall watchdog (30s) + NEW early-handoff idle tracker (10s)
+            -- Early-handoff idle tracker (10s). Stall revocation handled by base manager.
             local allIdle = self:_AllFactoriesIdle()
             if self._haveSum ~= haveTotal then
                 self._haveSum = haveTotal
-                self._stuckCounter = 0
                 self._idleAllCounter = 0
             else
                 if allIdle then
-                    self._stuckCounter = (self._stuckCounter or 0) + 1
                     self._idleAllCounter = (self._idleAllCounter or 0) + 1
-                    if self._stuckCounter >= 30 then
-                        self:Warn(('Monitor: STALL (idle, no completed increase for %ds) -> resetting inProd and requeue'):format(self._stuckCounter))
-                        self.inProd = {}
-                        self._stuckCounter = 0
-                        self:QueueNeededBuilds(haveTbl or {})
-                    end
-                    -- NEW: Early handoff after 10 consecutive idle seconds
+                    -- Early handoff after 10 consecutive idle seconds
                     if self._idleAllCounter >= 10 then
                         self:Warn(('Monitor: factories idle for %ds -> EarlyHandoff with %d/%d units')
                             :format(self._idleAllCounter, haveTotal, wantTotal))
@@ -806,7 +855,6 @@ function Builder:MonitorLoop()
                         return
                     end
                 else
-                    self._stuckCounter = 0
                     self._idleAllCounter = 0
                 end
             end
@@ -815,7 +863,7 @@ function Builder:MonitorLoop()
         else
             -- Before handoff, require ALL expected units are assembled at the rally point
             local rpos    = getRallyPos(self.params) or self.basePos
-            local radius  = 12
+            local radius  = 18
             local timeout = 30
             local waited  = 0
             local ready   = false
@@ -824,11 +872,11 @@ function Builder:MonitorLoop()
                 -- recompute completed units from tracking set (not relying on platoon handle)
                 aliveList = {}
                 for id, u in pairs(self.stagingSet) do
-                    if isComplete(u) then
+                    if isComplete(u) and u.ub_tag == self.tag then
                         table.insert(aliveList, u)
                     end
                 end
-                haveTbl = countCompleteByBp(aliveList)
+                haveTbl = countCompleteByBp(aliveList, self.tag)
 
                 -- if composition regressed (death), reconcile deficit (no reset)
                 if not cmpCounts(self.wanted, haveTbl) then
@@ -852,9 +900,9 @@ function Builder:MonitorLoop()
                     WaitTicks(10)
                     local haveFinal
                     if self.stagingPlatoon and self.brain:PlatoonExists(self.stagingPlatoon) then
-                        haveFinal = countCompleteByBp(self.stagingPlatoon:GetPlatoonUnits() or {})
+                        haveFinal = countCompleteByBp(self.stagingPlatoon:GetPlatoonUnits() or {}, self.tag)
                     else
-                        haveFinal = countCompleteByBp(aliveList or {})
+                        haveFinal = countCompleteByBp(aliveList or {}, self.tag)
                     end
 
                     local deficitTbl = computeDeficit(self.wanted, haveFinal)
@@ -916,7 +964,7 @@ function Builder:MonitorLoop()
                 end
 
                 if self.leaseId then
-                    self.alloc:ReturnLease(self.leaseId)
+                    self.base:ReturnLease(self.leaseId)
                     self.leaseId = nil
                     self:Dbg('Handoff: returned factory lease; entering post-handoff mode gate')
                 end
@@ -1149,7 +1197,7 @@ function Builder:Mode3Loop(p)
             p = self:CollectForPlatoon(p)
         end
 
-        local haveTbl = exists and countCompleteByBp(p:GetPlatoonUnits() or {}) or {}
+        local haveTbl = exists and countCompleteByBp(p:GetPlatoonUnits() or {}, self.tag) or {}
         local needTbl = computeDeficit(self.wanted, haveTbl)
         local needTotal = deficitTotal(needTbl)
 
@@ -1165,7 +1213,7 @@ function Builder:Mode3Loop(p)
             end
             -- fill to full
             while not self.stopped do
-                haveTbl = countCompleteByBp(p:GetPlatoonUnits() or {})
+                haveTbl = countCompleteByBp(p:GetPlatoonUnits() or {}, self.tag)
                 needTbl = computeDeficit(self.wanted, haveTbl)
                 needTotal = deficitTotal(needTbl)
                 if needTotal <= 0 then break end
@@ -1192,10 +1240,10 @@ function Builder:Mode3Loop(p)
             end
             -- start AI if needed
             if self.params.attackFn then
-                p:ForkAIThread(self.params.attackFn)
+                _ForkAttack(p, self.params.attackFn, self.params.attackData or {}, self.tag)
             end
             if self.leaseId then
-                self.alloc:ReturnLease(self.leaseId)
+                self.base:ReturnLease(self.leaseId)
                 self.leaseId = nil
             end
         else
@@ -1216,7 +1264,7 @@ function Builder:Mode3Loop(p)
                     -- ensure we're not accidentally building while held
                     if self.leaseId then
                         _ClearQueuesRestoreRally(self)
-                        self.alloc:ReturnLease(self.leaseId)
+                        self.base:ReturnLease(self.leaseId)
                         self.leaseId = nil
                     end
                 end
@@ -1224,7 +1272,7 @@ function Builder:Mode3Loop(p)
                 -- no deficit; release any lease we hold
                 if self.leaseId then
                     _ClearQueuesRestoreRally(self)
-                    self.alloc:ReturnLease(self.leaseId)
+                    self.base:ReturnLease(self.leaseId)
                     self.leaseId = nil
                 end
             end
@@ -1238,7 +1286,7 @@ function Builder:Stop()
     self.stopped = true
 
     if self.leaseId then
-        self.alloc:ReturnLease(self.leaseId)
+        self.base:ReturnLease(self.leaseId)
         self.leaseId = nil
     end
     if self.collectThread then KillThread(self.collectThread) self.collectThread = nil end
@@ -1255,11 +1303,17 @@ function Start(params)
     o.brain   = brain
     o.params  = normalizeParams(params)
     o.tag     = params.builderTag or ('UB_'..math.floor(100000*Random()))
-    o.basePos = ScenarioUtils.MarkerToPosition(params.baseMarker)
-    o.alloc   = params._alloc or FactoryAllocMod.New(brain)
+
+    o.base    = params.baseHandle or params.base or o.params.baseHandle
+    if (not o.base) and (o.params.baseTag or params.baseTag) then
+        o.base = BaseManager.GetBase(o.params.baseTag or params.baseTag)
+    end
+    assert(o.base, 'UnitBuilder requires a baseHandle or baseTag to request factories')
+
+    o.basePos = ScenarioUtils.MarkerToPosition(o.params.baseMarker) or o.base.basePos
     o.stopped = false
-    o.wanted, o.bpOrder = flattenCounts(params.composition, params.difficulty or 2)
     if not o.basePos then error('Invalid baseMarker: '.. tostring(params.baseMarker)) end
+    o.wanted, o.bpOrder = flattenCounts(params.composition, params.difficulty or 2)
     o:Start()
     return o
 end

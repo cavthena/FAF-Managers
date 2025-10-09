@@ -22,6 +22,7 @@
 --     },
 --     difficulty         = ScenarioInfo.Options.Difficulty or 2,  -- 1..3
 --     attackFn           = 'Platoon_BasicAttack',                 -- function or global function name
+--     attackData         = {},
 --     waveCooldown       = 15,                                    -- seconds; in mode 2 it is applied only after a wipe
 --     mode               = 1,                                     -- 1: cooldown, 2: gate by losses
 --     mode2LossThreshold = 0.50,                                  -- fraction lost to trigger next wave
@@ -109,6 +110,29 @@ local function sumCounts(tbl)
     return s
 end
 
+local function _PickSpawnPos(markers)
+    if type(markers) ~= 'table' then
+        return markers and ScenarioUtils.MarkerToPosition(markers) or nil
+    end
+
+    local n = table.getn(markers)
+    if n == 0 then return nil end
+
+    -- pick a random starting index, then scan for the first valid marker
+    local start = math.floor((Random() or 0) * n) + 1
+    if start < 1 then start = 1 end
+    if start > n then start = n end
+
+    for i = 0, n - 1 do
+        local idx = start + i
+        if idx > n then idx = idx - n end
+        local name = markers[idx]
+        local pos = name and ScenarioUtils.MarkerToPosition(name)
+        if pos then return pos, name end
+    end
+    return nil
+end
+
 -- ========== class ==========
 local Spawner = {}
 Spawner.__index = Spawner
@@ -119,10 +143,13 @@ function Spawner:Dbg(msg) if self.params.debug then self:Log(msg) end end
 
 -- spawn a single wave and return the platoon
 function Spawner:SpawnWave(waveNo)
-    local pos = self.spawnPos
+    local pos, picked = _PickSpawnPos(self.params.spawnMarker)
     if not pos then
-        self:Warn('SpawnWave: invalid spawnMarker position')
+        self:Warn('SpawnWave: invalid spawnMarker (string or table); no usable marker found')
         return nil
+    end
+    if self.params.debug then
+        self:Dbg(('SpawnWave: using marker %s for wave %d'):format(tostring(picked or self.params.spawnMarker), waveNo or 1))
     end
 
     local spawned = {}
@@ -243,10 +270,14 @@ function Start(params)
     o.params   = normalizeParams(params)
     o.brain    = o.params.brain
     o.tag      = params.spawnerTag or ('US_'.. math.floor(100000 * Random()))
-    o.spawnPos = markerPos(o.params.spawnMarker)
-    if not o.spawnPos then
-        error('Invalid spawnMarker: '.. tostring(o.params.spawnMarker))
+
+    local p = (type(o.params.spawnMarker) == 'table')
+            and _PickSpawnPos(o.params.spawnMarker)
+            or markerPos(o.params.spawnMarker)
+    if not p then
+        error('Invalid spawnMarker (string or table): '.. tostring(o.params.spawnMarker))
     end
+
     o.stopped  = false
     o.wanted, o.bpOrder = flattenCounts(o.params.composition, o.params.difficulty)
     o.wave = 0

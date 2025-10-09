@@ -1,45 +1,72 @@
--- Created by Ruanuku/Cavthena
--- Base Engineer Manager
+--[[
+================================================================================
+ Base Engineer Manager (Lua 5.0 safe)
+================================================================================
 
--- local handle = BaseEngineer.Start{
---     brain           = ArmyBrains[Army],
---     baseMarker      = 'marker',
---     baseTag         = 'tag',
---     radius          = 65,
---     difficulty      = Difficulty,
---     structGroups    = {'UnitGroup'},
+Overview
+    Drop-in replacement for the legacy BaseManager/OpAI helpers. Spawns a base
+    layout, keeps a dedicated engineer platoon alive, rebuilds/repairs
+    structures, manages experimental projects, and exposes a factory allocator
+    that other systems (such as manager_UnitBuilder) can lease through.
 
---     counts          = {{0,0,0}, {0,0,0}, {0,0,0}, {0,0,0}} -- T1, T2, T3, SCU. {Easy, Normal, Hard}
---     priority        = 120,
---     wantFactories   = 1,
---     spawnSpread     = 2,
---     _alloc          = self.GetAllocator(ArmyBrains[Army]),
+Usage
+    local BaseManager = import('/maps/.../manager_BaseEngineer.lua')
+    local baseHandle = BaseManager.Start{
+        brain        = ArmyBrains[armyIndex],         -- required
+        baseMarker   = 'Base_Marker',                 -- required Scenario marker name
+        baseTag      = 'UEF_Main',                    -- required unique tag used for lookups/logging
+        radius       = 70,                            -- required operating radius for engineers/factories
+        structGroups = {'BaseLayout_T1', 'BaseWalls'},-- required army group names to spawn
+        engineers    = {                              -- required engineer headcount per tier/difficulty
+            T1  = {3, 4, 5},                          -- {easy, normal, hard}; accepts tier index tables too
+            T2  = {1, 2, 2},
+            T3  = {0, 1, 1},
+            SCU = {0, 0, 1},
+        },
 
---     tasks = {
---         min         = {BUILD = 0, ASSIST = 0, EXP = 0},
---         max         = {BUILD = 1, ASSIST = 1, EXP = 1},
---         exp = {
---             marker  = 'marker',
---             cooldown= 180,
---             bp      = 'bp',
---             attackFn= Function,
---             attackData= {},
---         },
---     },
--- }
+        difficulty   = ScenarioInfo.Options.Difficulty or 2, -- optional, clamped 1..3 (default 2)
+        spawnSpread  = 2,                                    -- optional engineer spread when respawning
+        engineerFactoryPriority = 200,                       -- optional build request priority (0..200)
+        engineerFactoryCount    = 1,                         -- optional factories to lease for engineers (0:any)
+        factoryStallTimeout     = 30,                        -- optional seconds before idle leases are revoked (default 30)
+        tasks = {                                            -- optional engineer task preferences
+            weights = { BUILD = 1.0, ASSIST = 1.0, EXP = 1.25 }, -- severity multipliers (higher == more coverage)
+            exp     = { marker = 'Base_Marker', cooldown = 0, bp = nil, attackFn = nil, attackData = {} }, -- experimental build config
+        },
+        debug = false,
+    }
+
+Public API
+    BaseManager.Start(params)
+        Creates (or refreshes) the named base and returns a handle. The handle
+        is also stored in ScenarioInfo.BaseManagers[baseTag].
+
+    BaseManager.Stop(handle)
+        Stops and cleans up the provided base handle.
+
+    BaseManager.GetBase(baseTag)
+        Returns the base handle previously created with Start.
+
+    Handle methods
+        baseHandle:RequestFactories{ priority, want, domain, markerPos/markerName, radius }
+            -- Requests asking for 0 factories are treated as "take what you can" but will share fairly with other leases
+        baseHandle:ReturnLease(leaseId[, reason])
+            -- Leases revoked for stalls trigger `reason == 'stall'` before being removed
+        baseHandle:GetGrantedUnits(leaseId)
+        baseHandle:PushEngineerBuildTask(bpId, positionOrMarker, facing)
+        baseHandle:UpdateEngineerTasks(preferencesTable)
+            -- Accepts Start.tasks fields (weights/exp) to tweak severity or experimental config at runtime
+        baseHandle:GetStructureSnapshot()
+        baseHandle:GetEngineerHandle()
+        baseHandle:Stop()
+
+    Legacy helpers (advanced)
+        BaseManager.StartEngineer(params)
+        BaseManager.StopEngineer(handle)
+        These expose only the engineer subsystem for specialized scenarios.
+]]
 
 local ScenarioUtils     = import('/lua/sim/ScenarioUtilities.lua')
-local FactoryAllocMod   = import('/maps/faf_coop_U01.v0001/manager_FactoryHandler.lua')
-
-ScenarioInfo.AllocByBrain = ScenarioInfo.AllocByBrain or {}
-local function GetAllocator(brain)
-    local alloc = ScenarioInfo.AllocByBrain[brain]
-    if not alloc then
-        alloc = FactoryAllocMod.New(brain)
-        ScenarioInfo.AllocByBrain[brain] = alloc
-    end
-    return alloc
-end
 
 -- faction maps (1 UEF, 2 Aeon, 3 Cybran, 4 Seraphim)
 local EngBp = {
@@ -113,6 +140,31 @@ local function _TryGetUnitsFromGroup(name)
         end
     end
     return list
+end
+
+local function _EnsureEngineerPlatoon(brain, name)
+    if not (brain and name) then return nil end
+    local platoon = nil
+    if brain.GetPlatoonUniquelyNamed then
+        platoon = brain:GetPlatoonUniquelyNamed(name)
+        if platoon then
+            return platoon
+        end
+    end
+    return brain:MakePlatoon(name, '')
+end
+
+local function _safeIs(u, state)
+    if not (u and u.IsUnitState and (not u.Dead)) then return false end
+    local ok, res = pcall(function() return u:IsUnitState(state) end)
+    return ok and res or false
+end
+
+local function _safeCQ(u)
+    if not (u and u.GetCommandQueue and (not u.Dead)) then return {} end
+    local ok, res = pcall(function() return u:GetCommandQueue() end)
+    if ok and type(res) == 'table' then return res end
+    return {}
 end
 
 local M = {}
@@ -192,6 +244,10 @@ function M:_TagAndTrack(u, tier)
     self.tracked[tier][id] = u
     self.engTask = self.engTask or {}
     self.engTask[id] = self.engTask[id] or 'IDLE'
+
+    if self.engineerPlatoon and self.brain and self.brain.AssignUnitsToPlatoon then
+        self.brain:AssignUnitsToPlatoon(self.engineerPlatoon, {u}, 'Support', 'None')
+    end
 
     if u.AddUnitCallback then
         u:AddUnitCallback(function(unit) self:_OnEngineerGone(unit) end, 'OnKilled')
@@ -675,12 +731,11 @@ end
 
 
 -- ===================== Tasking (IDLE / BUILD / ASSIST / EXP) =====================
--- (Hardcoded options per user request)
 --  * IDLE timings & radius are fixed; moveRadius == self.params.radius
 --  * ASSIST always includes factories and experimentals
 --  * EXP requires explicit tasks.exp.bp (no faction table). Engineers return to pool during cooldown.
 --  * BUILD uses BaseManager BuildGroup info via standard methods; falls back to queue providers.
---  * Priority: BUILD > ASSIST > EXP > IDLE; IDLE is the pool (no max).
+--  * Severity weights determine how many engineers pursue BUILD/ASSIST/EXP; IDLE is the shared pool.
 
 local function _copy(t)
     local o = {}
@@ -690,28 +745,17 @@ end
 
 local function _NormalizeTasks(p)
     local t = p.tasks or {}
-    local min = _copy(t.min or {})
-    local max = _copy(t.max or {})
-    if min.IDLE  == nil then min.IDLE = 0 end
-    if min.BUILD == nil then min.BUILD = 0 end
-    if min.ASSIST== nil then min.ASSIST= 0 end
-    if min.EXP   == nil then min.EXP   = 0 end
-    if max.BUILD == nil then max.BUILD = 999 end
-    if max.ASSIST== nil then max.ASSIST= 999 end
-    if max.EXP   == nil then max.EXP   = 1 end
+    local weights = _copy(t.weights or {})
+    if weights.BUILD == nil then weights.BUILD = 1.0 end
+    if weights.ASSIST == nil then weights.ASSIST = 1.0 end
+    if weights.EXP == nil then weights.EXP = 1.25 end
 
-    local exp = t.exp or {}
+    local exp = _copy(t.exp or {})
     exp.marker = exp.marker or p.baseMarker
     exp.cooldown = exp.cooldown or 0
-    -- exp.bp must be provided manually by caller
     exp.bp = exp.bp
 
-    local assist = t.assist or {}
-    local idle = t.idle or {}
-
-    local build = t.build or {}
-
-    return { min=min, max=max, exp=exp, assist=assist, idle=idle, build=build }
+    return { weights = weights, exp = exp }
 end
 
 local function _shortBpId(u)
@@ -769,9 +813,9 @@ end
 
 function M:_InitTasking()
     self.tasks = _NormalizeTasks(self.params)
-    self.engTask = {}   
+    self.engTask = {}
     self.expState = { active=false, lastDoneAt=0, startedAt=0, bp=nil, pos=nil }
-    self.buildQueue = {}  
+    self.buildQueue = {}
 end
 
 function M:UpdateTaskPrefs(newPrefs)
@@ -913,10 +957,9 @@ function M:_FindAssistTargets()
         while i <= table.getn(fac) do
             local f = fac[i]
             if f and (not f.Dead) then
-                local active = false
-                if f.IsUnitState and f:IsUnitState('Building') then active = true end
-                if (not active) and f.GetCommandQueue then
-                    local q = f:GetCommandQueue() or {}
+                local active = _safeIs(f, 'Building')
+                if (not active) then
+                    local q = _safeCQ(f)
                     if table.getn(q) > 0 then active = true end
                 end
                 if active then table.insert(targ, f) end
@@ -933,7 +976,7 @@ function M:_FindAssistTargets()
             local j = 1
             while j <= table.getn(ex) do
                 local u = ex[j]
-                if u and (not u.Dead) and u.IsUnitState and u:IsUnitState('BeingBuilt') then
+                if u and (not u.Dead) and _safeIs(u, 'BeingBuilt') then
                     table.insert(targ, u)
                 end
                 j = j + 1
@@ -1117,34 +1160,46 @@ function M:TaskLoop()
     while not self.stopped do
         local now = GetGameTimeSeconds and GetGameTimeSeconds() or 0
         local all = self:_EnumerateEngineers()
+        local assistTargets = self:_FindAssistTargets() or {}
+        local assistCount = table.getn(assistTargets)
+        local buildDemand = table.getn(self.buildQueue or {})
 
-        -- demand signals (keep local inside TaskLoop)
-        local function hasAssistDemand()
-            local t = self:_FindAssistTargets() or {}
-            return table.getn(t) > 0
-        end
-
-        local function hasBuildDemand()
-            return (table.getn(self.buildQueue or {}) > 0)
-        end
-
-        local function hasExpDemand(now)
+        local function computeExpDemand(ts)
             local ex = self.expState or {}
-            if ex.active then return true end
+            if ex.active then return 1, true end
             local cfg = (self.tasks and self.tasks.exp) or {}
-            if not cfg.bp then return false end
-            local elapsed = now - (ex.lastDoneAt or 0)
-            if elapsed < (cfg.cooldown or 0) then return false end
+            if not cfg.bp then return 0, false end
+            local elapsed = ts - (ex.lastDoneAt or 0)
+            if elapsed < (cfg.cooldown or 0) then return 0, false end
             local marker = cfg.marker or self.params.baseMarker
             local pos = marker and ScenarioUtils.MarkerToPosition(marker) or self.basePos
-            return pos ~= nil
+            if not pos then return 0, false end
+            return 1, false
         end
+
+        local expDemand, expActive = computeExpDemand(now)
+
+        local weights = (self.tasks and self.tasks.weights) or {}
+        local severity = {
+            BUILD = (buildDemand > 0) and ((1 + buildDemand) * (weights.BUILD or 1.0)) or 0,
+            ASSIST = (assistCount > 0) and ((1 + assistCount) * (weights.ASSIST or 1.0)) or 0,
+            EXP   = (expDemand > 0) and (((expActive and 2) or 1) * (weights.EXP or 1.25)) or 0,
+        }
 
         local cnt = { IDLE=0, BUILD=0, ASSIST=0, EXP=0 }
         for _, rec in ipairs(all) do
             local id = rec.id
             local t = self.engTask[id] or 'IDLE'
             cnt[t] = (cnt[t] or 0) + 1
+        end
+
+        local function recount()
+            cnt = { IDLE=0, BUILD=0, ASSIST=0, EXP=0 }
+            for _, rec in ipairs(all) do
+                local id = rec.id
+                local t = self.engTask[id] or 'IDLE'
+                cnt[t] = (cnt[t] or 0) + 1
+            end
         end
 
         local function steal(fromList, need)
@@ -1158,14 +1213,13 @@ function M:TaskLoop()
                     local id = rec.id
                     if (self.engTask[id] or 'IDLE') == fromTask then
                         self:_AssignEngineer(id, rec.u, 'IDLE')
-                        cnt[fromTask] = (cnt[fromTask] or 0) - 1
-                        cnt.IDLE = (cnt.IDLE or 0) + 1
                         taken = taken + 1
                     end
                 end
                 if taken >= need then break end
                 idx = idx + 1
             end
+            if taken > 0 then recount() end
             return taken
         end
 
@@ -1183,62 +1237,120 @@ function M:TaskLoop()
                     if self.params.debug then self:Dbg(('Promote %s -> %s'):format(id, task)) end
                 end
             end
+            if moved > 0 then recount() end
             return moved
         end
 
-        -- ---------- ensure minimums (Build > Assist > Exp), but only if there is demand ----------
-        local min = self.tasks.min
+        local severityList = {
+            { task = 'BUILD', score = severity.BUILD },
+            { task = 'ASSIST', score = severity.ASSIST },
+            { task = 'EXP',   score = severity.EXP },
+        }
+        table.sort(severityList, function(a, b)
+            if a.score == b.score then return a.task < b.task end
+            return a.score > b.score
+        end)
 
-        local needBuild  = math.max(0, (min.BUILD  or 0) - (cnt.BUILD  or 0))
-        if needBuild > 0 and hasBuildDemand() then
-            promote('BUILD', needBuild)
+        local severitySum = 0
+        for _, entry in ipairs(severityList) do
+            severitySum = severitySum + (entry.score or 0)
         end
-        cnt = { IDLE=0, BUILD=0, ASSIST=0, EXP=0 }
-        for _, rec in ipairs(all) do cnt[self.engTask[rec.id] or 'IDLE'] = (cnt[self.engTask[rec.id] or 'IDLE'] or 0) + 1 end
 
-        local needAssist = math.max(0, (min.ASSIST or 0) - (cnt.ASSIST or 0))
-        if needAssist > 0 and hasAssistDemand() then
-            promote('ASSIST', needAssist)
-        end
-        cnt = { IDLE=0, BUILD=0, ASSIST=0, EXP=0 }
-        for _, rec in ipairs(all) do cnt[self.engTask[rec.id] or 'IDLE'] = (cnt[self.engTask[rec.id] or 'IDLE'] or 0) + 1 end
+        local totalEng = table.getn(all)
+        local desired = { BUILD = 0, ASSIST = 0, EXP = 0 }
 
-        local needExp    = math.max(0, (min.EXP    or 0) - (cnt.EXP    or 0))
-        if needExp > 0 and hasExpDemand(now) then
-            -- gate EXP to T3/SCU only
-            promote('EXP', needExp, function(rec) return rec.tier == 'T3' or rec.tier == 'SCU' end)
-        end
-        cnt = { IDLE=0, BUILD=0, ASSIST=0, EXP=0 }
-        for _, rec in ipairs(all) do cnt[self.engTask[rec.id] or 'IDLE'] = (cnt[self.engTask[rec.id] or 'IDLE'] or 0) + 1 end
-
-        -- ---------- if minimums are met, top up to caps, still demand-gated ----------
-        local minsMet = (cnt.BUILD >= (min.BUILD or 0)) and (cnt.ASSIST >= (min.ASSIST or 0)) and (cnt.EXP >= (min.EXP or 0))
-        if minsMet then
-            local max = self.tasks.max
-
-            local capBuild  = math.max(0, (max.BUILD  or 0) - (cnt.BUILD  or 0))
-            if capBuild > 0 and hasBuildDemand() then
-                promote('BUILD', math.min(capBuild, cnt.IDLE or 0))
-                cnt = { IDLE=0, BUILD=0, ASSIST=0, EXP=0 }
-                for _, rec in ipairs(all) do cnt[self.engTask[rec.id] or 'IDLE'] = (cnt[self.engTask[rec.id] or 'IDLE'] or 0) + 1 end
+        if severitySum > 0 and totalEng > 0 then
+            local remaining = totalEng
+            for _, entry in ipairs(severityList) do
+                if (entry.score or 0) <= 0 then break end
+                local share = entry.score / severitySum
+                local want = math.floor((share * totalEng) + 0.5)
+                if want < 1 then want = 1 end
+                if want > remaining then want = remaining end
+                desired[entry.task] = want
+                remaining = remaining - want
+                if remaining <= 0 then break end
             end
 
-            local capAssist = math.max(0, (max.ASSIST or 0) - (cnt.ASSIST or 0))
-            if capAssist > 0 and hasAssistDemand() then
-                promote('ASSIST', math.min(capAssist, cnt.IDLE or 0))
-                cnt = { IDLE=0, BUILD=0, ASSIST=0, EXP=0 }
-                for _, rec in ipairs(all) do cnt[self.engTask[rec.id] or 'IDLE'] = (cnt[self.engTask[rec.id] or 'IDLE'] or 0) + 1 end
-            end
-
-            local capExp    = math.max(0, (max.EXP    or 0) - (cnt.EXP    or 0))
-            if capExp > 0 and hasExpDemand(now) then
-                promote('EXP', math.min(capExp, cnt.IDLE or 0), function(rec) return rec.tier == 'T3' or rec.tier == 'SCU' end)
-                cnt = { IDLE=0, BUILD=0, ASSIST=0, EXP=0 }
-                for _, rec in ipairs(all) do cnt[self.engTask[rec.id] or 'IDLE'] = (cnt[self.engTask[rec.id] or 'IDLE'] or 0) + 1 end
+            local allocated = desired.BUILD + desired.ASSIST + desired.EXP
+            local leftover = totalEng - allocated
+            local idx = 1
+            while leftover > 0 and idx <= table.getn(severityList) do
+                local entry = severityList[idx]
+                if (entry.score or 0) > 0 then
+                    desired[entry.task] = desired[entry.task] + 1
+                    leftover = leftover - 1
+                else
+                    break
+                end
+                idx = idx + 1
+                if idx > table.getn(severityList) then idx = 1 end
             end
         end
 
-        local assistTargets = self:_FindAssistTargets()
+        if buildDemand <= 0 then desired.BUILD = 0 end
+        if assistCount <= 0 then desired.ASSIST = 0 end
+
+        if expDemand > 0 then
+            local eligibleExp = 0
+            for _, rec in ipairs(all) do
+                if rec.tier == 'T3' or rec.tier == 'SCU' then
+                    eligibleExp = eligibleExp + 1
+                end
+            end
+            if eligibleExp > 0 then
+                desired.EXP = math.max(1, math.min(desired.EXP, expDemand, eligibleExp))
+            else
+                desired.EXP = 0
+            end
+        else
+            desired.EXP = 0
+        end
+
+        local allocatedAfterDemand = desired.BUILD + desired.ASSIST + desired.EXP
+        if allocatedAfterDemand > totalEng then
+            local excess = allocatedAfterDemand - totalEng
+            for idx = table.getn(severityList), 1, -1 do
+                if excess <= 0 then break end
+                local task = severityList[idx].task
+                local take = math.min(excess, desired[task])
+                desired[task] = desired[task] - take
+                excess = excess - take
+            end
+        end
+
+        local ascending = {}
+        for i = table.getn(severityList), 1, -1 do
+            table.insert(ascending, severityList[i])
+        end
+
+        for _, entry in ipairs(ascending) do
+            local task = entry.task
+            local want = desired[task] or 0
+            local have = cnt[task] or 0
+            local extra = have - want
+            if extra > 0 then
+                steal({task}, extra)
+            end
+        end
+
+        for _, entry in ipairs(severityList) do
+            if (entry.score or 0) > 0 then
+                local task = entry.task
+                local want = desired[task] or 0
+                local have = cnt[task] or 0
+                local need = want - have
+                if need > 0 then
+                    local filter = nil
+                    if task == 'EXP' then
+                        filter = function(rec) return rec.tier == 'T3' or rec.tier == 'SCU' end
+                    end
+                    promote(task, need, filter)
+                end
+            end
+        end
+
+        recount()
         local distrib = {}
         for _, rec in ipairs(all) do
             local id, u = rec.id, rec.u
@@ -1319,9 +1431,16 @@ function M:Stop()
         KillThread(self.taskThread)
         self.taskThread = nil
     end
+    if ScenarioInfo.BaseEngineerPlatoons and self.platoonName then
+        ScenarioInfo.BaseEngineerPlatoons[self.platoonName] = nil
+    end
+    if self.engineerPlatoon and self.brain and self.brain.PlatoonExists and self.brain:PlatoonExists(self.engineerPlatoon) then
+        self.brain:DisbandPlatoon(self.engineerPlatoon)
+    end
+    self.engineerPlatoon = nil
 end
 
-local function NormalizeParams(p)
+local function NormalizeEngineerParams(p)
     local d = clampDifficulty(p.difficulty or 2)
     local counts = p.counts or { {0,0,0}, {0,0,0}, {0,0,0}, {0,0,0} }
     local function tri(t)
@@ -1343,25 +1462,26 @@ local function NormalizeParams(p)
         baseTag      = p.baseTag,
         counts       = {C1, C2, C3, CS},
         radius       = p.radius or 60,
-        priority     = p.priority or 120,
+        priority     = p.priority or 200,
         wantFactories= p.wantFactories or 1,
         spawnSpread  = (p.spawnSpread ~= nil) and p.spawnSpread or 2,
         debug        = p.debug and true or false,
-        _alloc       = p._alloc,
+        platoonName  = p.platoonName,
     }
 end
 
-function Start(params)
+local function EngineerStart(params)
     assert(params and params.brain and params.baseMarker and params.counts, 'brain, baseMarker, counts are required')
 
     local o = setmetatable({}, M)
-    o.params   = NormalizeParams(params)
+    o.params   = NormalizeEngineerParams(params)
     o.brain    = o.params.brain
     o.basePos  = markerPos(o.params.baseMarker)
     if not o.basePos then error('Invalid baseMarker: '.. tostring(o.params.baseMarker)) end
 
     o.tag      = params.baseTag or ('BE_'.. math.floor(100000 * Random()))
-    o.alloc    = params._alloc or GetAllocator(o.brain)
+    o.alloc    = params._alloc
+    assert(o.alloc, 'BaseEngineer requires a factory allocator (_alloc)')
     o.stopped  = false
     o.tracked  = { T1={}, T2={}, T3={}, SCU={} }
     o.faction  = (o.brain.GetFactionIndex and o.brain:GetFactionIndex()) or 1
@@ -1381,12 +1501,816 @@ function Start(params)
 
     o.structGroupUnits = {}
 
+    o.platoonName = o.params.platoonName or (o.tag .. '_Engineers')
+    o.engineerPlatoon = _EnsureEngineerPlatoon(o.brain, o.platoonName)
+    ScenarioInfo.BaseEngineerPlatoons = ScenarioInfo.BaseEngineerPlatoons or {}
+    if o.engineerPlatoon then
+        ScenarioInfo.BaseEngineerPlatoons[o.platoonName] = o.engineerPlatoon
+    end
+
     o:Start()
     return o
 end
 
-function Stop(handle)
+local function EngineerStop(handle)
     if handle and handle.Stop then handle:Stop() end
 end
 
-return { Start = Start, Stop = Stop }
+-- ============================================================================
+-- Integrated Base Controller
+-- ============================================================================
+
+ScenarioInfo.BaseManagers = ScenarioInfo.BaseManagers or {}
+
+local function ClampDifficulty(d)
+    if not d then return 2 end
+    if d < 1 then return 1 end
+    if d > 3 then return 3 end
+    return d
+end
+
+local function ArmyNameFromBrain(brain)
+    if not brain then return nil end
+    local idx = brain.GetArmyIndex and brain:GetArmyIndex()
+    if not idx then return nil end
+    if ArmyBrains and ArmyBrains[idx] and ArmyBrains[idx].Name then
+        return ArmyBrains[idx].Name
+    end
+    return 'ARMY_' .. tostring(idx)
+end
+
+local function MarkerPosition(marker)
+    if type(marker) == 'string' then
+        return ScenarioUtils.MarkerToPosition(marker)
+    end
+    if type(marker) == 'table' then
+        return { marker[1], marker[2], marker[3] }
+    end
+    return nil
+end
+
+local function CopyTable(tbl)
+    local copy = {}
+    if type(tbl) ~= 'table' then
+        return copy
+    end
+    for k, v in pairs(tbl) do
+        if type(v) == 'table' then
+            copy[k] = CopyTable(v)
+        else
+            copy[k] = v
+        end
+    end
+    return copy
+end
+
+local FactoryControl = {}
+FactoryControl.__index = FactoryControl
+
+local AGE_RATE   = 0.33  -- points per second (20 per minute)
+local PRI_MIN, PRI_MAX = 0, 200
+
+local function EffectivePriority(req, now)
+    if not req then return 0 end
+    local base = math.max(PRI_MIN, math.min(PRI_MAX, req.priority or 0))
+    local age  = 0
+    if req.enqueuedAt and now then
+        age = math.max(0, now - req.enqueuedAt)
+    end
+    local eff = base + (age * AGE_RATE)
+    if eff > PRI_MAX then eff = PRI_MAX end
+    return eff
+end
+
+local function DomainCategories(domain)
+    if domain == 'LAND' then
+        return categories.FACTORY * categories.LAND
+    elseif domain == 'AIR' then
+        return categories.FACTORY * categories.AIR
+    elseif domain == 'NAVAL' then
+        return categories.FACTORY * categories.NAVAL
+    end
+    return categories.FACTORY
+end
+
+function FactoryControl.New(base)
+    local self = setmetatable({}, FactoryControl)
+    self.base            = base
+    self.brain           = base.brain
+    self.requests        = {}
+    self.queue           = {}
+    self.reqSeq          = 0
+    self.factoryState    = {}
+    self.updateInterval  = 0.5
+    self.stallTimeout    = 30
+    self.running         = false
+    self.thread          = nil
+    return self
+end
+
+function FactoryControl:_RefreshFactoryRoster()
+    local brain = self.brain
+    if not brain or not brain.GetListOfUnits then return end
+
+    local list = brain:GetListOfUnits(categories.FACTORY) or {}
+    local i = 1
+    while i <= table.getn(list) do
+        local fac = list[i]
+        if fac and not fac:IsDead() and fac:GetAIBrain() == brain and self:_WithinBase(fac, self.base.basePos, self.base.radius) then
+            local id = fac:GetEntityId()
+            local state = self.factoryState[id]
+            if not state then
+                self.factoryState[id] = { unit = fac, leased = false, leaseId = nil }
+            else
+                state.unit = fac
+            end
+        end
+        i = i + 1
+    end
+end
+
+function FactoryControl:_FactoryMatchesDomain(unit, domain)
+    if not unit or unit:IsDead() then return false end
+    if domain == 'LAND' then
+        return EntityCategoryContains(categories.FACTORY * categories.LAND, unit)
+    elseif domain == 'AIR' then
+        return EntityCategoryContains(categories.FACTORY * categories.AIR, unit)
+    elseif domain == 'NAVAL' then
+        return EntityCategoryContains(categories.FACTORY * categories.NAVAL, unit)
+    end
+    return EntityCategoryContains(categories.FACTORY, unit)
+end
+
+function FactoryControl:_EligibleFactoryCount(req)
+    local count = 0
+    for _, state in pairs(self.factoryState) do
+        local unit = state.unit
+        if unit and not unit:IsDead() and unit:GetAIBrain() == self.brain and self:_WithinBase(unit, req.markerPos, req.radius) then
+            if self:_FactoryMatchesDomain(unit, req.domain) then
+                count = count + 1
+            end
+        end
+    end
+    return count
+end
+
+function FactoryControl:_GrantedCount(req)
+    local have = 0
+    for _ in pairs(req.granted or {}) do
+        have = have + 1
+    end
+    return have
+end
+
+local function _DomainsOverlap(a, b)
+    if a == 'AUTO' or b == 'AUTO' then
+        return true
+    end
+    return a == b
+end
+
+function FactoryControl:_RequestsCompete(a, b)
+    if not a or not b or a == b then return false end
+    if not _DomainsOverlap(a.domain, b.domain) then return false end
+    return true
+end
+
+function FactoryControl:_ShareFor(req)
+    local total = self:_EligibleFactoryCount(req)
+    if total <= 0 then return 0 end
+    local peers = 1
+    for _, other in pairs(self.requests) do
+        if self:_RequestsCompete(req, other) then
+            peers = peers + 1
+        end
+    end
+    if peers <= 1 then return total end
+    local share = math.floor(total / peers)
+    if share < 1 then share = 1 end
+    return share
+end
+
+function FactoryControl:_CompetitorNeeds(req)
+    for _, other in pairs(self.requests) do
+        if self:_RequestsCompete(req, other) then
+            local have = self:_GrantedCount(other)
+            local target
+            if (other.want or 0) > 0 then
+                target = other.want
+            else
+                target = self:_ShareFor(other)
+            end
+            if have < target then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function FactoryControl:_UpdateDesiredCaps()
+    for _, req in pairs(self.requests) do
+        if req then
+            if (req.want or 0) > 0 then
+                local total = self:_EligibleFactoryCount(req)
+                req.desired = math.min(req.want, total > 0 and total or req.want)
+            else
+                local total = self:_EligibleFactoryCount(req)
+                if total <= 0 then
+                    req.desired = 0
+                elseif self:_CompetitorNeeds(req) then
+                    req.desired = self:_ShareFor(req)
+                else
+                    req.desired = total
+                end
+            end
+        end
+    end
+end
+
+function FactoryControl:_RebalanceLeases()
+    for _, req in pairs(self.requests) do
+        if req and req.desired then
+            local cap = req.desired
+            local have = self:_GrantedCount(req)
+            if have > cap and cap >= 0 and self:_CompetitorNeeds(req) then
+                local toRelease = have - cap
+                local revoke = {}
+                for entId, unit in pairs(req.granted) do
+                    if toRelease <= 0 then break end
+                    local state = self.factoryState[entId]
+                    if state then
+                        state.leased = false
+                        state.leaseId = nil
+                    end
+                    revoke[entId] = unit
+                    req.granted[entId] = nil
+                    toRelease = toRelease - 1
+                end
+                if next(revoke) and req.onRevoke then
+                    pcall(req.onRevoke, revoke, req.id, 'rebalanced')
+                end
+            end
+        end
+    end
+end
+
+local function _FactoryIdle(unit)
+    if not unit or unit:IsDead() then return true end
+    if unit.IsUnitState then
+        if unit:IsUnitState('Building') then return false end
+        if unit:IsUnitState('Upgrading') then return false end
+        if unit:IsUnitState('Guarding') then return false end
+    end
+    if unit.GetCommandQueue then
+        local q = unit:GetCommandQueue() or {}
+        if table.getn(q) > 0 then
+            return false
+        end
+    end
+    if unit.IsPaused and unit:IsPaused() then
+        return true
+    end
+    return true
+end
+
+function FactoryControl:_CheckStalls(dt)
+    local revokeIds = {}
+    for id, req in pairs(self.requests) do
+        if req then
+            local anyGranted = false
+            local active = false
+            for entId, unit in pairs(req.granted or {}) do
+                if unit and not unit:IsDead() and unit:GetAIBrain() == self.brain and self:_WithinBase(unit, req.markerPos, req.radius) then
+                    anyGranted = true
+                    if not _FactoryIdle(unit) then
+                        active = true
+                        break
+                    end
+                else
+                    req.granted[entId] = nil
+                    local state = self.factoryState[entId]
+                    if state then
+                        state.leased = false
+                        state.leaseId = nil
+                    end
+                end
+            end
+
+            if anyGranted then
+                if active then
+                    req._idleSeconds = 0
+                else
+                    req._idleSeconds = (req._idleSeconds or 0) + dt
+                    local threshold = req.stallTimeout or self.stallTimeout
+                    if threshold and req._idleSeconds >= threshold then
+                        table.insert(revokeIds, id)
+                    end
+                end
+            else
+                req._idleSeconds = 0
+            end
+        end
+    end
+
+    if table.getn(revokeIds) > 0 then
+        for _, id in ipairs(revokeIds) do
+            if self.requests[id] then
+                self:ReturnLease(id, 'stall')
+            end
+        end
+    end
+end
+
+function FactoryControl:Start()
+    if self.running then return end
+    self.running = true
+    self.thread = self.brain:ForkThread(function()
+        while self.running do
+            self:Tick()
+            WaitSeconds(self.updateInterval)
+        end
+    end)
+end
+
+function FactoryControl:Shutdown()
+    self.running = false
+    if self.thread then
+        KillThread(self.thread)
+        self.thread = nil
+    end
+    local ids = {}
+    for id in pairs(self.requests) do
+        table.insert(ids, id)
+    end
+    local i = 1
+    while i <= table.getn(ids) do
+        local rid = ids[i]
+        if self.requests[rid] then
+            self:ReturnLease(rid, 'shutdown')
+        end
+        i = i + 1
+    end
+    self.requests = {}
+    self.queue = {}
+    self.factoryState = {}
+end
+
+function FactoryControl:_WithinBase(unit, pos, radius)
+    local baseRadius = self.base.radius or radius
+    if not baseRadius then return false end
+    local p = pos or (self.base and self.base.basePos)
+    if not p then return false end
+    local up = unit:GetPosition()
+    local dx = (up[1] or 0) - (p[1] or 0)
+    local dz = (up[3] or 0) - (p[3] or 0)
+    return (dx*dx + dz*dz) <= (baseRadius * baseRadius)
+end
+
+function FactoryControl:RequestFactories(params)
+    if not params then return nil end
+    self.reqSeq = self.reqSeq + 1
+    local id = self.reqSeq
+
+    local req = {
+        id          = id,
+        markerName  = params.markerName,
+        markerPos   = params.markerPos or MarkerPosition(params.markerName) or self.base.basePos,
+        radius      = params.radius or self.base.radius,
+        domain      = (params.domain or 'AUTO'):upper(),
+        want        = math.max(0, params.wantFactories or 0),
+        priority    = params.priority or 50,
+        onGrant     = params.onGrant,
+        onUpdate    = params.onUpdate,
+        onRevoke    = params.onRevoke,
+        onComplete  = params.onComplete,
+        granted     = {},
+        stallTimeout= params.stallTimeout,
+        _idleSeconds= 0,
+    }
+
+    if req.priority < PRI_MIN then
+        req.priority = PRI_MIN
+    elseif req.priority > PRI_MAX then
+        req.priority = PRI_MAX
+    end
+
+    if req.radius and self.base.radius then
+        if req.radius > self.base.radius then
+            req.radius = self.base.radius
+        end
+    else
+        req.radius = self.base.radius
+    end
+
+    if not (req.markerPos and req.markerPos[1] and req.markerPos[3]) then
+        WARN(('[BaseFactory:%s] Invalid marker position for request %d'):format(self.base.tag, id))
+        return nil
+    end
+
+    self.requests[id] = req
+    if GetGameTimeSeconds then
+        req.enqueuedAt = GetGameTimeSeconds()
+    else
+        req.enqueuedAt = 0
+    end
+
+    table.insert(self.queue, id)
+    self:SortQueue()
+
+    return id
+end
+
+function FactoryControl:ReturnLease(leaseId, reason)
+    local req = self.requests[leaseId]
+    if not req then return end
+    local revoke = {}
+    for entId, unit in pairs(req.granted) do
+        local fs = self.factoryState[entId]
+        if fs then
+            fs.leased  = false
+            fs.leaseId = nil
+        end
+        revoke[entId] = unit
+    end
+    req.granted = {}
+    if reason then
+        if next(revoke) and req.onRevoke then
+            pcall(req.onRevoke, revoke, leaseId, reason)
+        end
+    elseif req.onComplete then
+        pcall(req.onComplete, leaseId)
+    end
+    local i = 1
+    while i <= table.getn(self.queue) do
+        if self.queue[i] == leaseId then
+            table.remove(self.queue, i)
+        else
+            i = i + 1
+        end
+    end
+    self.requests[leaseId] = nil
+end
+
+function FactoryControl:GetGrantedUnits(leaseId)
+    local req = self.requests[leaseId]
+    if not req then return {} end
+    local out = {}
+    for _, u in pairs(req.granted) do
+        table.insert(out, u)
+    end
+    return out
+end
+
+function FactoryControl:SortQueue()
+    local now = 0
+    if GetGameTimeSeconds then
+        now = GetGameTimeSeconds()
+    end
+    table.sort(self.queue, function(a, b)
+        local ra = self.requests[a]
+        local rb = self.requests[b]
+        if not ra or not rb then return a < b end
+        local pa = EffectivePriority(ra, now)
+        local pb = EffectivePriority(rb, now)
+        if pa == pb then
+            return (ra.id or 0) < (rb.id or 0)
+        end
+        return pa > pb
+    end)
+end
+
+function FactoryControl:Tick()
+    local brain = self.brain
+    if not brain then return end
+
+    self:_RefreshFactoryRoster()
+
+    for entId, state in pairs(self.factoryState) do
+        local unit = state.unit
+        if (not unit) or unit:IsDead() or unit:GetAIBrain() ~= brain then
+            if state.leased and state.leaseId then
+                local req = self.requests[state.leaseId]
+                if req and req.onRevoke then
+                    pcall(req.onRevoke, { [entId] = unit }, state.leaseId, 'lost')
+                end
+            end
+            self.factoryState[entId] = nil
+        end
+    end
+
+    self:SortQueue()
+    self:_UpdateDesiredCaps()
+    self:_RebalanceLeases()
+    self:_CheckStalls(self.updateInterval or 1)
+
+    local i = 1
+    while i <= table.getn(self.queue) do
+        local id = self.queue[i]
+        local req = self.requests[id]
+        if req then
+            self:ServiceRequest(req)
+            i = i + 1
+        else
+            table.remove(self.queue, i)
+        end
+    end
+end
+
+function FactoryControl:ServiceRequest(req)
+    local brain = self.brain
+    local domainCats
+    if req.domain == 'AUTO' then
+        domainCats = categories.FACTORY
+    else
+        domainCats = DomainCategories(req.domain)
+    end
+    local list = brain:GetListOfUnits(domainCats) or {}
+    local candidates = {}
+    local idx = 1
+    while idx <= table.getn(list) do
+        local fac = list[idx]
+        if fac and not fac:IsDead() and fac:GetAIBrain() == brain and self:_WithinBase(fac, req.markerPos, req.radius) then
+            local entId = fac:GetEntityId()
+            local state = self.factoryState[entId]
+            if not state then
+                state = { unit = fac, leased = false, leaseId = nil }
+                self.factoryState[entId] = state
+            end
+            if not state.leased then
+                table.insert(candidates, fac)
+            end
+        end
+        idx = idx + 1
+    end
+
+    local have = self:_GrantedCount(req)
+
+    local target = req.desired
+    if not target then
+        if req.want == 0 then
+            target = table.getn(candidates)
+            if target <= 0 then
+                target = 0
+            end
+        else
+            target = req.want
+        end
+    end
+    local need = math.max(0, target - have)
+
+    if need <= 0 then return end
+
+    local grantedNow = {}
+    local j = 1
+    while j <= table.getn(candidates) and need > 0 do
+        local fac = candidates[j]
+        local entId = fac:GetEntityId()
+        local state = self.factoryState[entId]
+        if state and not state.leased then
+            state.leased = true
+            state.leaseId = req.id
+            req.granted[entId] = fac
+            table.insert(grantedNow, fac)
+            need = need - 1
+        end
+        j = j + 1
+    end
+
+    if table.getn(grantedNow) > 0 then
+        if have == 0 and req.onGrant then
+            pcall(req.onGrant, grantedNow, req.id)
+        elseif req.onUpdate then
+            pcall(req.onUpdate, grantedNow, req.id)
+        end
+    end
+end
+
+local Base = {}
+Base.__index = Base
+
+function Base:Log(msg)
+    LOG(('[Base:%s] %s'):format(self.tag or '??', msg))
+end
+
+function Base:Warn(msg)
+    WARN(('[Base:%s] %s'):format(self.tag or '??', msg))
+end
+
+local function ResolveEngineerCounts(tbl, difficulty)
+    local d = ClampDifficulty(difficulty)
+    local tiers = { 'T1', 'T2', 'T3', 'SCU' }
+    local out = { {}, {}, {}, {} }
+    local i = 1
+    while i <= table.getn(tiers) do
+        local entry = tbl[tiers[i]] or tbl[i] or {0,0,0}
+        if type(entry) == 'number' then
+            out[i] = { entry, entry, entry }
+        elseif type(entry) == 'table' then
+            out[i] = { entry[1] or 0, entry[2] or (entry[1] or 0), entry[3] or (entry[2] or entry[1] or 0) }
+        else
+            out[i] = {0,0,0}
+        end
+        i = i + 1
+    end
+    return out, d
+end
+
+function Base:_CreateStructures()
+    local groups = self.params.structGroups or {}
+    local armyName = ArmyNameFromBrain(self.brain)
+    local created = {}
+    self.spawnedGroups = {}
+
+    local i = 1
+    while i <= table.getn(groups) do
+        local gname = groups[i]
+        if gname then
+            local ok, units = pcall(function() return ScenarioUtils.CreateArmyGroup(armyName, gname, false) end)
+            if ok and units then
+                self.spawnedGroups[gname] = units
+                local j = 1
+                while units[j] do
+                    table.insert(created, units[j])
+                    j = j + 1
+                end
+            else
+                self:Warn('Failed to create structure group '.. tostring(gname))
+            end
+        end
+        i = i + 1
+    end
+
+    self.structures = created
+end
+
+function Base:_SetupFactoryControl()
+    self.factoryControl = FactoryControl.New(self)
+    if self.params.factoryStallTimeout then
+        self.factoryControl.stallTimeout = self.params.factoryStallTimeout
+    end
+    self.factoryControl:Start()
+end
+
+function Base:_SetupEngineerManager()
+    local counts, difficulty = ResolveEngineerCounts(self.params.engineers or {}, self.params.difficulty)
+
+    local beParams = {
+        brain        = self.brain,
+        baseMarker   = self.params.baseMarker,
+        baseTag      = self.tag,
+        difficulty   = difficulty,
+        structGroups = self.params.structGroups,
+        counts       = counts,
+        radius       = self.radius,
+        priority     = self.params.engineerFactoryPriority or 200,
+        wantFactories= self.params.engineerFactoryCount or 1,
+        spawnSpread  = self.params.spawnSpread or 2,
+        debug        = self.params.debug,
+        _alloc       = self.factoryControl,
+        tasks        = self.params.tasks,
+    }
+
+    self.engineers = EngineerStart(beParams)
+    if self.engineers then
+        self.engineerPlatoonName = self.engineers.platoonName
+    end
+end
+
+function Base:GetFactoryControl()
+    return self.factoryControl
+end
+
+function Base:RequestFactories(params)
+    if not self.factoryControl then return nil end
+    if params and not params.markerPos and not params.markerName then
+        params.markerPos = self.basePos
+    end
+    if params and not params.radius then
+        params.radius = self.radius
+    end
+    return self.factoryControl:RequestFactories(params)
+end
+
+function Base:ReturnLease(id, reason)
+    if not id or not self.factoryControl then return end
+    self.factoryControl:ReturnLease(id, reason)
+end
+
+function Base:GetGrantedUnits(leaseId)
+    if not self.factoryControl then return {} end
+    return self.factoryControl:GetGrantedUnits(leaseId)
+end
+
+function Base:GetEngineerHandle()
+    return self.engineers
+end
+
+function Base:PushEngineerBuildTask(bp, pos, facing)
+    if self.engineers and self.engineers.PushBuildTask then
+        self.engineers:PushBuildTask(bp, pos, facing)
+    end
+end
+
+function Base:UpdateEngineerTasks(prefs)
+    if self.engineers and self.engineers.UpdateTaskPrefs then
+        self.engineers:UpdateTaskPrefs(prefs)
+    end
+end
+
+function Base:GetStructureSnapshot()
+    if self.engineers and self.engineers.struct then
+        return self.engineers.struct
+    end
+    return CopyTable(self.structures or {})
+end
+
+function Base:Stop()
+    if self.engineers then
+        EngineerStop(self.engineers)
+        self.engineers = nil
+    end
+    if self.factoryControl then
+        self.factoryControl:Shutdown()
+        self.factoryControl = nil
+    end
+    if ScenarioInfo.BaseEngineerPlatoons and self.engineerPlatoonName then
+        ScenarioInfo.BaseEngineerPlatoons[self.engineerPlatoonName] = nil
+    end
+    ScenarioInfo.BaseManagers[self.tag] = nil
+end
+
+local function NormalizeBaseParams(p)
+    assert(p.brain, 'brain is required')
+    assert(p.baseMarker, 'baseMarker is required')
+    assert(p.baseTag, 'baseTag is required')
+    assert(p.radius, 'radius is required')
+    assert(p.structGroups, 'structGroups table is required')
+    assert(p.engineers, 'engineers table is required')
+
+    local pos = MarkerPosition(p.baseMarker)
+    if not pos then
+        error('Invalid baseMarker '.. tostring(p.baseMarker))
+    end
+
+    return {
+        brain        = p.brain,
+        baseMarker   = p.baseMarker,
+        baseTag      = p.baseTag,
+        basePos      = pos,
+        radius       = p.radius,
+        structGroups = CopyTable(p.structGroups),
+        engineers    = CopyTable(p.engineers),
+        difficulty   = p.difficulty,
+        tasks        = CopyTable(p.tasks or {}),
+        debug        = p.debug and true or false,
+        spawnSpread           = p.spawnSpread,
+        engineerFactoryPriority = p.engineerFactoryPriority,
+        engineerFactoryCount    = p.engineerFactoryCount,
+        factoryStallTimeout     = p.factoryStallTimeout,
+    }
+end
+
+local function BaseStart(params)
+    local p = NormalizeBaseParams(params or {})
+    local base = setmetatable({
+        brain    = p.brain,
+        tag      = p.baseTag,
+        params   = p,
+        radius   = p.radius,
+        basePos  = p.basePos,
+    }, Base)
+
+    base:_SetupFactoryControl()
+    base:_SetupEngineerManager()
+
+    ScenarioInfo.BaseManagers[base.tag] = base
+    return base
+end
+
+local function BaseStop(handle)
+    if handle and handle.Stop then
+        handle:Stop()
+    end
+end
+
+function GetBase(tag)
+    if not tag then return nil end
+    return ScenarioInfo.BaseManagers[tag]
+end
+
+function Start(params)
+    return BaseStart(params)
+end
+
+function Stop(handle)
+    return BaseStop(handle)
+end
+
+return {
+    Start              = Start,
+    Stop               = Stop,
+    GetBase            = GetBase,
+    StartEngineer      = EngineerStart,
+    StopEngineer       = EngineerStop,
+}
