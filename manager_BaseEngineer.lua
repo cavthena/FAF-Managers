@@ -1,11 +1,10 @@
 --[[
 ================================================================================
- Base Engineer Manager (Lua 5.0 safe)
+ Base Engineer Manager
 ================================================================================
 
 Overview
-    Drop-in replacement for the legacy BaseManager/OpAI helpers. Spawns a base
-    layout, keeps a dedicated engineer platoon alive, rebuilds/repairs
+    Spawns a base layout, keeps a dedicated engineer platoon alive, rebuilds/repairs
     structures, manages experimental projects, and exposes a factory allocator
     that other systems (such as manager_UnitBuilder) can lease through.
 
