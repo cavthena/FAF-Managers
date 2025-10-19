@@ -1,6 +1,6 @@
 --[[
 ================================================================================
- Base Engineer Manager, Created by Ruanuku/Cavthena
+ Base Engineer Manager
 ================================================================================
 
 Overview
@@ -90,7 +90,7 @@ end
 local function isComplete(u)
     if not u or u.Dead then return false end
     if u.GetFractionComplete and u:GetFractionComplete() < 1 then return false end
-    if u.IsUnitState and u:IsUnitState('BeingBuilt') then return false end
+    if _safeIs(u, 'BeingBuilt') then return false end
     return true
 end
 
@@ -423,8 +423,8 @@ function M:_FactoriesList(usableOnly)
     for _, f in pairs(self.leased or {}) do
         if f and not f.Dead then
             if usableOnly then
-                local up = (f.IsUnitState and f:IsUnitState('Upgrading'))
-                local gd = (f.IsUnitState and f:IsUnitState('Guarding'))
+                local up = _safeIs(f, 'Upgrading')
+                local gd = _safeIs(f, 'Guarding')
                 local ps = (f.IsPaused and f:IsPaused())
                 if not (up or gd or ps) then table.insert(flist, f) end
             else
@@ -1036,7 +1036,7 @@ end
 
 function M:_TickBuild(u, id, now)
     if not u or u.Dead then return end
-    if u.IsUnitState and u:IsUnitState('Building') then return end
+    if _safeIs(u, 'Building') then return end
 
     local task = table.remove(self.buildQueue, 1)
     if not task then
