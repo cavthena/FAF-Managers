@@ -75,6 +75,12 @@ local DomainToThreat = {
     AIR = 'AntiAir',
 }
 
+local DomainAliases = {
+    NAVAL = 'SEA',
+    WATER = 'SEA',
+    NAVY = 'SEA',
+}
+
 local DefaultOptions = {
     IntelOnly = false,
     Formation = 'GrowthFormation',
@@ -615,14 +621,77 @@ local function GatherEnemyUnits(brain, category, opts)
     return result
 end
 
-local function ResolvePlatoonData(platoon, data)
-    if type(data) == 'table' then
-        platoon.PlatoonData = data
-        return data
+local function ExtractAttackData(data)
+    if type(data) ~= 'table' then
+        return nil
     end
+
+    -- Allow callers to pass the full manager configuration table where the
+    -- options live under ``attackData`` while still supporting the legacy
+    -- direct options table used by older scripts. Some callers have been seen
+    -- to wrap the payload more than once, so peel layers until we hit the
+    -- innermost valid table.
+    local current = data
+    local seen = {}
+
+    while type(current) == 'table' do
+        if seen[current] then
+            WARN('[platoon_AttackFunctions] attackData contains a recursive reference; using last valid table')
+            return current
+        end
+        seen[current] = true
+
+        local nested = current.attackData or current.AttackData
+        if nested == nil then
+            return current
+        end
+
+        if type(nested) ~= 'table' then
+            WARN('[platoon_AttackFunctions] attackData must be a table; ignoring invalid nested value')
+            return current
+        end
+
+        current = nested
+    end
+
+    return nil
+end
+
+local function NormalizeDomain(domain)
+    if type(domain) ~= 'string' then
+        return nil
+    end
+
+    local upper = string.upper(domain)
+    upper = DomainAliases[upper] or upper
+
+    if DomainToLayer[upper] or upper == 'AIR' then
+        return upper
+    end
+
+    if upper == 'LAND' or upper == 'AMPHIBIOUS' or upper == 'SEA' then
+        return upper
+    end
+
+    return nil
+end
+
+local function ResolvePlatoonData(platoon, data)
+    local resolved = ExtractAttackData(data)
+
+    if resolved ~= nil then
+        if type(resolved) ~= 'table' then
+            WARN('[platoon_AttackFunctions] attackData must be a table; ignoring invalid value')
+            resolved = {}
+        end
+        platoon.PlatoonData = resolved
+        return resolved
+    end
+
     if type(platoon.PlatoonData) == 'table' then
         return platoon.PlatoonData
     end
+
     local fallback = {}
     platoon.PlatoonData = fallback
     return fallback
@@ -631,16 +700,16 @@ end
 local function ResolveOptions(platoon, data)
     local opts = {}
     data = ResolvePlatoonData(platoon, data)
-    for key, value in pairs(DefaultOptions) do
+        for key, value in pairs(DefaultOptions) do
         if data[key] ~= nil then
             opts[key] = data[key]
         else
             opts[key] = value
         end
     end
-    opts.Domain = data.Domain or data.domain or nil
-    if opts.Domain then
-        opts.Domain = string.upper(opts.Domain)
+    opts.Domain = NormalizeDomain(data.Domain or data.domain or data.DOMAIN)
+    if not opts.Domain and data ~= platoon.PlatoonData and type(platoon.PlatoonData) == 'table' then
+        opts.Domain = NormalizeDomain(platoon.PlatoonData.Domain or platoon.PlatoonData.domain or platoon.PlatoonData.DOMAIN)
     end
     opts.TargetArmy = data.TargetArmy or data.targetArmy
     opts.Brain = platoon:GetBrain()
@@ -650,6 +719,9 @@ local function ResolveOptions(platoon, data)
         -- domain required; attempt to infer but warn through log
         opts.Domain = 'LAND'
         WARN('[platoon_AttackFunctions] Domain not provided, defaulting to LAND')
+    end
+    if type(data) == 'table' then
+        data.Domain = opts.Domain
     end
     opts.Formation = ResolveFormation(data.Formation or data.formation)
     opts.IntelOnly = (data.IntelOnly ~= nil) and data.IntelOnly or DefaultOptions.IntelOnly

@@ -455,6 +455,7 @@ end
          composition        = normalizeComposition(p.composition),
          difficulty         = p.difficulty or 2,
          attackFn           = p.attackFn,
+         attackData         = p.attackData,
          waveCooldown       = p.waveCooldown or 0,
          mode               = p.mode or 1,
         mode2LossThreshold = (p.mode2LossThreshold ~= nil) and p.mode2LossThreshold or 0.5,
