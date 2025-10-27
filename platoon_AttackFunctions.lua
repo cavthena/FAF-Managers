@@ -372,20 +372,103 @@ local function TryUseTransports(platoon, destination, opts)
     return success
 end
 
+local function NormalizeRoute(route)
+    if not route then
+        return {}
+    end
+    local normalized = {}
+    for _, node in ipairs(route) do
+        if node then
+            if node.x then
+                TableInsert(normalized, {node.x, node.y, node.z})
+            else
+                TableInsert(normalized, {node[1], node[2], node[3]})
+            end
+        end
+    end
+    return normalized
+end
+
+local function ComputeRouteAngles(route, platoon)
+    local count = TableGetn(route)
+    if count == 0 then
+        return {}
+    end
+    local angles = {}
+    local previous = CopyVector(route[1])
+    local platoonPos = GetPlatoonPosition(platoon)
+    if platoonPos then
+        previous = CopyVector(platoonPos)
+    end
+    local lastAngle = 0
+    for index = 1, count do
+        local current = route[index]
+        if previous then
+            local direction = Normalize2D(SubVectors(current, previous))
+            if direction then
+                local angle = math.atan2(-(direction[1] or 0), direction[3] or 0)
+                if angle ~= angle then
+                    angle = lastAngle
+                else
+                    lastAngle = angle
+                end
+                angles[index] = angle
+            else
+                angles[index] = lastAngle
+            end
+        else
+            angles[index] = lastAngle
+        end
+        previous = current
+    end
+    return angles
+end
+
 local function IssueMoveRoute(platoon, route, formation)
-    if not platoon or not route or TableGetn(route) == 0 then return end
+    if not platoon then return end
+    local normalized = NormalizeRoute(route)
+    if TableGetn(normalized) == 0 then return end
+    formation = formation or DefaultOptions.Formation
     if formation and platoon.SetPlatoonFormationOverride then
         pcall(platoon.SetPlatoonFormationOverride, platoon, formation)
     end
-    pcall(platoon.IssueMoveAlongRoute, platoon, route, formation)
+    local units = GetPlatoonUnits(platoon)
+    if TableGetn(units) == 0 then return end
+    if formation == 'NoFormation' then
+        for _, node in ipairs(normalized) do
+            IssueMove(units, node)
+        end
+        return
+    end
+    local angles = ComputeRouteAngles(normalized, platoon)
+    for index = 1, TableGetn(normalized) - 1 do
+        local node = normalized[index]
+        IssueFormMove(units, node, formation, angles[index] or 0)
+    end
+    local finalNode = normalized[TableGetn(normalized)]
+    IssueFormAggressiveMove(units, finalNode, formation, angles[TableGetn(normalized)] or 0)
 end
 
 local function IssueAggressiveRoute(platoon, route, formation)
-    if not platoon or not route or TableGetn(route) == 0 then return end
+    if not platoon then return end
+    local normalized = NormalizeRoute(route)
+    if TableGetn(normalized) == 0 then return end
+    formation = formation or DefaultOptions.Formation
     if formation and platoon.SetPlatoonFormationOverride then
         pcall(platoon.SetPlatoonFormationOverride, platoon, formation)
     end
-    pcall(platoon.IssueAggressiveMoveAlongRoute, platoon, route, formation)
+    local units = GetPlatoonUnits(platoon)
+    if TableGetn(units) == 0 then return end
+    if formation == 'NoFormation' then
+        for _, node in ipairs(normalized) do
+            IssueAggressiveMove(units, node)
+        end
+        return
+    end
+    local angles = ComputeRouteAngles(normalized, platoon)
+    for index, node in ipairs(normalized) do
+        IssueFormAggressiveMove(units, node, formation, angles[index] or 0)
+    end
 end
 
 local function WaitForPlatoon(platoon, destination, radius, timeout)
