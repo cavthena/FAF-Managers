@@ -87,6 +87,12 @@ local function markerPos(mark)
     return ScenarioUtils.MarkerToPosition(mark)
 end
 
+local function _safeIs(u, state)
+    if not (u and u.IsUnitState and (not u.Dead)) then return false end
+    local ok, res = pcall(function() return u:IsUnitState(state) end)
+    return ok and res or false
+end
+
 local function isComplete(u)
     if not u or u.Dead then return false end
     if u.GetFractionComplete and u:GetFractionComplete() < 1 then return false end
@@ -153,10 +159,10 @@ local function _EnsureEngineerPlatoon(brain, name)
     return brain:MakePlatoon(name, '')
 end
 
-local function _safeIs(u, state)
-    if not (u and u.IsUnitState and (not u.Dead)) then return false end
-    local ok, res = pcall(function() return u:IsUnitState(state) end)
-    return ok and res or false
+local function _RegisterEngineerPlatoon(name, platoon)
+    if not (name and platoon) then return end
+    ScenarioInfo.BaseEngineerPlatoons = ScenarioInfo.BaseEngineerPlatoons or {}
+    ScenarioInfo.BaseEngineerPlatoons[name] = platoon
 end
 
 local function _safeCQ(u)
@@ -172,6 +178,37 @@ M.__index = M
 function M:Log(msg) LOG(('[BE:%s] %s'):format(self.tag, msg)) end
 function M:Warn(msg) WARN(('[BE:%s] %s'):format(self.tag, msg)) end
 function M:Dbg(msg) if self.params.debug then self:Log(msg) end end
+
+function M:_FindEngineerPlatoon()
+    if not (self.brain and self.platoonName) then return nil end
+    local platoon = nil
+    if self.brain.GetPlatoonUniquelyNamed then
+        platoon = self.brain:GetPlatoonUniquelyNamed(self.platoonName)
+    end
+    if not platoon then
+        local existing = self.engineerPlatoon
+        if existing and self.brain.PlatoonExists and self.brain:PlatoonExists(existing) then
+            platoon = existing
+        end
+    end
+    if platoon then
+        self.engineerPlatoon = platoon
+        _RegisterEngineerPlatoon(self.platoonName, platoon)
+    end
+    return platoon
+end
+
+function M:_GetEngineerPlatoon()
+    local platoon = self:_FindEngineerPlatoon()
+    if platoon then return platoon end
+    if not (self.brain and self.platoonName) then return nil end
+    platoon = _EnsureEngineerPlatoon(self.brain, self.platoonName)
+    if platoon then
+        self.engineerPlatoon = platoon
+        _RegisterEngineerPlatoon(self.platoonName, platoon)
+    end
+    return platoon
+end
 
 local function _sum(tbl)
     local s = 0; for _,n in pairs(tbl or {}) do s = s + (n or 0) end; return s
@@ -244,8 +281,11 @@ function M:_TagAndTrack(u, tier)
     self.engTask = self.engTask or {}
     self.engTask[id] = self.engTask[id] or 'IDLE'
 
-    if self.engineerPlatoon and self.brain and self.brain.AssignUnitsToPlatoon then
-        self.brain:AssignUnitsToPlatoon(self.engineerPlatoon, {u}, 'Support', 'None')
+    if self.brain and self.brain.AssignUnitsToPlatoon then
+        local platoon = self:_GetEngineerPlatoon()
+        if platoon then
+            self.brain:AssignUnitsToPlatoon(platoon, {u}, 'Support', 'None')
+        end
     end
 
     if u.AddUnitCallback then
@@ -905,7 +945,7 @@ function M:_SyncStructureDemand()
             if cur ~= slot.bpTarget then
                 -- Same chain and below -> upgrade one step
                 if _IsSameChainAndNotAbove(cur, slot.bpTarget) then
-                    if present.IsUnitState and not present:IsUnitState('Upgrading') then
+                    if not _safeIs(present, 'Upgrading') then
                         local nxt = _ChainNext(cur)
                         if nxt then
                             IssueUpgrade({present}, nxt)
@@ -1065,7 +1105,7 @@ function M:_TickBuild(u, id, now)
         while not (u.Dead) and waited < timeout do
             WaitSeconds(1)
             waited = waited + 1
-            if u.IsUnitState and (not u:IsUnitState('Building')) then
+            if not _safeIs(u, 'Building') then
                 break
             end
         end
@@ -1430,11 +1470,12 @@ function M:Stop()
         KillThread(self.taskThread)
         self.taskThread = nil
     end
-    if ScenarioInfo.BaseEngineerPlatoons and self.platoonName then
+        if ScenarioInfo.BaseEngineerPlatoons and self.platoonName then
         ScenarioInfo.BaseEngineerPlatoons[self.platoonName] = nil
     end
-    if self.engineerPlatoon and self.brain and self.brain.PlatoonExists and self.brain:PlatoonExists(self.engineerPlatoon) then
-        self.brain:DisbandPlatoon(self.engineerPlatoon)
+    local platoon = self:_FindEngineerPlatoon()
+    if platoon and self.brain and self.brain.PlatoonExists and self.brain:PlatoonExists(platoon) then
+        self.brain:DisbandPlatoon(platoon)
     end
     self.engineerPlatoon = nil
 end
@@ -1501,11 +1542,7 @@ local function EngineerStart(params)
     o.structGroupUnits = {}
 
     o.platoonName = o.params.platoonName or (o.tag .. '_Engineers')
-    o.engineerPlatoon = _EnsureEngineerPlatoon(o.brain, o.platoonName)
-    ScenarioInfo.BaseEngineerPlatoons = ScenarioInfo.BaseEngineerPlatoons or {}
-    if o.engineerPlatoon then
-        ScenarioInfo.BaseEngineerPlatoons[o.platoonName] = o.engineerPlatoon
-    end
+    o.engineerPlatoon = o:_GetEngineerPlatoon()
 
     o:Start()
     return o

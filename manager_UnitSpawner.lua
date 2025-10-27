@@ -257,17 +257,17 @@ function Spawner:HandOffToAttack(platoon)
                      table.getn(p:GetPlatoonUnits() or {}),
                      type(fn)))
          if type(fn) == 'function' then
-             return fn(p)
-         elseif type(fn) == 'string' then
-             local ref = _G and _G[fn] or nil
-             if type(ref) == 'function' then
-                 return ref(p)
-             else
-                 self:Warn('AttackWrapper: string attackFn not found in _G: '.. tostring(fn))
-             end
-         else
-             self:Warn('AttackWrapper: attackFn is not callable: '.. tostring(fn))
-         end
+            return fn(p, self.params.attackData)
+        elseif type(fn) == 'string' then
+            local ref = _G and _G[fn]
+            if type(ref) == 'function' then
+                return ref(p, self.params.attackData)
+            else
+                self:Warn('AttackWrapper: string attackFn not found in _G: '.. tostring(fn))
+            end
+        else
+            self:Warn('AttackWrapper: attackFn is not callable: '.. tostring(fn))
+        end
      end
  
      platoon:ForkAIThread(_AttackWrapper, self.params.attackFn)

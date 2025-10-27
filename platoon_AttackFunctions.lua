@@ -615,9 +615,22 @@ local function GatherEnemyUnits(brain, category, opts)
     return result
 end
 
+local function ResolvePlatoonData(platoon, data)
+    if type(data) == 'table' then
+        platoon.PlatoonData = data
+        return data
+    end
+    if type(platoon.PlatoonData) == 'table' then
+        return platoon.PlatoonData
+    end
+    local fallback = {}
+    platoon.PlatoonData = fallback
+    return fallback
+end
+
 local function ResolveOptions(platoon, data)
     local opts = {}
-    data = data or {}
+    data = ResolvePlatoonData(platoon, data)
     for key, value in pairs(DefaultOptions) do
         if data[key] ~= nil then
             opts[key] = data[key]
@@ -643,7 +656,7 @@ local function ResolveOptions(platoon, data)
     opts.Underwater = (data.Underwater ~= nil) and data.Underwater or DefaultOptions.Underwater
     opts.UseTransports = (data.UseTransports ~= nil) and data.UseTransports or DefaultOptions.UseTransports
     opts.AvoidDef = (data.AvoidDef ~= nil) and data.AvoidDef or DefaultOptions.AvoidDef
-    return opts
+    return opts, data
 end
 
 --------------------------------------------------------------------------------
@@ -1201,11 +1214,10 @@ end
 -- exposed attack routines -----------------------------------------------------
 --------------------------------------------------------------------------------
 
-function WaveAttack(platoon)
-    local data = platoon.PlatoonData or {}
-    local opts = ResolveOptions(platoon, data)
+function WaveAttack(platoon, data)
+    local opts, config = ResolveOptions(platoon, data)
     while PlatoonAlive(platoon) do
-        local target = SelectWaveTarget(platoon, opts, data.TargetType or data.targetType)
+        local target = SelectWaveTarget(platoon, opts, config.TargetType or config.targetType)
         if not target then
             break
         end
@@ -1214,11 +1226,10 @@ function WaveAttack(platoon)
     platoon:PlatoonDisband()
 end
 
-function RaidAttack(platoon)
-    local data = platoon.PlatoonData or {}
-    local opts = ResolveOptions(platoon, data)
+function RaidAttack(platoon, data)
+    local opts, config = ResolveOptions(platoon, data)
     while PlatoonAlive(platoon) do
-        local raid = SelectRaidTarget(platoon, opts, data.TargetType or data.targetType)
+        local raid = SelectRaidTarget(platoon, opts, config.TargetType or config.targetType)
         if not raid then
             break
         end
@@ -1227,8 +1238,7 @@ function RaidAttack(platoon)
     platoon:PlatoonDisband()
 end
 
-function Scout(platoon)
-    local data = platoon.PlatoonData or {}
+function Scout(platoon, data)
     local opts = ResolveOptions(platoon, data)
     while PlatoonAlive(platoon) do
         ExecuteScout(platoon, opts)
@@ -1236,11 +1246,10 @@ function Scout(platoon)
     platoon:PlatoonDisband()
 end
 
-function Bombard(platoon)
-    local data = platoon.PlatoonData or {}
-    local opts = ResolveOptions(platoon, data)
+function Bombard(platoon, data)
+    local opts, config = ResolveOptions(platoon, data)
     while PlatoonAlive(platoon) do
-        local bombard = SelectBombardTargets(platoon, opts, data.TargetType or data.targetType)
+        local bombard = SelectBombardTargets(platoon, opts, config.TargetType or config.targetType)
         if not bombard then
             break
         end
@@ -1249,11 +1258,10 @@ function Bombard(platoon)
     platoon:PlatoonDisband()
 end
 
-function Siege(platoon)
-    local data = platoon.PlatoonData or {}
-    local opts = ResolveOptions(platoon, data)
+function Siege(platoon, data)
+    local opts, config = ResolveOptions(platoon, data)
     while PlatoonAlive(platoon) do
-        local siege = SelectSiegeTarget(platoon, opts, data.TargetType or data.targetType)
+        local siege = SelectSiegeTarget(platoon, opts, config.TargetType or config.targetType)
         if not siege then
             break
         end
@@ -1262,8 +1270,7 @@ function Siege(platoon)
     platoon:PlatoonDisband()
 end
 
-function Cull(platoon)
-    local data = platoon.PlatoonData or {}
+function Cull(platoon, data)
     local opts = ResolveOptions(platoon, data)
     while PlatoonAlive(platoon) do
         ExecuteCull(platoon, opts)
@@ -1271,25 +1278,23 @@ function Cull(platoon)
     platoon:PlatoonDisband()
 end
 
-function Hunt(platoon)
-    local data = platoon.PlatoonData or {}
-    local opts = ResolveOptions(platoon, data)
-    local params = {
-        Targets = data.TargetList or data.targetList or {},
-        WaitForSafeZone = data.Wait or data.wait or false,
-        WaitPosition = ResolveMarkerPosition(data.Marker or data.Location or data.WaitLocation or data.waitLocation),
+function Hunt(platoon, data)
+    local opts, config = ResolveOptions(platoon, data)
+    local huntParams = {
+        Targets = config.TargetList or config.targetList or {},
+        WaitForSafeZone = config.Wait or config.wait or false,
+        WaitPosition = ResolveMarkerPosition(config.Marker or config.Location or config.WaitLocation or config.waitLocation),
     }
     while PlatoonAlive(platoon) do
-        ExecuteHunt(platoon, opts, params)
+        ExecuteHunt(platoon, opts, huntParams)
     end
     platoon:PlatoonDisband()
 end
 
-function Firebase(platoon)
-    local data = platoon.PlatoonData or {}
-    local opts = ResolveOptions(platoon, data)
-    local locationEntries = data.Location or data.Locations or {}
-    local templateEntries = data.Template or data.Templates or {}
+function Firebase(platoon, data)
+    local opts, config = ResolveOptions(platoon, data)
+    local locationEntries = config.Location or config.Locations or {}
+    local templateEntries = config.Template or config.Templates or {}
     local locations = {}
     for _, entry in ipairs(locationEntries) do
         local pos = ResolveMarkerPosition(entry)
