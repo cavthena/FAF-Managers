@@ -182,7 +182,32 @@ local DefaultOptions = {
     Underwater     = false,
     UseTransports  = false,
     AvoidDef       = false,
+    Debug          = false,
 }
+
+local function FormatVector(vec)
+    if not vec then
+        return '(nil)'
+    end
+    return string.format('(%.1f, %.1f, %.1f)', (vec[1] or 0), (vec[2] or 0), (vec[3] or 0))
+end
+
+local function WaveDebug(options, message)
+    if not options or not (options.DebugWave or options.Debug) then
+        return
+    end
+    local prefix = '[WaveAttack]'
+    if options.Brain then
+        local ok, armyIndex = pcall(options.Brain.GetArmyIndex, options.Brain)
+        if ok and armyIndex then
+            prefix = string.format('%s[Army %s]', prefix, tostring(armyIndex))
+        end
+        if options.Brain.Nickname then
+            prefix = string.format('%s[%s]', prefix, options.Brain.Nickname)
+        end
+    end
+    LOG(string.format('%s %s', prefix, message))
+end
 
 local function Clamp(v, lo, hi)
     if v < lo then return lo elseif v > hi then return hi else return v end
@@ -726,6 +751,7 @@ local function ResolveOptions(platoon, data)
     opts.TargetArmy = (data and (data.TargetArmy or data.targetArmy)) or opts.TargetArmy
     opts.Brain = platoon and platoon:GetBrain()
     opts.TargetBrains = DetermineTargetBrains(opts.Brain, opts)
+    opts.DebugWave = (data and (data.DebugWave or data.debugWave)) or opts.Debug
     return opts, data or {}
 end
 
@@ -735,19 +761,36 @@ end
 
 local function SelectWaveTarget(platoon, options, targetType)
     local structures = GatherEnemyUnits(options.Brain, StructureCategory, options)
+    WaveDebug(options, string.format('SelectWaveTarget: found %d viable structures', TableGetn(structures)))
     if TableGetn(structures) == 0 then
+        WaveDebug(options, 'SelectWaveTarget: no structures available to target')
         return nil
     end
     targetType = string.lower(targetType or 'concentration')
+    WaveDebug(options, string.format('SelectWaveTarget: evaluating target type "%s"', targetType))
     if targetType == 'closest' then
-        return SelectClosestStructure(platoon, options, structures)
+        local closest = SelectClosestStructure(platoon, options, structures)
+        if closest then
+            WaveDebug(options, string.format('SelectWaveTarget: chose closest structure at %s', FormatVector(closest.Position)))
+        else
+            WaveDebug(options, 'SelectWaveTarget: closest structure selection returned nil')
+        end
+        return closest
     end
     local cluster = SelectStructureCluster(platoon, options, structures)
     if cluster then
         cluster.Units = structures
+        WaveDebug(options, string.format('SelectWaveTarget: selected cluster center at %s', FormatVector(cluster.Position)))
         return cluster
     end
-    return SelectClosestStructure(platoon, options, structures)
+    WaveDebug(options, 'SelectWaveTarget: falling back to closest structure selection')
+    local fallback = SelectClosestStructure(platoon, options, structures)
+    if fallback then
+        WaveDebug(options, string.format('SelectWaveTarget: fallback closest structure at %s', FormatVector(fallback.Position)))
+    else
+        WaveDebug(options, 'SelectWaveTarget: fallback closest structure selection returned nil')
+    end
+    return fallback
 end
 
 local function BuildRaidPriorityList(targetType)
@@ -851,17 +894,22 @@ end
 
 local function ExecuteWave(platoon, options, target)
     if not target or not target.Position then
+        WaveDebug(options, 'ExecuteWave: no valid target or position; aborting execution')
         return false
     end
     local dest = AdjustToDomain(options.Domain, target.Position)
     if not MovePlatoon(platoon, dest, options, false) then
+        WaveDebug(options, string.format('ExecuteWave: MovePlatoon failed towards %s', FormatVector(dest)))
         return false
     end
     if not PlatoonAlive(platoon) then
+        WaveDebug(options, 'ExecuteWave: platoon destroyed while moving to target')
         return false
     end
+    WaveDebug(options, string.format('ExecuteWave: issuing aggressive move to %s', FormatVector(dest)))
     platoon:AggressiveMoveToLocation(dest)
     WaitSeconds(RecheckDelay)
+    WaveDebug(options, 'ExecuteWave: completed cycle, rechecking after delay')
     return true
 end
 
@@ -1237,17 +1285,24 @@ end
 
 function WaveAttack(platoon, data)
     local opts, config = ResolveOptions(platoon, data)
+    WaveDebug(opts, string.format('WaveAttack: starting (domain=%s, formation=%s)', tostring(opts.Domain), tostring(opts.Formation)))
     while PlatoonAlive(platoon) do
+        WaveDebug(opts, 'WaveAttack: selecting next target')
         local target = SelectWaveTarget(platoon, opts, config.TargetType or config.targetType)
         if target then
+            local targetPos = target.Position or (target.Unit and AdjustToSurface(target.Unit:GetPosition()))
+            WaveDebug(opts, string.format('WaveAttack: engaging target at %s', FormatVector(targetPos)))
             if not ExecuteWave(platoon, opts, target) then
+                WaveDebug(opts, 'WaveAttack: ExecuteWave returned false, waiting before retry')
                 WaitSeconds(RecheckDelay)
             end
         else
+            WaveDebug(opts, 'WaveAttack: no target available, waiting before next search')
             WaitSeconds(RecheckDelay)
         end
     end
     if PlatoonAlive(platoon) then
+        WaveDebug(opts, 'WaveAttack: disbanding surviving platoon')
         platoon:PlatoonDisband()
     end
 end
