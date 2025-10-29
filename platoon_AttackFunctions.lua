@@ -543,17 +543,34 @@ local function IssuePath(platoon, path, formation, aggressiveFinal)
     if size == 0 then
         return false
     end
+    local form = formation or 'GrowthFormation'
+    if type(form) ~= 'string' then
+        form = 'GrowthFormation'
+    end
+    local useForm = string.lower(form) ~= 'noformation'
     for i = 1, size - 1 do
         local waypoint = path[i]
         if waypoint then
-            IssueFormMove(units, waypoint, formation or 'GrowthFormation', 0)
+            if useForm then
+                IssueFormMove(units, waypoint, form, 0)
+            else
+                IssueMove(units, waypoint)
+            end
         end
     end
     local last = path[size]
     if aggressiveFinal then
-        platoon:AggressiveMoveToLocation(last)
+        if useForm then
+            platoon:AggressiveMoveToLocation(last)
+        else
+            IssueAggressiveMove(units, last)
+        end
     else
-        IssueFormMove(units, last, formation or 'GrowthFormation', 0)
+        if useForm then
+            IssueFormMove(units, last, form, 0)
+        else
+            IssueMove(units, last)
+        end
     end
     return true
 end
