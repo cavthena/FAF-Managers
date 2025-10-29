@@ -1,481 +1,546 @@
 --[[
-Usage Overview
-==============
+================================================================================
+Platoon Attack Behaviours (FAF safe, Lua 5.0)
+================================================================================
 
-Import the module from your scenario or manager scripts and hand it a platoon
-plus an options table when transferring control to an attack thread:
+Import this module from your manager script (for example
+manager_UnitBuilder.lua or manager_UnitSpawner.lua) and fork the desired
+behaviour on the platoon once it has been handed off:
 
-    local PlatoonAttacks = import('/lua/AI/platoon_AttackFunctions.lua')
-    platoon:ForkAIThread(PlatoonAttacks.WaveAttack, {
+    local Attacks = import('/maps/<map-name>/platoon_AttackFunctions.lua')
+    local options = {
         Domain = 'LAND',
         TargetArmy = {'Player1', 'Player2'},
-        TargetType = 'concentration',
-    })
+        Formation = 'AttackFormation',
+    }
+    platoon:ForkAIThread(Attacks.WaveAttack, options)
 
-Every entry point shares the same global options:
-  * `TargetArmy` (table of army nicknames / indices) limits target scanning.
-  * `IntelOnly` (bool, default `false`) respects Fog-of-War if `true`.
-  * `Formation` (string, default `'GrowthFormation'`) selects movement
-    formation: `'AttackFormation'`, `'GrowthFormation'`, or `'NoFormation'`.
-  * `Domain` (string, required) restricts routing & targeting. Accepted values:
-    `'LAND'`, `'AMPHIBIOUS'`, `'AIR'`, `'SEA'`. Amphibious units route across
-    water but evaluate land targets.
-  * `Underwater` (bool, default `false`) allows targeting submerged units when
-    `true`.
-  * `UseTransports` (bool, default `false`) requests airlift support for long or
-    blocked paths. Units unload before switching back to their domain routing.
-  * `AvoidDef` (bool, default `false`) attempts to path around dangerous
-    defenses when possible.
+Each public entry point accepts the platoon and an optional configuration table.
+All functions share the following global options:
 
-Function specific options:
-  * `WaveAttack` / `Bombard` / `Siege` require `TargetType = 'concentration'` or
-    `'closest'` to determine structure selection.
-  * `RaidAttack` requires `TargetType` from `'ECO' | 'FAB' | 'ENG' | 'DEF' |
-    'SMT'` and automatically falls back through other categories as needed.
-  * `Scout` has no additional parameters; units split between known and random
-    intel sweeps.
-  * `Cull` roams near known enemies to ambush mobile units only.
-  * `Hunt` needs `TargetList` (array of unit BPs) and optional `Wait` (bool)
-    that delays attacks until targets leave defensive umbrellas.
-  * `Firebase` expects `Location` (array of marker names / positions) and
-    matching `Template` entries (scenario army groups) describing the base to
-    construct at each marker. Engineers loop through the list, rebuilding as
-    required.
+    TargetArmy (table<string|number>)
+        A whitelist of army nicknames/indices that may be targeted.  When nil the
+        platoon looks for any hostile army.
 
-Each function runs until its platoon is destroyed or no further targets can be
-found. Targets are re-evaluated roughly every 10 seconds, and commands are
-issued using the standard move or aggressive move route helpers provided by the
-engine.
+    IntelOnly (boolean, default = false)
+        When true the platoon only considers units/areas that are currently known
+        through intelligence (vision, radar or sonar).  When false it may select
+        any hostile unit regardless of intel coverage.
+
+    Formation (string, default = 'GrowthFormation')
+        Formation used for non-aggressive movement: 'AttackFormation',
+        'GrowthFormation' or 'NoFormation'.
+
+    Domain (string, required)
+        Movement layer and primary target domain.  Accepted values: 'LAND',
+        'AMPHIBIOUS', 'AIR', 'SEA'.  Amphibious units route over both land and
+        water but evaluate land targets.  Air platoons may engage both land and
+        sea units/structures.
+
+    Underwater (boolean, default = false)
+        When true the platoon will consider underwater targets (if its weapons
+        allow).  When false submerged units are ignored.
+
+    UseTransports (boolean, default = false)
+        Allows the platoon to request transports for long distance moves or
+        unreachable areas.  A transport will be requested for trips over 200
+        units or if the navmesh reports no valid path.  Units unload safely
+        before continuing on their domain routing.
+
+    AvoidDef (boolean, default = false)
+        Attempts to avoid static defenses that threaten the platoon.  Paths are
+        evaluated against domain-appropriate threat fields; when no safe path is
+        found the direct path is used instead.
+
+Attack specific options
+-----------------------
+
+WaveAttack
+    TargetType = 'concentration' | 'closest'
+        Focuses on either the densest cluster of structures or the closest
+        hostile structure respectively.
+
+RaidAttack
+    TargetType = 'ECO' | 'FAB' | 'ENG' | 'DEF' | 'SMT'
+        Selects priority categories for hit-and-run raids.  When no targets are
+        available in the chosen category the search falls back in this order:
+        selected > ECO > FAB > ENG > DEF.  'SMT' chooses the least defended
+        target overall.
+
+Scout
+    No extra parameters.  Half the platoon scouts near known contacts while the
+    remainder explores random points on the map.
+
+Bombard
+    TargetType = 'concentration' | 'closest'
+        Long range bombardment prioritising shields/intel, then artillery/TML,
+        then point defences, finally remaining structures.
+
+Siege
+    TargetType = 'concentration' | 'closest'
+        Focused destruction of static defences.  Platoon advances aggressively as
+        threats are removed.
+
+Cull
+    No extra parameters.  Patrols near known enemy activity and hunts enemy
+    platoons, only engaging when they stray from defensive cover.
+
+Hunt
+    TargetList (table of unit blueprints) -- required
+    Wait (boolean, default = false)
+        If Wait is true the platoon ignores targets protected by defences.  When
+        false it engages immediately upon detection.  The platoon returns to the
+        initial marker location whenever no targets are detected.
+
+Firebase
+    Location (array)
+    Template (array)
+        Matching arrays of marker names/positions and structure templates.  The
+        platoon must consist entirely of engineers.  Engineers travel to each
+        marker in order, construct the template, and loop indefinitely,
+        rebuilding missing structures as required.
+
+All behaviours run as independent threads (ForkAIThread) and remain active
+until the platoon is destroyed, idling when no valid targets are present.
+================================================================================
 ]]
 
-local ScenarioUtils = import('/lua/sim/ScenarioUtilities.lua')
-local ScenarioFramework = import('/lua/ScenarioFramework.lua')
-local NavUtils = import('/lua/sim/NavUtils.lua')
-local AIBuildStructures = import('/lua/AI/aibuildstructures.lua')
+local ScenarioUtils      = import('/lua/sim/ScenarioUtilities.lua')
+local ScenarioFramework  = import('/lua/ScenarioFramework.lua')
+local NavUtils           = import('/lua/sim/NavUtils.lua')
 
 --------------------------------------------------------------------------------
--- helpers & shared state ------------------------------------------------------
+-- small helpers ----------------------------------------------------------------
 --------------------------------------------------------------------------------
 
-local TableGetn = table.getn
-local TableInsert = table.insert
-local TableSort = table.sort
+local TableGetn          = table.getn
+local TableInsert        = table.insert
+local TableSort          = table.sort
+local Random             = math.random
+local Floor              = math.floor
+local Min                = math.min
+local Max                = math.max
+local Abs                = math.abs
+local PI                 = math.pi
 
-local DomainToLayer = {
-    LAND = 'Land',
-    AMPHIBIOUS = 'Amphibious',
-    AIR = 'Air',
-    SEA = 'Water',
+local RecheckDelay       = 10
+local TransportDistance  = 200
+local ClusterRadius      = 32
+local ThreatSampleRadius = 24
+local FirebaseTimeout    = 120
+
+local DomainLayer = {
+    LAND        = 'Land',
+    AMPHIBIOUS  = 'Amphibious',
+    AIR         = 'Air',
+    SEA         = 'Water',
 }
 
-local DomainToThreat = {
-    LAND = 'StructureAntiSurface',
-    AMPHIBIOUS = 'StructureAntiSurface',
-    SEA = 'Naval',
-    AIR = 'AntiAir',
+local DomainThreatType = {
+    LAND        = 'AntiSurface',
+    AMPHIBIOUS  = 'AntiSurface',
+    SEA         = 'AntiSurface',
+    AIR         = 'AntiAir',
 }
+
+local DomainTargetCategory = {
+    LAND        = categories.LAND - categories.AIR - categories.NAVAL,
+    AMPHIBIOUS  = categories.LAND - categories.AIR,
+    SEA         = categories.NAVAL,
+    AIR         = categories.AIR,
+}
+
+local StructureCategory = categories.STRUCTURE - categories.WALL
+local MobileCategory    = categories.MOBILE - categories.ENGINEER - categories.SCOUT - categories.WALL
+
+local RaidCategoryPriorities = {
+    ECO = categories.MASSEXTRACTION + categories.MASSPRODUCTION + categories.ENERGYPRODUCTION + categories.MASSSTORAGE + categories.ENERGYSTORAGE,
+    FAB = categories.FACTORY + categories.ANTIMISSILE * categories.STRUCTURE,
+    ENG = categories.ENGINEER + categories.STRUCTURE * categories.ENGINEERSTATION,
+    DEF = categories.DEFENSE + categories.SHIELD + categories.RADAR + categories.SONAR,
+}
+
+local BombardPriority = {
+    categories.STRUCTURE * (categories.SHIELD + categories.RADAR + categories.SONAR),
+    categories.STRUCTURE * (categories.ARTILLERY + categories.TACTICALMISSILEPLATFORM),
+    categories.STRUCTURE * (categories.DEFENSE - categories.SHIELD),
+    StructureCategory,
+}
+
+local SiegeCategory = categories.STRUCTURE * (categories.DEFENSE + categories.SHIELD)
 
 local DomainAliases = {
-    NAVAL = 'SEA',
-    WATER = 'SEA',
-    NAVY = 'SEA',
+    NAVY        = 'SEA',
+    NAVAL       = 'SEA',
+    WATER       = 'SEA',
+    LANDPATH    = 'LAND',
 }
 
 local DefaultOptions = {
-    IntelOnly = false,
-    Formation = 'GrowthFormation',
-    Underwater = false,
-    UseTransports = false,
-    AvoidDef = false,
+    IntelOnly      = false,
+    Formation      = 'GrowthFormation',
+    Underwater     = false,
+    UseTransports  = false,
+    AvoidDef       = false,
 }
 
-local RecheckDelay = 10
-
-local function CopyVector(pos)
-    if not pos then return nil end
-    return { pos[1], pos[2], pos[3] }
+local function Clamp(v, lo, hi)
+    if v < lo then return lo elseif v > hi then return hi else return v end
 end
 
-local function AddVectors(a, b)
+local function CopyVector(vec)
+    if not vec then return nil end
+    return {vec[1], vec[2], vec[3]}
+end
+
+local function AddVector(a, b)
     return { (a[1] or 0) + (b[1] or 0), (a[2] or 0) + (b[2] or 0), (a[3] or 0) + (b[3] or 0) }
 end
 
-local function SubVectors(a, b)
+local function SubVector(a, b)
     return { (a[1] or 0) - (b[1] or 0), (a[2] or 0) - (b[2] or 0), (a[3] or 0) - (b[3] or 0) }
 end
 
-local function ScaleVector(vec, scale)
-    return { (vec[1] or 0) * scale, (vec[2] or 0) * scale, (vec[3] or 0) * scale }
-end
-
-local function VectorLength2D(vec)
-    return math.sqrt((vec[1] or 0) * (vec[1] or 0) + (vec[3] or 0) * (vec[3] or 0))
+local function VectorLength2D(v)
+    local x = v[1] or 0
+    local z = v[3] or 0
+    return math.sqrt(x * x + z * z)
 end
 
 local function Distance2D(a, b)
-    return VectorLength2D(SubVectors(a, b))
+    return VectorLength2D(SubVector(a, b))
 end
 
-local function Distance3D(a, b)
-    local dx = (a[1] or 0) - (b[1] or 0)
-    local dy = (a[2] or 0) - (b[2] or 0)
-    local dz = (a[3] or 0) - (b[3] or 0)
-    return math.sqrt(dx * dx + dy * dy + dz * dz)
-end
-
-local function Normalize2D(vec)
-    local len = VectorLength2D(vec)
-    if len <= 0.001 then
-        return {0, 0, 0}
+local function SurfaceHeight(x, z)
+    local terrain = GetTerrainHeight(x, z)
+    local surface = GetSurfaceHeight(x, z)
+    if terrain > surface then
+        return terrain
     end
-    return { (vec[1] or 0) / len, 0, (vec[3] or 0) / len }
+    return surface
 end
 
-local function RandomInRange(minValue, maxValue)
-    return minValue + (maxValue - minValue) * math.random()
-end
-
-local function MeanPosition(units)
-    local count = 0
-    local pos = {0, 0, 0}
-    for _, unit in ipairs(units) do
-        if unit and not unit.Dead then
-            local up = unit:GetPosition()
-            pos[1] = pos[1] + up[1]
-            pos[2] = pos[2] + up[2]
-            pos[3] = pos[3] + up[3]
-            count = count + 1
-        end
-    end
-    if count == 0 then
+local function AdjustToSurface(position)
+    if not position then
         return nil
     end
-    pos[1] = pos[1] / count
-    pos[2] = pos[2] / count
-    pos[3] = pos[3] / count
-    return pos
+    local x = position[1]
+    local z = position[3]
+    local y = position[2] or SurfaceHeight(x, z)
+    return { x, y, z }
+end
+
+local function AdjustToDomain(domain, position)
+    if not position then
+        return nil
+    end
+    local x = position[1]
+    local z = position[3]
+    if domain == 'SEA' then
+        return { x, GetSurfaceHeight(x, z), z }
+    end
+    if domain == 'AIR' then
+        return { x, position[2] or SurfaceHeight(x, z) + 20, z }
+    end
+    -- land / amphibious
+    return { x, GetTerrainHeight(x, z), z }
+end
+
+local function MapCenterAndRadius()
+    local size = ScenarioInfo and ScenarioInfo.size or {512, 512}
+    local width = size[1] or 512
+    local height = size[2] or 512
+    local center = { width * 0.5, 0, height * 0.5 }
+    local radius = math.sqrt((width * 0.5) ^ 2 + (height * 0.5) ^ 2)
+    return center, radius
+end
+
+local function RandomDomainPoint(domain)
+    local center, radius = MapCenterAndRadius()
+    local angle = Random() * 2 * PI
+    local distance = Random() * radius
+    local pos = { center[1] + math.cos(angle) * distance, 0, center[3] + math.sin(angle) * distance }
+    return AdjustToDomain(domain, pos)
+end
+
+local function NormalizeDomain(domain)
+    if not domain then return nil end
+    local upper = string.upper(domain)
+    return DomainAliases[upper] or upper
+end
+
+local function GetArmyIndex(brainOrIndex)
+    if type(brainOrIndex) == 'number' then
+        return brainOrIndex
+    end
+    if brainOrIndex and brainOrIndex.GetArmyIndex then
+        return brainOrIndex:GetArmyIndex()
+    end
+    return nil
+end
+
+local function ArmiesEqual(a, b)
+    if a == b then return true end
+    local ai, bi = GetArmyIndex(a), GetArmyIndex(b)
+    return ai and bi and ai == bi
+end
+
+local function PlatoonAlive(platoon)
+    return platoon and not platoon.Dead and platoon:GetBrain() and platoon:GetBrain():PlatoonExists(platoon)
 end
 
 local function GetPlatoonUnits(platoon)
     if not platoon or platoon.Dead then return {} end
     local units = platoon:GetPlatoonUnits() or {}
-    local result = {}
+    local alive = {}
     for _, unit in ipairs(units) do
         if unit and not unit.Dead then
-            TableInsert(result, unit)
+            TableInsert(alive, unit)
         end
     end
-    return result
-end
-
-local function PlatoonAlive(platoon)
-    if not platoon or platoon.Dead then return false end
-    return TableGetn(GetPlatoonUnits(platoon)) > 0
+    return alive
 end
 
 local function GetPlatoonPosition(platoon)
-    local units = GetPlatoonUnits(platoon)
-    return MeanPosition(units)
+    if not platoon or platoon.Dead then return nil end
+    return platoon:GetPlatoonPosition()
 end
 
-local function GetMapCenterAndRadius()
-    local width, height = GetMapSize()
-    local center = { width * 0.5, 0, height * 0.5 }
-    local radius = math.sqrt(width * width + height * height) * 0.6
-    return center, radius
-end
-
-local function ResolveFormation(option)
-    if not option or option == '' then
-        return DefaultOptions.Formation
-    end
-    if option == 'AttackFormation' or option == 'GrowthFormation' or option == 'NoFormation' then
-        return option
-    end
-    return DefaultOptions.Formation
-end
-
-local function ArmyNameToIndex(name)
-    if not name then return nil end
-    if type(name) == 'number' then return name end
-
-    if ScenarioInfo and ScenarioInfo.ArmySetup then
-        local rec = ScenarioInfo.ArmySetup[name]
-        if rec and rec.ArmyIndex then
-            return rec.ArmyIndex
+local function GetArmyBrainsFromList(list)
+    local brains = {}
+    for _, entry in ipairs(list or {}) do
+        local idx
+        if type(entry) == 'number' then
+            idx = entry
+        elseif type(entry) == 'string' then
+            local wanted = string.lower(entry)
+            for _, brain in ipairs(ArmyBrains or {}) do
+                local name = (brain.Nickname or brain.Name or brain:GetArmyIndex())
+                if type(name) == 'string' then
+                    if string.lower(name) == wanted then
+                        idx = brain:GetArmyIndex()
+                        break
+                    end
+                elseif type(name) == 'number' and tostring(name) == wanted then
+                    idx = brain:GetArmyIndex()
+                    break
+                end
+            end
+            if not idx and ScenarioInfo and ScenarioInfo.ArmySetup then
+                for armyName, info in pairs(ScenarioInfo.ArmySetup) do
+                    if string.lower(armyName) == wanted then
+                        idx = info.ArmyIndex or info.armyIndex
+                        break
+                    end
+                end
+            end
+        end
+        if idx and ArmyBrains[idx] then
+            TableInsert(brains, ArmyBrains[idx])
         end
     end
-
-    for index, brain in ArmyBrains do
-        if brain and (brain.Name == name or brain.Nickname == name) then
-            return index
-        end
-    end
-    return nil
+    return brains
 end
 
-local function GetEnemyArmyIndexes(brain, requested)
-    local myIndex = brain:GetArmyIndex()
-    local indexes = {}
-    if requested and type(requested) == 'table' then
-        for _, token in ipairs(requested) do
-            local idx = ArmyNameToIndex(token)
-            if idx and idx ~= myIndex and IsEnemy(myIndex, idx) then
-                indexes[idx] = true
+local function DetermineTargetBrains(brain, options)
+    local brains
+    if options.TargetArmy and TableGetn(options.TargetArmy) > 0 then
+        brains = GetArmyBrainsFromList(options.TargetArmy)
+    end
+    if not brains or TableGetn(brains) == 0 then
+        brains = {}
+        local ourIndex = brain:GetArmyIndex()
+        for _, otherBrain in ipairs(ArmyBrains or {}) do
+            if otherBrain and not ArmiesEqual(otherBrain, brain) and IsEnemy(ourIndex, otherBrain:GetArmyIndex()) then
+                TableInsert(brains, otherBrain)
             end
         end
     end
-    if next(indexes) then
-        return indexes
-    end
-    for index, other in ArmyBrains do
-        if other and index ~= myIndex and IsEnemy(myIndex, index) then
-            indexes[index] = true
-        end
-    end
-    return indexes
+    return brains
 end
 
-local function AdjustPositionToSurface(pos)
-    if not pos then return nil end
-    local y = GetSurfaceHeight(pos[1], pos[3])
-    return { pos[1], y, pos[3] }
-end
-
-local function AdjustPositionToDomain(domain, pos)
-    if not pos then return nil end
-    if domain == 'AIR' then
-        return { pos[1], pos[2], pos[3] }
-    end
-    local y = GetTerrainHeight(pos[1], pos[3])
-    return { pos[1], y, pos[3] }
-end
-
-local function UnitHasCategory(unit, category)
-    if not unit or not category then
+local function IntelVisible(brain, unit, options)
+    if not unit or unit.Dead then
         return false
     end
-    local ok, result = pcall(EntityCategoryContains, category, unit)
-    if ok then
-        return result
+    if not options or not options.IntelOnly then
+        return true
+    end
+    if not brain then
+        return false
+    end
+    local armyIndex = brain:GetArmyIndex()
+    local ok, visible = pcall(IsUnitVisible, armyIndex, unit)
+    if ok and visible then
+        return true
+    end
+    if unit.IsOnRadar and unit:IsOnRadar(armyIndex) then
+        return true
+    end
+    if unit.IsOnSonar and unit:IsOnSonar(armyIndex) then
+        return true
     end
     return false
 end
 
-local function UnitIsUnderwater(unit)
-    if not unit or unit.Dead then return false end
-    if UnitHasCategory(unit, categories.UNDERWATER) then
-        return true
+local function UnitMatchesDomain(unit, domain, options)
+    if not unit or unit.Dead then
+        return false
     end
-    local pos = unit:GetPosition()
-    if not pos then return false end
-    local surface = GetSurfaceHeight(pos[1], pos[3])
-    return pos[2] < surface - 0.2
-end
-
-local function UnitMatchesDomain(domain, unit)
-    if not unit or unit.Dead then return false end
     if domain == 'AIR' then
-        return true
-    end
-    if domain == 'SEA' then
-        return UnitHasCategory(unit, categories.NAVAL) or UnitHasCategory(unit, categories.SUBMERSIBLE)
-    end
-    -- LAND and AMPHIBIOUS treat as land
-    return not UnitHasCategory(unit, categories.NAVAL)
-end
-
-local function EnsureNavMesh()
-    if not NavUtils or not NavUtils.IsGenerated then
-        return
-    end
-    if not NavUtils:IsGenerated() then
-        pcall(NavUtils.Generate)
-    end
-end
-
-local function BuildNavPath(layer, origin, destination, opts)
-    EnsureNavMesh()
-    if not NavUtils or not NavUtils.PathTo then
-        return { AdjustPositionToSurface(origin), AdjustPositionToSurface(destination) }
-    end
-    local path
-    local ok, result = pcall(NavUtils.PathTo, layer, origin, destination)
-    if ok and type(result) == 'table' and TableGetn(result) > 0 then
-        path = {}
-        for _, point in ipairs(result) do
-            TableInsert(path, AdjustPositionToSurface(point))
+        return EntityCategoryContains(categories.AIR, unit)
+    elseif domain == 'SEA' then
+        if EntityCategoryContains(categories.NAVAL, unit) then
+            return true
         end
+        if options.Underwater and EntityCategoryContains(categories.SUBMERSIBLE, unit) then
+            return true
+        end
+        return false
+    else
+        -- treat amphibious as land for targets
+        if EntityCategoryContains(categories.NAVAL, unit) then
+            return false
+        end
+        if not options.Underwater and EntityCategoryContains(categories.SUBMERSIBLE, unit) then
+            return false
+        end
+        if domain == 'AMPHIBIOUS' then
+            return true
+        end
+        return not EntityCategoryContains(categories.AIR, unit)
     end
-    if (not path or TableGetn(path) == 0) and opts and opts.AvoidDef and NavUtils.PathToWithThreatThreshold then
-        local threatName = DomainToThreat[opts.Domain or 'LAND'] or 'StructureAntiSurface'
-        local threatFunc = NavUtils.ThreatFunctions and NavUtils.ThreatFunctions[threatName]
-        if threatFunc then
-            local brain = opts.Brain
-            if brain then
-                local okAvoid, avoidPath = pcall(NavUtils.PathToWithThreatThreshold, layer, origin, destination, brain, threatFunc, opts.ThreatThreshold or 15, opts.ThreatRadius or 25)
-                if okAvoid and type(avoidPath) == 'table' and TableGetn(avoidPath) > 0 then
-                    path = {}
-                    for _, point in ipairs(avoidPath) do
-                        TableInsert(path, AdjustPositionToSurface(point))
+end
+
+local function FilterUnitsByIntel(units, brain, options, domainCategory)
+    local filtered = {}
+    for _, unit in ipairs(units or {}) do
+        if unit and not unit.Dead then
+            if not domainCategory or EntityCategoryContains(domainCategory, unit) or EntityCategoryContains(StructureCategory, unit) then
+                if UnitMatchesDomain(unit, options.Domain, options) then
+                    if IntelVisible(brain, unit, options) then
+                        TableInsert(filtered, unit)
                     end
                 end
             end
         end
     end
-    if not path or TableGetn(path) == 0 then
-        path = { AdjustPositionToSurface(origin), AdjustPositionToSurface(destination) }
-    else
-        local last = path[TableGetn(path)]
-        if Distance2D(last, destination) > 1.5 then
-            TableInsert(path, AdjustPositionToSurface(destination))
+    return filtered
+end
+
+local function GatherEnemyUnits(brain, category, options)
+    local targets = {}
+    local domainCategory = DomainTargetCategory[options.Domain] or category
+    for _, enemyBrain in ipairs(options.TargetBrains or {}) do
+        local ok, units = pcall(enemyBrain.GetListOfUnits, enemyBrain, category or categories.ALLUNITS, false)
+        if ok and units then
+            for _, unit in ipairs(units) do
+                if unit and not unit.Dead then
+                    if UnitMatchesDomain(unit, options.Domain, options) or EntityCategoryContains(StructureCategory, unit) then
+                        if IntelVisible(brain, unit, options) then
+                            TableInsert(targets, unit)
+                        end
+                    end
+                end
+            end
         end
+    end
+    return targets
+end
+
+local function SortUnitsByDistance(units, reference)
+    if not reference then
+        return units
+    end
+    TableSort(units, function(a, b)
+        local ap = a:GetPosition()
+        local bp = b:GetPosition()
+        return Distance2D(ap, reference) < Distance2D(bp, reference)
+    end)
+    return units
+end
+
+local function EnsureNavMesh(layer)
+    if not NavUtils then
+        return
+    end
+    if NavUtils.IsGenerated and not NavUtils.IsGenerated() then
+        pcall(function()
+            NavUtils.Generate()
+        end)
+    end
+end
+
+local function BuildPath(layer, start, goal, options)
+    if not goal then
+        return nil
+    end
+    if not layer then
+        layer = DomainLayer[options.Domain or 'LAND'] or 'Land'
+    end
+    if not start then
+        return {goal}
+    end
+    EnsureNavMesh(layer)
+    local path
+    if NavUtils and NavUtils.PathTo then
+        local ok, result = pcall(NavUtils.PathTo, layer, start, goal)
+        if ok then
+            path = result
+        end
+        if options.AvoidDef and NavUtils.PathToWithThreatThreshold then
+            local threatName = DomainThreatType[options.Domain]
+            local threatFunc = NavUtils.ThreatFunctions and NavUtils.ThreatFunctions[threatName]
+            if threatFunc then
+                local okAvoid, safe = pcall(NavUtils.PathToWithThreatThreshold, layer, start, goal, options.Brain, threatFunc, options.ThreatThreshold or 15, options.ThreatRadius or 30)
+                if okAvoid and safe and TableGetn(safe) > 0 then
+                    path = safe
+                end
+            end
+        end
+    end
+    path = path or {}
+    local count = TableGetn(path)
+    if count == 0 or Distance2D(path[count], goal) > 3 then
+        path[count + 1] = goal
     end
     return path
 end
 
-local function TryUseTransports(platoon, destination, opts)
-    if not opts or not opts.UseTransports then
-        return false
-    end
-    if opts.Domain == 'AIR' then
-        return false
-    end
+local function IssuePath(platoon, path, formation, aggressiveFinal)
     local units = GetPlatoonUnits(platoon)
     if TableGetn(units) == 0 then
         return false
     end
-    local start = GetPlatoonPosition(platoon)
-    if not start then return false end
-    local distance = Distance2D(start, destination)
-    local needTransports = distance > 200
-    if not needTransports and NavUtils and NavUtils.CanPathTo then
-        local layer = DomainToLayer[opts.Domain] or 'Land'
-        EnsureNavMesh()
-        local okPath = pcall(NavUtils.CanPathTo, layer, start, destination)
-        if not okPath then
-            needTransports = true
-        end
-    end
-    if not needTransports then
+    IssueClearCommands(units)
+    --platoon:SetPlatoonFormation(formation or 'GrowthFormation')
+    local size = TableGetn(path or {})
+    if size == 0 then
         return false
     end
-    local brain = platoon:GetBrain()
-    local success = false
-    local ok, result = pcall(ScenarioFramework.UseTransports, units, brain, destination, true)
-    if ok and result then
-        success = true
-    end
-    if success then
-        WaitSeconds(1)
-    end
-    return success
-end
-
-local function NormalizeRoute(route)
-    if not route then
-        return {}
-    end
-    local normalized = {}
-    for _, node in ipairs(route) do
-        if node then
-            if node.x then
-                TableInsert(normalized, {node.x, node.y, node.z})
-            else
-                TableInsert(normalized, {node[1], node[2], node[3]})
-            end
+    for i = 1, size - 1 do
+        local waypoint = path[i]
+        if waypoint then
+            IssueFormMove(units, waypoint, formation or 'GrowthFormation', 0)
         end
     end
-    return normalized
-end
-
-local function ComputeRouteAngles(route, platoon)
-    local count = TableGetn(route)
-    if count == 0 then
-        return {}
+    local last = path[size]
+    if aggressiveFinal then
+        platoon:AggressiveMoveToLocation(last)
+    else
+        IssueFormMove(units, last, formation or 'GrowthFormation', 0)
     end
-    local angles = {}
-    local previous = CopyVector(route[1])
-    local platoonPos = GetPlatoonPosition(platoon)
-    if platoonPos then
-        previous = CopyVector(platoonPos)
-    end
-    local lastAngle = 0
-    for index = 1, count do
-        local current = route[index]
-        if previous then
-            local direction = Normalize2D(SubVectors(current, previous))
-            if direction then
-                local angle = math.atan2(-(direction[1] or 0), direction[3] or 0)
-                if angle ~= angle then
-                    angle = lastAngle
-                else
-                    lastAngle = angle
-                end
-                angles[index] = angle
-            else
-                angles[index] = lastAngle
-            end
-        else
-            angles[index] = lastAngle
-        end
-        previous = current
-    end
-    return angles
-end
-
-local function IssueMoveRoute(platoon, route, formation)
-    if not platoon then return end
-    local normalized = NormalizeRoute(route)
-    if TableGetn(normalized) == 0 then return end
-    formation = formation or DefaultOptions.Formation
-    if formation and platoon.SetPlatoonFormationOverride then
-        pcall(platoon.SetPlatoonFormationOverride, platoon, formation)
-    end
-    local units = GetPlatoonUnits(platoon)
-    if TableGetn(units) == 0 then return end
-    if formation == 'NoFormation' then
-        for _, node in ipairs(normalized) do
-            IssueMove(units, node)
-        end
-        return
-    end
-    local angles = ComputeRouteAngles(normalized, platoon)
-    for index = 1, TableGetn(normalized) - 1 do
-        local node = normalized[index]
-        IssueFormMove(units, node, formation, angles[index] or 0)
-    end
-    local finalNode = normalized[TableGetn(normalized)]
-    IssueFormAggressiveMove(units, finalNode, formation, angles[TableGetn(normalized)] or 0)
-end
-
-local function IssueAggressiveRoute(platoon, route, formation)
-    if not platoon then return end
-    local normalized = NormalizeRoute(route)
-    if TableGetn(normalized) == 0 then return end
-    formation = formation or DefaultOptions.Formation
-    if formation and platoon.SetPlatoonFormationOverride then
-        pcall(platoon.SetPlatoonFormationOverride, platoon, formation)
-    end
-    local units = GetPlatoonUnits(platoon)
-    if TableGetn(units) == 0 then return end
-    if formation == 'NoFormation' then
-        for _, node in ipairs(normalized) do
-            IssueAggressiveMove(units, node)
-        end
-        return
-    end
-    local angles = ComputeRouteAngles(normalized, platoon)
-    for index, node in ipairs(normalized) do
-        IssueFormAggressiveMove(units, node, formation, angles[index] or 0)
-    end
+    return true
 end
 
 local function WaitForPlatoon(platoon, destination, radius, timeout)
+    radius = radius or 15
+    timeout = timeout or 120
     local elapsed = 0
-    radius = radius or 10
-    timeout = timeout or 60
-    while PlatoonAlive(platoon) and elapsed < timeout do
+    while elapsed < timeout do
+        if not PlatoonAlive(platoon) then
+            return false
+        end
         local pos = GetPlatoonPosition(platoon)
         if pos and Distance2D(pos, destination) <= radius then
             return true
@@ -486,71 +551,578 @@ local function WaitForPlatoon(platoon, destination, radius, timeout)
     return false
 end
 
-local function EnsureTemplateCached(aiBrain, entry)
-    if not entry then return nil end
-    local groupName
-    local armyName
-    if type(entry) == 'table' then
-        groupName = entry.Group or entry.Name or entry[1]
-        armyName = entry.Army or entry[2]
-    else
-        groupName = entry
+local function ShouldUseTransport(platoon, options, destination)
+    if not options.UseTransports or not destination then
+        return false
     end
-    if not groupName then
-        return nil
+    local start = GetPlatoonPosition(platoon)
+    if not start then
+        return true
     end
-    armyName = armyName or aiBrain.Name
-    if not aiBrain.BaseTemplates[groupName] then
-        pcall(AIBuildStructures.CreateBuildingTemplate, aiBrain, armyName, groupName)
+    if Distance2D(start, destination) > TransportDistance then
+        return true
     end
-    return aiBrain.BaseTemplates[groupName]
-end
-
-local function ResolveTemplateUnits(aiBrain, entry)
-    local groupName
-    local armyName
-    if type(entry) == 'table' then
-        groupName = entry.Group or entry.Name or entry[1]
-        armyName = entry.Army or entry[2]
-    else
-        groupName = entry
-    end
-    if not groupName then
-        return {}
-    end
-    armyName = armyName or aiBrain.Name
-    local ok, units = pcall(ScenarioUtils.AssembleArmyGroup, armyName, groupName)
-    if not ok or not units then
-        return {}
-    end
-    local result = {}
-    for _, data in pairs(units) do
-        if data.type and data.Position then
-            TableInsert(result, {
-                id = data.type,
-                position = { data.Position[1], data.Position[2], data.Position[3] },
-                orientation = data.Orientation,
-            })
+    if NavUtils and NavUtils.CanPathTo then
+        local layer = DomainLayer[options.Domain or 'LAND'] or 'Land'
+        local ok, canPath = pcall(NavUtils.CanPathTo, layer, start, destination)
+        if ok and not canPath then
+            return true
         end
     end
-    return result
+    return false
 end
 
-local function OrientationToHeading(orientation)
-    if not orientation then
+local function UseTransports(platoon, destination, options)
+    if not ScenarioFramework then
+        return false
+    end
+    local success = false
+    if ScenarioFramework.PlatoonMoveWithTransports then
+        success = pcall(function()
+            ScenarioFramework.PlatoonMoveWithTransports(platoon, destination, false)
+        end)
+        if not success and options.Brain then
+            success = pcall(function()
+                ScenarioFramework.PlatoonMoveWithTransports(options.Brain, platoon, destination, false)
+            end)
+        end
+    end
+    if not success and ScenarioFramework.PlatoonAttackWithTransports then
+        success = pcall(function()
+            ScenarioFramework.PlatoonAttackWithTransports(platoon, destination, false)
+        end)
+        if not success and options.Brain then
+            success = pcall(function()
+                ScenarioFramework.PlatoonAttackWithTransports(options.Brain, platoon, destination, false)
+            end)
+        end
+    end
+    if not success then
+        WARN('[platoon_AttackFunctions] Transport move request failed; falling back to ground pathing.')
+    end
+    return success
+end
+
+local function MovePlatoon(platoon, destination, options, aggressiveFinal)
+    if not PlatoonAlive(platoon) then
+        return false
+    end
+    destination = CopyVector(destination)
+    if not destination then
+        return false
+    end
+    if ShouldUseTransport(platoon, options, destination) then
+        if UseTransports(platoon, destination, options) then
+            WaitForPlatoon(platoon, destination, 20, 240)
+            return true
+        end
+    end
+    local start = GetPlatoonPosition(platoon)
+    local path = BuildPath(DomainLayer[options.Domain or 'LAND'] or 'Land', start, destination, options)
+    if not path then
+        return false
+    end
+    IssuePath(platoon, path, options.Formation, aggressiveFinal)
+    WaitForPlatoon(platoon, destination, aggressiveFinal and 25 or 15, 180)
+    return true
+end
+
+local function CalculatePlatoonStrength(platoon, threatType)
+    local threat = 0
+    if platoon and platoon.CalculatePlatoonThreat then
+        local ok, value = pcall(platoon.CalculatePlatoonThreat, platoon, threatType or 'Overall', categories.ALLUNITS)
+        if ok and value then
+            threat = value
+        end
+    end
+    return threat
+end
+
+local function ThreatAt(brain, position, threatType)
+    if not brain or not position then
         return 0
     end
-    if orientation[1] and orientation[2] and orientation[3] then
-        -- assume Euler yaw in radians (y component)
-        return orientation[2] or 0
+    local ok, threat = pcall(brain.GetThreatAtPosition, brain, position, ThreatSampleRadius, true, threatType or 'Overall')
+    if ok and threat then
+        return threat
     end
-    return orientation[1] or 0
+    return 0
 end
 
-local function StructureExistsAt(brain, pos, blueprintId)
-    local units = brain:GetUnitsAroundPoint(categories.ALLUNITS, pos, 1.5, 'Ally') or {}
-    for _, unit in ipairs(units) do
+local function TargetDefenseWeight(brain, unit, options)
+    if not unit or unit.Dead then
+        return math.huge
+    end
+    local position = unit:GetPosition()
+    local threatType = DomainThreatType[options.Domain] or 'Overall'
+    return ThreatAt(brain, position, threatType)
+end
+
+local function SelectClosestStructure(platoon, options, structures)
+    if TableGetn(structures) == 0 then
+        return nil
+    end
+    local pos = GetPlatoonPosition(platoon)
+    if not pos then
+        pos = structures[1]:GetPosition()
+    end
+    SortUnitsByDistance(structures, pos)
+    local unit = structures[1]
+    return { Unit = unit, Position = CopyVector(unit:GetPosition()) }
+end
+
+local function SelectStructureCluster(platoon, options, structures)
+    if TableGetn(structures) == 0 then
+        return nil
+    end
+    local bestScore = -1
+    local bestCenter = nil
+    for _, structure in ipairs(structures) do
+        local pos = structure:GetPosition()
+        local count = 0
+        local sum = {0, 0, 0}
+        for _, other in ipairs(structures) do
+            local otherPos = other:GetPosition()
+            if Distance2D(pos, otherPos) <= ClusterRadius then
+                count = count + 1
+                sum[1] = sum[1] + otherPos[1]
+                sum[2] = sum[2] + otherPos[2]
+                sum[3] = sum[3] + otherPos[3]
+            end
+        end
+        if count > bestScore then
+            bestScore = count
+            bestCenter = {sum[1] / count, sum[2] / count, sum[3] / count}
+        end
+    end
+    if not bestCenter then
+        return nil
+    end
+    return { Position = bestCenter }
+end
+
+local function SortByDefense(units, brain, options)
+    TableSort(units, function(a, b)
+        return TargetDefenseWeight(brain, a, options) < TargetDefenseWeight(brain, b, options)
+    end)
+end
+
+local function ResolveOptions(platoon, data)
+    local opts = {}
+    for key, default in pairs(DefaultOptions) do
+        local lower = string.lower(key)
+        local value = data and (data[key] ~= nil and data[key] or data[lower])
+        if value == nil then
+            value = default
+        end
+        opts[key] = value
+    end
+    opts.Domain = NormalizeDomain((data and (data.Domain or data.domain)) or opts.Domain)
+    if not opts.Domain then
+        opts.Domain = 'LAND'
+        WARN('[platoon_AttackFunctions] Domain missing; defaulting to LAND.')
+    end
+    opts.Formation = (data and (data.Formation or data.formation)) or opts.Formation
+    opts.TargetArmy = (data and (data.TargetArmy or data.targetArmy)) or opts.TargetArmy
+    opts.Brain = platoon and platoon:GetBrain()
+    opts.TargetBrains = DetermineTargetBrains(opts.Brain, opts)
+    return opts, data or {}
+end
+
+--------------------------------------------------------------------------------
+-- target selection ------------------------------------------------------------
+--------------------------------------------------------------------------------
+
+local function SelectWaveTarget(platoon, options, targetType)
+    local structures = GatherEnemyUnits(options.Brain, StructureCategory, options)
+    if TableGetn(structures) == 0 then
+        return nil
+    end
+    targetType = string.lower(targetType or 'concentration')
+    if targetType == 'closest' then
+        return SelectClosestStructure(platoon, options, structures)
+    end
+    local cluster = SelectStructureCluster(platoon, options, structures)
+    if cluster then
+        cluster.Units = structures
+        return cluster
+    end
+    return SelectClosestStructure(platoon, options, structures)
+end
+
+local function BuildRaidPriorityList(targetType)
+    local ordered = {}
+    local seen = {}
+    local function push(key)
+        key = string.upper(key)
+        if not seen[key] then
+            seen[key] = true
+            TableInsert(ordered, key)
+        end
+    end
+    if targetType and string.upper(targetType) ~= 'SMT' then
+        push(targetType)
+    end
+    push('ECO')
+    push('FAB')
+    push('ENG')
+    push('DEF')
+    return ordered
+end
+
+local function SelectRaidTarget(platoon, options, targetType)
+    local desired = string.upper(targetType or 'ECO')
+    if desired ~= 'SMT' and not RaidCategoryPriorities[desired] then
+        desired = 'ECO'
+    end
+    local units
+    if desired == 'SMT' then
+        units = GatherEnemyUnits(options.Brain, StructureCategory, options)
+        if TableGetn(units) == 0 then
+            return nil
+        end
+        SortByDefense(units, options.Brain, options)
+        local unit = units[1]
+        return { Unit = unit, Position = AdjustToSurface(unit:GetPosition()) }
+    end
+    for _, key in ipairs(BuildRaidPriorityList(desired)) do
+        local category = RaidCategoryPriorities[key]
+        units = GatherEnemyUnits(options.Brain, category, options)
+        if TableGetn(units) > 0 then
+            SortByDefense(units, options.Brain, options)
+            local target = units[1]
+            return { Unit = target, Position = AdjustToSurface(target:GetPosition()) }
+        end
+    end
+    return nil
+end
+
+local function SelectBombardTarget(platoon, options, targetType)
+    targetType = string.lower(targetType or 'concentration')
+    for _, category in ipairs(BombardPriority) do
+        local units = GatherEnemyUnits(options.Brain, category, options)
+        if TableGetn(units) > 0 then
+            if targetType == 'closest' then
+                return SelectClosestStructure(platoon, options, units)
+            else
+                local cluster = SelectStructureCluster(platoon, options, units)
+                if cluster then
+                    cluster.Units = units
+                    return cluster
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function SelectSiegeTarget(platoon, options, targetType)
+    local defenses = GatherEnemyUnits(options.Brain, SiegeCategory, options)
+    if TableGetn(defenses) == 0 then
+        return nil
+    end
+    targetType = string.lower(targetType or 'closest')
+    if targetType == 'closest' then
+        return SelectClosestStructure(platoon, options, defenses)
+    end
+    local cluster = SelectStructureCluster(platoon, options, defenses)
+    if cluster then
+        cluster.Units = defenses
+        return cluster
+    end
+    return SelectClosestStructure(platoon, options, defenses)
+end
+
+local function SelectMobileTargets(platoon, options)
+    local category
+    if options.Domain == 'AIR' then
+        category = categories.MOBILE * categories.AIR
+    elseif options.Domain == 'SEA' then
+        category = categories.MOBILE * categories.NAVAL
+    else
+        category = categories.MOBILE * categories.LAND
+    end
+    return GatherEnemyUnits(options.Brain, category, options)
+end
+
+--------------------------------------------------------------------------------
+-- behaviour implementations ---------------------------------------------------
+--------------------------------------------------------------------------------
+
+local function ExecuteWave(platoon, options, target)
+    if not target or not target.Position then
+        return false
+    end
+    local dest = AdjustToDomain(options.Domain, target.Position)
+    if not MovePlatoon(platoon, dest, options, false) then
+        return false
+    end
+    if not PlatoonAlive(platoon) then
+        return false
+    end
+    platoon:AggressiveMoveToLocation(dest)
+    WaitSeconds(RecheckDelay)
+    return true
+end
+
+local function ExecuteRaid(platoon, options, raid)
+    if not raid or not raid.Unit or raid.Unit.Dead then
+        return false
+    end
+    local dest = AdjustToDomain(options.Domain, raid.Position or raid.Unit:GetPosition())
+    if not MovePlatoon(platoon, dest, options, false) then
+        return false
+    end
+    if not PlatoonAlive(platoon) then
+        return false
+    end
+    local members = GetPlatoonUnits(platoon)
+    for _, unit in ipairs(members) do
         if unit and not unit.Dead then
+            IssueClearCommands({ unit })
+            IssueAttack({ unit }, raid.Unit)
+        end
+    end
+    WaitSeconds(RecheckDelay)
+    return true
+end
+
+local function GetPlatoonMaxRange(platoon)
+    if not platoon or platoon.Dead then
+        return 30
+    end
+    if platoon.GetPlatoonMaxRange then
+        local ok, value = pcall(platoon.GetPlatoonMaxRange, platoon)
+        if ok and value and value > 0 then
+            return value
+        end
+    end
+    return 30
+end
+
+local function ExecuteBombard(platoon, options, bombard)
+    if not bombard or not bombard.Position then
+        return false
+    end
+    local dest = AdjustToDomain(options.Domain, bombard.Position)
+    if not MovePlatoon(platoon, dest, options, false) then
+        return false
+    end
+    if not PlatoonAlive(platoon) then
+        return false
+    end
+    local range = Max(GetPlatoonMaxRange(platoon) - 5, 25)
+    local members = GetPlatoonUnits(platoon)
+    for _, attacker in ipairs(members) do
+        if attacker and not attacker.Dead then
+            IssueClearCommands({ attacker })
+        end
+    end
+    local targets = bombard.Units or {}
+    if TableGetn(targets) == 0 and bombard.Unit then
+        targets = { bombard.Unit }
+    end
+    for _, unit in ipairs(targets) do
+        if not PlatoonAlive(platoon) then
+            return false
+        end
+        if unit and not unit.Dead then
+            local pos = AdjustToSurface(unit:GetPosition())
+            for _, attacker in ipairs(members) do
+                if attacker and not attacker.Dead then
+                    IssueAttack({ attacker }, unit)
+                end
+            end
+            WaitSeconds(2)
+            local ourPos = GetPlatoonPosition(platoon)
+            if ourPos and Distance2D(ourPos, pos) > range then
+                MovePlatoon(platoon, pos, options, false)
+            end
+        end
+    end
+    WaitSeconds(RecheckDelay)
+    return true
+end
+
+local function ExecuteSiege(platoon, options, siege)
+    if not siege or not siege.Position then
+        return false
+    end
+    local dest = AdjustToDomain(options.Domain, siege.Position)
+    if not MovePlatoon(platoon, dest, options, true) then
+        return false
+    end
+    if not PlatoonAlive(platoon) then
+        return false
+    end
+    local units = siege.Units or {}
+    if TableGetn(units) > 0 then
+        local members = GetPlatoonUnits(platoon)
+        for _, unit in ipairs(units) do
+            if unit and not unit.Dead then
+                local pos = AdjustToSurface(unit:GetPosition())
+                platoon:AggressiveMoveToLocation(pos)
+            end
+        end
+    end
+    WaitSeconds(RecheckDelay)
+    return true
+end
+
+local function ExecuteScout(platoon, options)
+    local members = GetPlatoonUnits(platoon)
+    if TableGetn(members) == 0 then
+        return false
+    end
+    local known = GatherEnemyUnits(options.Brain, categories.ALLUNITS - categories.WALL, options)
+    local half = Floor(TableGetn(members) * 0.5)
+    for idx, unit in ipairs(members) do
+        if unit and not unit.Dead then
+            local destination
+            if idx <= half and TableGetn(known) > 0 then
+                local reference = known[(math.mod((idx - 1), TableGetn(known))) + 1]
+                local refPos = reference:GetPosition()
+                local angle = Random() * 2 * PI
+                destination = { refPos[1] + math.cos(angle) * 25, 0, refPos[3] + math.sin(angle) * 25 }
+            else
+                destination = RandomDomainPoint(options.Domain)
+            end
+            destination = AdjustToDomain(options.Domain, destination)
+            IssueClearCommands({ unit })
+            IssueMove({ unit }, destination)
+        end
+    end
+    WaitSeconds(RecheckDelay)
+    return true
+end
+
+local function ExecuteCull(platoon, options)
+    local brain = options.Brain
+    local mobiles = SelectMobileTargets(platoon, options)
+    if TableGetn(mobiles) == 0 then
+        MovePlatoon(platoon, RandomDomainPoint(options.Domain), options, false)
+        WaitSeconds(RecheckDelay)
+        return true
+    end
+    SortByDefense(mobiles, brain, options)
+    local target = mobiles[1]
+    if not target or target.Dead then
+        WaitSeconds(RecheckDelay)
+        return true
+    end
+    local threat = TargetDefenseWeight(brain, target, options)
+    local strength = CalculatePlatoonStrength(platoon, DomainThreatType[options.Domain])
+    if threat > strength * 0.75 then
+        -- wait nearby for safer opportunity
+        local patrol = target:GetPosition()
+        local offset = { patrol[1] + Random() * 20 - 10, 0, patrol[3] + Random() * 20 - 10 }
+        MovePlatoon(platoon, AdjustToDomain(options.Domain, offset), options, false)
+        WaitSeconds(RecheckDelay)
+        return true
+    end
+    MovePlatoon(platoon, AdjustToDomain(options.Domain, target:GetPosition()), options, true)
+    WaitSeconds(RecheckDelay)
+    return true
+end
+
+local function ExecuteHunt(platoon, options, params)
+    local targets = params.Targets or {}
+    if TableGetn(targets) == 0 then
+        return false
+    end
+    local waitPos = params.WaitPosition
+    if waitPos then
+        MovePlatoon(platoon, AdjustToDomain(options.Domain, waitPos), options, false)
+    end
+    local desired = {}
+    for _, id in ipairs(targets) do
+        desired[string.lower(id)] = true
+    end
+    local mobiles = SelectMobileTargets(platoon, options)
+    local best
+    local bestThreat = math.huge
+    for _, unit in ipairs(mobiles) do
+        local bp = unit:GetBlueprint()
+        local id = bp and bp.BlueprintId and string.lower(bp.BlueprintId)
+        if id and desired[id] then
+            local threat = 0
+            if params.WaitForSafeZone then
+                threat = TargetDefenseWeight(options.Brain, unit, options)
+            end
+            if threat < bestThreat then
+                bestThreat = threat
+                best = unit
+            end
+        end
+    end
+    if not best then
+        if waitPos then
+            MovePlatoon(platoon, AdjustToDomain(options.Domain, waitPos), options, false)
+        end
+        WaitSeconds(RecheckDelay)
+        return true
+    end
+    MovePlatoon(platoon, AdjustToDomain(options.Domain, best:GetPosition()), options, true)
+    WaitSeconds(RecheckDelay)
+    return true
+end
+
+local function ResolveMarkerPosition(entry)
+    if not entry then
+        return nil
+    end
+    if type(entry) == 'string' then
+        local pos = ScenarioUtils.MarkerToPosition(entry)
+        if pos then
+            return pos
+        end
+        local chain = ScenarioUtils.ChainToPositions(entry)
+        if chain and chain[1] then
+            return chain[1]
+        end
+    elseif type(entry) == 'table' then
+        if entry.Position then
+            return ResolveMarkerPosition(entry.Position)
+        end
+        if entry[1] and entry[3] then
+            return { entry[1], entry[2] or SurfaceHeight(entry[1], entry[3]), entry[3] }
+        end
+    end
+    return nil
+end
+
+local function ParseTemplate(template)
+    if type(template) ~= 'table' then
+        return nil
+    end
+    if template.TemplateData then
+        return template.TemplateData
+    end
+    if template[1] and type(template[1]) == 'string' and template[2] and type(template[2]) == 'string' then
+        local data
+        if ScenarioUtils.GetTemplate then
+            local ok, result = pcall(ScenarioUtils.GetTemplate, template[2])
+            if ok and result then
+                data = result
+            end
+        end
+        if not data and ScenarioUtils.GetTemplateNamed then
+            local ok, result = pcall(ScenarioUtils.GetTemplateNamed, template[2])
+            if ok and result then
+                data = result
+            end
+        end
+        if data then
+            return data
+        end
+    end
+    return template
+end
+
+local function StructureExistsAt(brain, position, blueprintId)
+    local around = brain:GetUnitsAroundPoint(categories.STRUCTURE, position, 2, 'Ally') or {}
+    for _, unit in ipairs(around) do
+        if not unit.Dead then
             local bp = unit:GetBlueprint()
             if bp and bp.BlueprintId == blueprintId then
                 return true
@@ -560,799 +1132,67 @@ local function StructureExistsAt(brain, pos, blueprintId)
     return false
 end
 
-local function GetThreatAtPosition(brain, pos, domain, radius)
-    radius = radius or 20
-    local threatType = DomainToThreat[domain or 'LAND'] or 'StructureAntiSurface'
-    local threat = brain:GetThreatAtPosition(pos, radius, true, threatType)
-    return threat or 0
-end
-
-local function GetPlatoonMaxRange(platoon)
-    local units = GetPlatoonUnits(platoon)
-    local maxRange = 0
-    for _, unit in ipairs(units) do
-        local bp = unit:GetBlueprint()
-        if bp and bp.Weapon then
-            for _, weapon in ipairs(bp.Weapon) do
-                if weapon.MaxRadius and weapon.MaxRadius > maxRange then
-                    maxRange = weapon.MaxRadius
-                end
-            end
-        end
-    end
-    return maxRange
-end
-
-local function FilterTargetsByCategory(list, category)
-    local result = {}
-    for _, unit in ipairs(list) do
-        if unit and not unit.Dead and UnitHasCategory(unit, category) then
-            TableInsert(result, unit)
-        end
-    end
-    return result
-end
-
-local function FilterTargetsExcludeCategory(list, category)
-    local result = {}
-    for _, unit in ipairs(list) do
-        if unit and not unit.Dead and not UnitHasCategory(unit, category) then
-            TableInsert(result, unit)
-        end
-    end
-    return result
-end
-
-local function SortByDistanceTo(units, reference)
-    TableSort(units, function(a, b)
-        local pa = a:GetPosition()
-        local pb = b:GetPosition()
-        return Distance2D(pa, reference) < Distance2D(pb, reference)
-    end)
-end
-
-local function SelectCluster(structures, radius)
-    if TableGetn(structures) == 0 then
-        return nil
-    end
-    local best = nil
-    local bestCount = 0
-    local radiusSq = radius * radius
-    for _, unit in ipairs(structures) do
-        local pos = unit:GetPosition()
-        local clusterUnits = {}
-        local cx, cz = 0, 0
-        local count = 0
-        for _, other in ipairs(structures) do
-            local opos = other:GetPosition()
-            local dx = pos[1] - opos[1]
-            local dz = pos[3] - opos[3]
-            if dx * dx + dz * dz <= radiusSq then
-                TableInsert(clusterUnits, other)
-                cx = cx + opos[1]
-                cz = cz + opos[3]
-                count = count + 1
-            end
-        end
-        if count > 0 then
-            cx = cx / count
-            cz = cz / count
-            if count > bestCount then
-                bestCount = count
-                best = {
-                    units = clusterUnits,
-                    position = { cx, GetSurfaceHeight(cx, cz), cz },
-                }
-            end
-        end
-    end
-    return best
-end
-
-local function UnitIsKnownToBrain(unit, brainIndex)
-    if not unit or unit.Dead then return false end
-    if unit.GetBlip then
-        local blip = unit:GetBlip(brainIndex)
-        if blip then
-            if blip.IsMaybeDead and blip:IsMaybeDead(brainIndex) then
-                return false
-            end
-            return true
-        end
-    end
-    -- If we cannot check blip, assume visible
-    return true
-end
-
-local function GatherEnemyUnits(brain, category, opts)
-    local result = {}
-    opts = opts or {}
-    local brainIndex = brain:GetArmyIndex()
-    local domain = opts.Domain or 'LAND'
-    local allowUnderwater = opts.Underwater or false
-    local enemyIndexes = GetEnemyArmyIndexes(brain, opts.TargetArmy)
-
-    if opts.IntelOnly then
-        local center, radius = GetMapCenterAndRadius()
-        local known = brain:GetUnitsAroundPoint(category, center, radius, 'Enemy') or {}
-        for _, unit in ipairs(known) do
-            if unit and not unit.Dead and UnitMatchesDomain(domain, unit) then
-                if allowUnderwater or not UnitIsUnderwater(unit) then
-                    if enemyIndexes[unit:GetArmy()] then
-                        TableInsert(result, unit)
-                    end
-                end
-            end
-        end
-    else
-        for enemyIndex, _ in pairs(enemyIndexes) do
-            local enemyBrain = ArmyBrains[enemyIndex]
-            if enemyBrain then
-                local units = enemyBrain:GetListOfUnits(category, false, true) or {}
-                for _, unit in ipairs(units) do
-                    if unit and not unit.Dead and UnitMatchesDomain(domain, unit) then
-                        if allowUnderwater or not UnitIsUnderwater(unit) then
-                            if UnitIsKnownToBrain(unit, brainIndex) or not opts.IntelOnly then
-                                TableInsert(result, unit)
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-    return result
-end
-
-local function ExtractAttackData(data)
-    if type(data) ~= 'table' then
-        return nil
-    end
-
-    -- Allow callers to pass the full manager configuration table where the
-    -- options live under ``attackData`` while still supporting the legacy
-    -- direct options table used by older scripts. Some callers have been seen
-    -- to wrap the payload more than once, so peel layers until we hit the
-    -- innermost valid table.
-    local current = data
-    local seen = {}
-
-    while type(current) == 'table' do
-        if seen[current] then
-            WARN('[platoon_AttackFunctions] attackData contains a recursive reference; using last valid table')
-            return current
-        end
-        seen[current] = true
-
-        local nested = current.attackData or current.AttackData
-        if nested == nil then
-            return current
-        end
-
-        if type(nested) ~= 'table' then
-            WARN('[platoon_AttackFunctions] attackData must be a table; ignoring invalid nested value')
-            return current
-        end
-
-        current = nested
-    end
-
-    return nil
-end
-
-local function NormalizeDomain(domain)
-    if type(domain) ~= 'string' then
-        return nil
-    end
-
-    local upper = string.upper(domain)
-    upper = DomainAliases[upper] or upper
-
-    if DomainToLayer[upper] or upper == 'AIR' then
-        return upper
-    end
-
-    if upper == 'LAND' or upper == 'AMPHIBIOUS' or upper == 'SEA' then
-        return upper
-    end
-
-    return nil
-end
-
-local function ResolvePlatoonData(platoon, data)
-    local resolved = ExtractAttackData(data)
-
-    if resolved ~= nil then
-        if type(resolved) ~= 'table' then
-            WARN('[platoon_AttackFunctions] attackData must be a table; ignoring invalid value')
-            resolved = {}
-        end
-        platoon.PlatoonData = resolved
-        return resolved
-    end
-
-    if type(platoon.PlatoonData) == 'table' then
-        return platoon.PlatoonData
-    end
-
-    local fallback = {}
-    platoon.PlatoonData = fallback
-    return fallback
-end
-
-local function ResolveOptions(platoon, data)
-    local opts = {}
-    data = ResolvePlatoonData(platoon, data)
-        for key, value in pairs(DefaultOptions) do
-        if data[key] ~= nil then
-            opts[key] = data[key]
-        else
-            opts[key] = value
-        end
-    end
-    opts.Domain = NormalizeDomain(data.Domain or data.domain or data.DOMAIN)
-    if not opts.Domain and data ~= platoon.PlatoonData and type(platoon.PlatoonData) == 'table' then
-        opts.Domain = NormalizeDomain(platoon.PlatoonData.Domain or platoon.PlatoonData.domain or platoon.PlatoonData.DOMAIN)
-    end
-    opts.TargetArmy = data.TargetArmy or data.targetArmy
-    opts.Brain = platoon:GetBrain()
-    opts.ThreatThreshold = data.ThreatThreshold
-    opts.ThreatRadius = data.ThreatRadius
-    if not opts.Domain then
-        -- domain required; attempt to infer but warn through log
-        opts.Domain = 'LAND'
-        WARN('[platoon_AttackFunctions] Domain not provided, defaulting to LAND')
-    end
-    if type(data) == 'table' then
-        data.Domain = opts.Domain
-    end
-    opts.Formation = ResolveFormation(data.Formation or data.formation)
-    opts.IntelOnly = (data.IntelOnly ~= nil) and data.IntelOnly or DefaultOptions.IntelOnly
-    opts.Underwater = (data.Underwater ~= nil) and data.Underwater or DefaultOptions.Underwater
-    opts.UseTransports = (data.UseTransports ~= nil) and data.UseTransports or DefaultOptions.UseTransports
-    opts.AvoidDef = (data.AvoidDef ~= nil) and data.AvoidDef or DefaultOptions.AvoidDef
-    return opts, data
-end
-
---------------------------------------------------------------------------------
--- target selection -----------------------------------------------------------
---------------------------------------------------------------------------------
-
-local function SelectWaveTarget(platoon, opts, targetType)
-    targetType = targetType or 'closest'
-    local brain = opts.Brain
-    local category = categories.STRUCTURE - categories.WALL
-    local structures = GatherEnemyUnits(brain, category, opts)
-    if TableGetn(structures) == 0 then
-        return nil
-    end
-    if targetType == 'concentration' then
-        local cluster = SelectCluster(structures, 40)
-        if not cluster then
-            return nil
-        end
-        return {
-            position = cluster.position,
-            units = cluster.units,
-            label = 'wave_cluster',
-        }
-    end
-    local platoonPos = GetPlatoonPosition(platoon) or {0,0,0}
-    local closest = nil
-    local bestDistance = math.huge
-    for _, unit in ipairs(structures) do
-        local pos = unit:GetPosition()
-        local dist = Distance2D(platoonPos, pos)
-        if dist < bestDistance then
-            bestDistance = dist
-            closest = unit
-        end
-    end
-    if not closest then return nil end
-    return {
-        position = AdjustPositionToSurface(closest:GetPosition()),
-        units = { closest },
-        label = 'wave_closest',
-    }
-end
-
-local RaidCategories = {
-    ECO = categories.STRUCTURE * (categories.MASSEXTRACTION + categories.MASSFABRICATION + categories.ENERGYPRODUCTION + categories.MASSSTORAGE + categories.ENERGYSTORAGE),
-    FAB = categories.STRUCTURE * (categories.FACTORY + categories.ANTIMISSILE),
-    ENG = (categories.ENGINEER + categories.ENGINEERSTATION),
-    DEF = categories.STRUCTURE * (categories.RADAR + categories.ARTILLERY + categories.NUKE + categories.TACTICALMISSILEPLATFORM + categories.SHIELD),
-}
-
-local function CollectRaidCandidates(brain, opts, raidType)
-    local category = RaidCategories[raidType]
-    if not category then
-        return {}
-    end
-    return GatherEnemyUnits(brain, category, opts)
-end
-
-local function EvaluateRaidTarget(platoon, opts, unit)
-    local brain = opts.Brain
-    local pos = unit:GetPosition()
-    local threat = GetThreatAtPosition(brain, pos, opts.Domain, 24)
-    local platoonPos = GetPlatoonPosition(platoon)
-    local distance = platoonPos and Distance2D(platoonPos, pos) or 0
-    return threat, distance
-end
-
-local RaidPriorityOrder = { 'ECO', 'FAB', 'ENG', 'DEF' }
-
-local function SelectRaidTarget(platoon, opts, raidType)
-    raidType = raidType or 'ECO'
-    local brain = opts.Brain
-    local order = { raidType }
-    for _, entry in ipairs(RaidPriorityOrder) do
-        if entry ~= raidType then
-            TableInsert(order, entry)
-        end
-    end
-    local bestUnit
-    local bestThreat = math.huge
-    local bestDistance = math.huge
-
-    for _, entry in ipairs(order) do
-        local candidates
-        if entry == 'SMT' then
-            candidates = {}
-            for _, name in ipairs(RaidPriorityOrder) do
-                local subCandidates = CollectRaidCandidates(brain, opts, name)
-                for _, unit in ipairs(subCandidates) do
-                    TableInsert(candidates, unit)
-                end
-            end
-        else
-            candidates = CollectRaidCandidates(brain, opts, entry)
-        end
-        for _, unit in ipairs(candidates) do
-            local threat, distance = EvaluateRaidTarget(platoon, opts, unit)
-            if threat < bestThreat or (math.abs(threat - bestThreat) < 0.1 and distance < bestDistance) then
-                bestThreat = threat
-                bestDistance = distance
-                bestUnit = unit
-            end
-        end
-        if bestUnit then
-            break
-        end
-    end
-    if not bestUnit then
-        return nil
-    end
-    return {
-        unit = bestUnit,
-        position = AdjustPositionToSurface(bestUnit:GetPosition()),
-        threat = bestThreat,
-    }
-end
-
-local BombardPriority = {
-    categories.STRUCTURE * (categories.SHIELD + categories.RADAR + categories.OMNI + categories.SONAR),
-    categories.STRUCTURE * (categories.ARTILLERY + categories.TACTICALMISSILEPLATFORM),
-    categories.STRUCTURE * categories.DEFENSE * (categories.DIRECTFIRE + categories.ANTIAIR + categories.ANTINAVY),
-    categories.STRUCTURE - categories.WALL,
-}
-
-local function SelectBombardTargets(platoon, opts, targetType)
-    local baseTarget = SelectWaveTarget(platoon, opts, targetType)
-    if not baseTarget then
-        return nil
-    end
-    local allUnits = baseTarget.units
-    if not allUnits or TableGetn(allUnits) == 0 then
-        -- fall back to scanning area around position
-        local brain = opts.Brain
-        local around = brain:GetUnitsAroundPoint(categories.STRUCTURE, baseTarget.position, 45, 'Enemy') or {}
-        allUnits = {}
-        for _, unit in ipairs(around) do
-            if unit and not unit.Dead and UnitMatchesDomain(opts.Domain, unit) then
-                TableInsert(allUnits, unit)
-            end
-        end
-    end
-    local prioritized = {}
-    for _, category in ipairs(BombardPriority) do
-        local list = FilterTargetsByCategory(allUnits, category)
-        if TableGetn(list) > 0 then
-            TableInsert(prioritized, list)
-        end
-    end
-    if TableGetn(prioritized) == 0 then
-        TableInsert(prioritized, allUnits)
-    end
-    return {
-        position = baseTarget.position,
-        groups = prioritized,
-    }
-end
-
-local SiegeCategory = categories.STRUCTURE * categories.DEFENSE
-
-local function SelectSiegeTarget(platoon, opts, targetType)
-    local brain = opts.Brain
-    local structures = GatherEnemyUnits(brain, SiegeCategory, opts)
-    if TableGetn(structures) == 0 then
-        return nil
-    end
-    if targetType == 'concentration' then
-        local cluster = SelectCluster(structures, 45)
-        if not cluster then
-            return nil
-        end
-        return { position = cluster.position, units = cluster.units }
-    end
-    local platoonPos = GetPlatoonPosition(platoon) or structures[1]:GetPosition()
-    SortByDistanceTo(structures, platoonPos)
-    local unit = structures[1]
-    return {
-        position = AdjustPositionToSurface(unit:GetPosition()),
-        units = { unit },
-    }
-end
-
-local function SelectMobileTargets(platoon, opts)
-    local category
-    if opts.Domain == 'AIR' then
-        category = categories.MOBILE * categories.AIR
-    elseif opts.Domain == 'SEA' then
-        category = categories.MOBILE * categories.NAVAL
-    else
-        category = categories.MOBILE * categories.LAND
-    end
-    return GatherEnemyUnits(opts.Brain, category, opts)
-end
-
---------------------------------------------------------------------------------
--- behaviour implementations ---------------------------------------------------
---------------------------------------------------------------------------------
-
-local function ExecuteWave(platoon, opts, target)
-    if not target or not target.position then
-        return false
-    end
-    local formation = opts.Formation
-    local startPos = GetPlatoonPosition(platoon) or target.position
-    local navLayer = DomainToLayer[opts.Domain or 'LAND'] or 'Land'
-    local route = BuildNavPath(navLayer, startPos, target.position, opts)
-    if not TryUseTransports(platoon, target.position, opts) then
-        IssueMoveRoute(platoon, route, formation)
-        WaitForPlatoon(platoon, target.position, 15, 90)
-    end
-    if not PlatoonAlive(platoon) then
-        return false
-    end
-    local attackRoute = {}
-    if target.units then
-        for _, unit in ipairs(target.units or {}) do
-            if unit and not unit.Dead then
-                TableInsert(attackRoute, AdjustPositionToSurface(unit:GetPosition()))
-            end
-        end
-    end
-    if TableGetn(attackRoute) == 0 then
-        TableInsert(attackRoute, target.position)
-    end
-    IssueAggressiveRoute(platoon, attackRoute, formation)
-    WaitSeconds(RecheckDelay)
-    return true
-end
-
-local function ExecuteRaid(platoon, opts, raid)
-    if not raid or not raid.unit or raid.unit.Dead then
-        return false
-    end
-    local unit = raid.unit
-    local dest = AdjustPositionToSurface(unit:GetPosition())
-    local formation = opts.Formation
-    local startPos = GetPlatoonPosition(platoon) or dest
-    local navLayer = DomainToLayer[opts.Domain or 'LAND'] or 'Land'
-    local route = BuildNavPath(navLayer, startPos, dest, opts)
-    IssueMoveRoute(platoon, route, formation)
-    WaitForPlatoon(platoon, dest, 20, 90)
-    if not PlatoonAlive(platoon) then
-        return false
-    end
-    local units = GetPlatoonUnits(platoon)
-    for _, member in ipairs(units) do
-        if member and not member.Dead then
-            IssueClearCommands({ member })
-            IssueAttack({ member }, unit)
-        end
-    end
-    WaitSeconds(RecheckDelay)
-    return true
-end
-
-local function ExecuteBombard(platoon, opts, bombard)
-    if not bombard or not bombard.groups then
-        return false
-    end
-    local formation = opts.Formation
-    local maxRange = math.max(GetPlatoonMaxRange(platoon), 30)
-    for _, group in ipairs(bombard.groups) do
-        for _, targetUnit in ipairs(group) do
-            if not PlatoonAlive(platoon) then
-                return false
-            end
-            if targetUnit and not targetUnit.Dead then
-                local targetPos = AdjustPositionToSurface(targetUnit:GetPosition())
-                local platoonPos = GetPlatoonPosition(platoon) or targetPos
-                local distance = Distance2D(platoonPos, targetPos)
-                if distance > maxRange * 0.85 then
-                    local direction = Normalize2D(SubVectors(platoonPos, targetPos))
-                    local approach = AddVectors(targetPos, ScaleVector(direction, maxRange * 0.8))
-                    local navLayer = DomainToLayer[opts.Domain or 'LAND'] or 'Land'
-                    local route = BuildNavPath(navLayer, platoonPos, approach, opts)
-                    IssueMoveRoute(platoon, route, formation)
-                    WaitForPlatoon(platoon, approach, 10, 60)
-                end
-                if not PlatoonAlive(platoon) then
-                    return false
-                end
-                local members = GetPlatoonUnits(platoon)
-                for _, member in ipairs(members) do
-                    if member and not member.Dead then
-                        IssueClearCommands({ member })
-                        IssueAttack({ member }, targetUnit)
-                    end
-                end
-                WaitSeconds(RecheckDelay)
-            end
-        end
-    end
-    return true
-end
-
-local function ExecuteSiege(platoon, opts, siege)
-    if not siege or not siege.position then
-        return false
-    end
-    local formation = opts.Formation
-    local startPos = GetPlatoonPosition(platoon) or siege.position
-    local navLayer = DomainToLayer[opts.Domain or 'LAND'] or 'Land'
-    local route = BuildNavPath(navLayer, startPos, siege.position, opts)
-    IssueMoveRoute(platoon, route, formation)
-    WaitForPlatoon(platoon, siege.position, 20, 90)
-    if not PlatoonAlive(platoon) then
-        return false
-    end
-    local attackRoute = {}
-    for _, unit in ipairs(siege.units or {}) do
-        if unit and not unit.Dead then
-            TableInsert(attackRoute, AdjustPositionToSurface(unit:GetPosition()))
-        end
-    end
-    if TableGetn(attackRoute) == 0 then
-        TableInsert(attackRoute, siege.position)
-    end
-    IssueAggressiveRoute(platoon, attackRoute, formation)
-    WaitSeconds(RecheckDelay)
-    return true
-end
-
-local function ExecuteCull(platoon, opts)
-    local brain = opts.Brain
-    local units = SelectMobileTargets(platoon, opts)
-    local candidates = {}
-    for _, unit in ipairs(units) do
-        local threat = GetThreatAtPosition(brain, unit:GetPosition(), opts.Domain, 20)
-        if threat < 15 then
-            TableInsert(candidates, unit)
-        end
-    end
-    local formation = opts.Formation
-    if TableGetn(candidates) > 0 then
-        local target = candidates[math.random(1, TableGetn(candidates))]
-        local dest = AdjustPositionToSurface(target:GetPosition())
-        local startPos = GetPlatoonPosition(platoon) or dest
-        local layer = DomainToLayer[opts.Domain or 'LAND'] or 'Land'
-        local route = BuildNavPath(layer, startPos, dest, opts)
-        IssueAggressiveRoute(platoon, route, formation)
-    else
-        local center, radius = GetMapCenterAndRadius()
-        local angle = math.random() * math.pi * 2
-        local distance = RandomInRange(radius * 0.3, radius * 0.6)
-        local dest = { center[1] + math.cos(angle) * distance, 0, center[3] + math.sin(angle) * distance }
-        dest = AdjustPositionToDomain(opts.Domain, dest)
-        local startPos = GetPlatoonPosition(platoon) or dest
-        local layer = DomainToLayer[opts.Domain or 'LAND'] or 'Land'
-        local route = BuildNavPath(layer, startPos, dest, opts)
-        IssueMoveRoute(platoon, route, formation)
-    end
-    WaitSeconds(RecheckDelay)
-    return true
-end
-
-local function ResolveMarkerPosition(entry)
-    if not entry then return nil end
-    if type(entry) == 'string' then
-        return ScenarioUtils.MarkerToPosition(entry)
-    end
-    if type(entry) == 'table' then
-        if entry[1] and entry[3] then
-            return { entry[1], entry[2] or GetSurfaceHeight(entry[1], entry[3]), entry[3] }
-        end
-        if entry.Position then
-            return ResolveMarkerPosition(entry.Position)
-        end
-    end
-    return nil
-end
-
-local function ExecuteHunt(platoon, opts, params)
-    local targets = params.Targets or {}
-    if TableGetn(targets) == 0 then
-        return false
-    end
-    local waitPos = params.WaitPosition
-    if waitPos then
-        local layer = DomainToLayer[opts.Domain or 'LAND'] or 'Land'
-        local startPos = GetPlatoonPosition(platoon) or waitPos
-        local route = BuildNavPath(layer, startPos, waitPos, opts)
-        IssueMoveRoute(platoon, route, opts.Formation)
-        WaitForPlatoon(platoon, waitPos, 10, 60)
-    end
-    local brain = opts.Brain
-    local targetList = {}
-    for _, id in ipairs(targets) do
-        targetList[string.lower(id)] = true
-    end
-    local units = SelectMobileTargets(platoon, opts)
-    local best
-    local bestThreat = math.huge
-    for _, unit in ipairs(units) do
-        local bp = unit:GetBlueprint()
-        local id = bp and bp.BlueprintId and string.lower(bp.BlueprintId)
-        if id and targetList[id] then
-            local threat = 0
-            if params.WaitForSafeZone then
-                threat = GetThreatAtPosition(brain, unit:GetPosition(), opts.Domain, 18)
-            end
-            if threat <= 10 and threat < bestThreat then
-                bestThreat = threat
-                best = unit
-            end
-        end
-    end
-    if not best then
-        if waitPos then
-            local layer = DomainToLayer[opts.Domain or 'LAND'] or 'Land'
-            local route = BuildNavPath(layer, GetPlatoonPosition(platoon) or waitPos, waitPos, opts)
-            IssueMoveRoute(platoon, route, opts.Formation)
-        end
-        WaitSeconds(RecheckDelay)
-        return true
-    end
-    local dest = AdjustPositionToSurface(best:GetPosition())
-    local layer = DomainToLayer[opts.Domain or 'LAND'] or 'Land'
-    local route = BuildNavPath(layer, GetPlatoonPosition(platoon) or dest, dest, opts)
-    IssueAggressiveRoute(platoon, route, opts.Formation)
-    WaitSeconds(RecheckDelay)
-    return true
-end
-
-local function ExecuteScout(platoon, opts)
-    local units = GetPlatoonUnits(platoon)
-    if TableGetn(units) == 0 then
-        return false
-    end
-    local half = math.floor(TableGetn(units) / 2)
-    local knownTargets = GatherEnemyUnits(opts.Brain, categories.ALLUNITS - categories.WALL, opts)
-    local formation = opts.Formation
-    for index, unit in ipairs(units) do
-        if unit and not unit.Dead then
-            local pos
-            if index <= half and TableGetn(knownTargets) > 0 then
-                local ref = knownTargets[math.mod((index - 1), TableGetn(knownTargets)) + 1]
-                local refPos = ref:GetPosition()
-                local angle = math.random() * math.pi * 2
-                pos = {
-                    refPos[1] + math.cos(angle) * 25,
-                    0,
-                    refPos[3] + math.sin(angle) * 25,
-                }
-            else
-                local center, radius = GetMapCenterAndRadius()
-                local angle = math.random() * math.pi * 2
-                local distance = RandomInRange(radius * 0.2, radius * 0.9)
-                pos = {
-                    center[1] + math.cos(angle) * distance,
-                    0,
-                    center[3] + math.sin(angle) * distance,
-                }
-            end
-            pos = AdjustPositionToDomain(opts.Domain, pos)
-            IssueClearCommands({ unit })
-            IssueMove({ unit }, pos)
-        end
-    end
-    WaitSeconds(RecheckDelay)
-    return true
-end
-
-local function ExecuteFirebase(platoon, opts, params)
-    local locations = params.Locations
-    local templates = params.Templates
-    if TableGetn(locations) == 0 or TableGetn(locations) ~= TableGetn(templates) then
-        WARN('[platoon_AttackFunctions] Firebase requires matching location/template tables.')
-        return false
-    end
-    local aiBrain = opts.Brain
-    local formation = opts.Formation
-    local units = GetPlatoonUnits(platoon)
-    if TableGetn(units) == 0 then
-        return false
-    end
-    local index = params.NextIndex or 1
-    if index > TableGetn(locations) then
-        index = 1
-    end
-    local location = locations[index]
-    local templateEntry = templates[index]
-    local targetPos = AdjustPositionToSurface(location)
-    params.NextIndex = index + 1
-    local startPos = GetPlatoonPosition(platoon) or targetPos
-    local navLayer = DomainToLayer[opts.Domain or 'LAND'] or 'Land'
-    local route = BuildNavPath(navLayer, startPos, targetPos, opts)
-    IssueMoveRoute(platoon, route, formation)
-    WaitForPlatoon(platoon, targetPos, 15, 120)
-    if not PlatoonAlive(platoon) then
-        return false
-    end
-    local cachedTemplate = EnsureTemplateCached(aiBrain, templateEntry)
-    local templateUnits = ResolveTemplateUnits(aiBrain, templateEntry)
-    if TableGetn(templateUnits) == 0 then
-        WaitSeconds(RecheckDelay)
-        return true
-    end
-    local average = {0, 0, 0}
-    for _, data in ipairs(templateUnits) do
-        average[1] = average[1] + data.position[1]
-        average[2] = average[2] + data.position[2]
-        average[3] = average[3] + data.position[3]
-    end
-    average[1] = average[1] / TableGetn(templateUnits)
-    average[2] = average[2] / TableGetn(templateUnits)
-    average[3] = average[3] / TableGetn(templateUnits)
-
+local function IssueTemplateBuild(platoon, options, template, origin)
     local engineers = GetPlatoonUnits(platoon)
+    if TableGetn(engineers) == 0 then
+        return false
+    end
+    local structures = ParseTemplate(template)
+    if not structures then
+        return false
+    end
+    local center = {0, 0, 0}
+    local count = 0
+    for _, data in ipairs(structures) do
+        local pos = data.position or data[2]
+        if pos then
+            center[1] = center[1] + pos[1]
+            center[2] = center[2] + (pos[2] or 0)
+            center[3] = center[3] + pos[3]
+            count = count + 1
+        end
+    end
+    if count == 0 then
+        return false
+    end
+    center[1] = center[1] / count
+    center[2] = center[2] / count
+    center[3] = center[3] / count
+    local brain = options.Brain
     for _, engineer in ipairs(engineers) do
         if engineer and not engineer.Dead then
             IssueClearCommands({ engineer })
         end
     end
-
-    local function ensureStructure(data)
-        local offset = SubVectors(data.position, average)
-        local buildPos = AddVectors(targetPos, { offset[1], 0, offset[3] })
-        buildPos = { buildPos[1], GetTerrainHeight(buildPos[1], buildPos[3]), buildPos[3] }
-        if not StructureExistsAt(aiBrain, buildPos, data.id) then
-            local heading = OrientationToHeading(data.orientation)
-            IssueBuildMobile(engineers, buildPos, data.id, { heading })
-        end
-    end
-
-    for _, data in ipairs(templateUnits) do
-        ensureStructure(data)
-    end
-
-    local elapsed = 0
-    while elapsed < 120 do
-        local allBuilt = true
-        for _, data in ipairs(templateUnits) do
-            local offset = SubVectors(data.position, average)
-            local buildPos = AddVectors(targetPos, { offset[1], 0, offset[3] })
-            buildPos = { buildPos[1], GetTerrainHeight(buildPos[1], buildPos[3]), buildPos[3] }
-            if not StructureExistsAt(aiBrain, buildPos, data.id) then
-                allBuilt = false
-                break
+    for _, data in ipairs(structures) do
+        local bp = data.id or data[1]
+        local pos = data.position or data[2]
+        local orient = data.orientation or data[3] or 0
+        if bp and pos then
+            local offset = SubVector(pos, center)
+            local buildPos = { origin[1] + offset[1], 0, origin[3] + offset[3] }
+            buildPos = AdjustToSurface(buildPos)
+            if not StructureExistsAt(brain, buildPos, bp) then
+                IssueBuildMobile(engineers, buildPos, bp, { orient })
             end
         end
-        if allBuilt then
+    end
+    local elapsed = 0
+    while elapsed < FirebaseTimeout do
+        local complete = true
+        for _, data in ipairs(structures) do
+            local bp = data.id or data[1]
+            local pos = data.position or data[2]
+            if bp and pos then
+                local offset = SubVector(pos, center)
+                local checkPos = AdjustToSurface({ origin[1] + offset[1], 0, origin[3] + offset[3] })
+                if not StructureExistsAt(brain, checkPos, bp) then
+                    complete = false
+                    break
+                end
+            end
+        end
+        if complete then
             break
         end
         WaitSeconds(5)
@@ -1361,104 +1201,160 @@ local function ExecuteFirebase(platoon, opts, params)
             return false
         end
     end
+    return true
+end
+
+local function ExecuteFirebase(platoon, options, params)
+    local locations = params.Locations or {}
+    local templates = params.Templates or {}
+    if TableGetn(locations) == 0 or TableGetn(locations) ~= TableGetn(templates) then
+        WARN('[platoon_AttackFunctions] Firebase requires matching Location/Template tables.')
+        return false
+    end
+    local index = params.NextIndex or 1
+    if index > TableGetn(locations) then
+        index = 1
+    end
+    params.NextIndex = index + 1
+    local origin = AdjustToSurface(locations[index])
+    if not origin then
+        return false
+    end
+    if not MovePlatoon(platoon, AdjustToDomain(options.Domain, origin), options, false) then
+        return false
+    end
+    if not PlatoonAlive(platoon) then
+        return false
+    end
+    IssueTemplateBuild(platoon, options, templates[index], origin)
     WaitSeconds(RecheckDelay)
     return true
 end
 
 --------------------------------------------------------------------------------
--- exposed attack routines -----------------------------------------------------
+-- public interface ------------------------------------------------------------
 --------------------------------------------------------------------------------
 
 function WaveAttack(platoon, data)
     local opts, config = ResolveOptions(platoon, data)
     while PlatoonAlive(platoon) do
         local target = SelectWaveTarget(platoon, opts, config.TargetType or config.targetType)
-        if not target then
-            break
+        if target then
+            if not ExecuteWave(platoon, opts, target) then
+                WaitSeconds(RecheckDelay)
+            end
+        else
+            WaitSeconds(RecheckDelay)
         end
-        ExecuteWave(platoon, opts, target)
     end
-    platoon:PlatoonDisband()
+    if PlatoonAlive(platoon) then
+        platoon:PlatoonDisband()
+    end
 end
 
 function RaidAttack(platoon, data)
     local opts, config = ResolveOptions(platoon, data)
     while PlatoonAlive(platoon) do
-        local raid = SelectRaidTarget(platoon, opts, config.TargetType or config.targetType)
-        if not raid then
-            break
+        local target = SelectRaidTarget(platoon, opts, config.TargetType or config.targetType)
+        if target then
+            if not ExecuteRaid(platoon, opts, target) then
+                WaitSeconds(RecheckDelay)
+            end
+        else
+            WaitSeconds(RecheckDelay)
         end
-        ExecuteRaid(platoon, opts, raid)
     end
-    platoon:PlatoonDisband()
+    if PlatoonAlive(platoon) then
+        platoon:PlatoonDisband()
+    end
 end
 
 function Scout(platoon, data)
     local opts = ResolveOptions(platoon, data)
     while PlatoonAlive(platoon) do
-        ExecuteScout(platoon, opts)
+        if not ExecuteScout(platoon, opts) then
+            break
+        end
     end
-    platoon:PlatoonDisband()
+    if PlatoonAlive(platoon) then
+        platoon:PlatoonDisband()
+    end
 end
 
 function Bombard(platoon, data)
     local opts, config = ResolveOptions(platoon, data)
     while PlatoonAlive(platoon) do
-        local bombard = SelectBombardTargets(platoon, opts, config.TargetType or config.targetType)
-        if not bombard then
-            break
+        local target = SelectBombardTarget(platoon, opts, config.TargetType or config.targetType)
+        if target then
+            if not ExecuteBombard(platoon, opts, target) then
+                WaitSeconds(RecheckDelay)
+            end
+        else
+            WaitSeconds(RecheckDelay)
         end
-        ExecuteBombard(platoon, opts, bombard)
     end
-    platoon:PlatoonDisband()
+    if PlatoonAlive(platoon) then
+        platoon:PlatoonDisband()
+    end
 end
 
 function Siege(platoon, data)
     local opts, config = ResolveOptions(platoon, data)
     while PlatoonAlive(platoon) do
-        local siege = SelectSiegeTarget(platoon, opts, config.TargetType or config.targetType)
-        if not siege then
-            break
+        local target = SelectSiegeTarget(platoon, opts, config.TargetType or config.targetType)
+        if target then
+            if not ExecuteSiege(platoon, opts, target) then
+                WaitSeconds(RecheckDelay)
+            end
+        else
+            WaitSeconds(RecheckDelay)
         end
-        ExecuteSiege(platoon, opts, siege)
     end
-    platoon:PlatoonDisband()
+    if PlatoonAlive(platoon) then
+        platoon:PlatoonDisband()
+    end
 end
 
 function Cull(platoon, data)
     local opts = ResolveOptions(platoon, data)
     while PlatoonAlive(platoon) do
-        ExecuteCull(platoon, opts)
+        if not ExecuteCull(platoon, opts) then
+            break
+        end
     end
-    platoon:PlatoonDisband()
+    if PlatoonAlive(platoon) then
+        platoon:PlatoonDisband()
+    end
 end
 
 function Hunt(platoon, data)
     local opts, config = ResolveOptions(platoon, data)
-    local huntParams = {
+    local params = {
         Targets = config.TargetList or config.targetList or {},
         WaitForSafeZone = config.Wait or config.wait or false,
         WaitPosition = ResolveMarkerPosition(config.Marker or config.Location or config.WaitLocation or config.waitLocation),
     }
     while PlatoonAlive(platoon) do
-        ExecuteHunt(platoon, opts, huntParams)
+        if not ExecuteHunt(platoon, opts, params) then
+            break
+        end
     end
-    platoon:PlatoonDisband()
+    if PlatoonAlive(platoon) then
+        platoon:PlatoonDisband()
+    end
 end
 
 function Firebase(platoon, data)
     local opts, config = ResolveOptions(platoon, data)
-    local locationEntries = config.Location or config.Locations or {}
-    local templateEntries = config.Template or config.Templates or {}
     local locations = {}
-    for _, entry in ipairs(locationEntries) do
-        local pos = ResolveMarkerPosition(entry)
+    for _, entry in ipairs(config.Location or config.Locations or {}) do
+        local pos = ResolveMarkerPosition(entry) or entry
         if pos then
-            TableInsert(locations, pos)
+            TableInsert(locations, AdjustToSurface(pos))
         end
     end
     local templates = {}
-    for _, entry in ipairs(templateEntries) do
+    for _, entry in ipairs(config.Template or config.Templates or {}) do
         TableInsert(templates, entry)
     end
     local params = {
@@ -1470,16 +1366,16 @@ function Firebase(platoon, data)
         if TableGetn(locations) == 0 or TableGetn(templates) == 0 then
             break
         end
-        ExecuteFirebase(platoon, opts, params)
+        if not ExecuteFirebase(platoon, opts, params) then
+            break
+        end
     end
-    platoon:PlatoonDisband()
+    if PlatoonAlive(platoon) then
+        platoon:PlatoonDisband()
+    end
 end
 
---------------------------------------------------------------------------------
--- module export ---------------------------------------------------------------
---------------------------------------------------------------------------------
-
-local M = {
+return {
     WaveAttack = WaveAttack,
     RaidAttack = RaidAttack,
     Scout = Scout,
@@ -1489,5 +1385,3 @@ local M = {
     Hunt = Hunt,
     Firebase = Firebase,
 }
-
-return M
