@@ -160,6 +160,8 @@ local RaidCategoryPriorities = {
     DEF = categories.DEFENSE + categories.SHIELD + categories.RADAR + categories.SONAR,
 }
 
+local RaidDefenseCategory = RaidCategoryPriorities.DEF
+
 local BombardPriority = {
     categories.STRUCTURE * (categories.SHIELD + categories.RADAR + categories.SONAR),
     categories.STRUCTURE * (categories.ARTILLERY + categories.TACTICALMISSILEPLATFORM),
@@ -395,15 +397,63 @@ local function IntelVisible(brain, unit, options)
         return false
     end
     local armyIndex = brain:GetArmyIndex()
-    local ok, visible = pcall(IsUnitVisible, armyIndex, unit)
-    if ok and visible then
-        return true
+
+    -- try the intel map first as it reflects current vision data
+    if unit.GetPosition then
+        local okPos, position = pcall(unit.GetPosition, unit)
+        if okPos and position then
+            local okVisible, visible = pcall(IsLocationVisible, armyIndex, position)
+            if okVisible and visible then
+                return true
+            end
+        end
     end
-    if unit.IsOnRadar and unit:IsOnRadar(armyIndex) then
-        return true
+
+    -- prefer checking blips because they exist when we have radar / sonar intel
+    if unit.GetBlip then
+        local okBlip, blip = pcall(unit.GetBlip, unit, armyIndex)
+        if okBlip and blip then
+            if blip.IsDead then
+                local okDead, dead = pcall(blip.IsDead, blip)
+                if okDead and not dead then
+                    return true
+                end
+            else
+                return true
+            end
+            if blip.IsOnRadar then
+                local okRadar, onRadar = pcall(blip.IsOnRadar, blip, armyIndex)
+                if okRadar and onRadar then
+                    return true
+                end
+            end
+            if blip.IsOnSonar then
+                local okSonar, onSonar = pcall(blip.IsOnSonar, blip, armyIndex)
+                if okSonar and onSonar then
+                    return true
+                end
+            end
+            if blip.IsOnOmni then
+                local okOmni, onOmni = pcall(blip.IsOnOmni, blip, armyIndex)
+                if okOmni and onOmni then
+                    return true
+                end
+            end
+        end
     end
-    if unit.IsOnSonar and unit:IsOnSonar(armyIndex) then
-        return true
+
+    -- finally fall back to directly querying the unit
+    if unit.IsOnRadar then
+        local okRadar, onRadar = pcall(unit.IsOnRadar, unit, armyIndex)
+        if okRadar and onRadar then
+            return true
+        end
+    end
+    if unit.IsOnSonar then
+        local okSonar, onSonar = pcall(unit.IsOnSonar, unit, armyIndex)
+        if okSonar and onSonar then
+            return true
+        end
     end
     return false
 end
@@ -691,13 +741,122 @@ local function ThreatAt(brain, position, threatType)
     return 0
 end
 
-local function TargetDefenseWeight(brain, unit, options)
+local DefenseThreatFields = {
+    AntiSurface = {
+        'AntiSurfaceThreatLevel',
+        'SurfaceThreatLevel',
+        'DirectFireThreatLevel',
+        'IndirectFireThreatLevel',
+        'NavalThreatLevel',
+        'SubThreatLevel',
+        'MilitaryValue',
+    },
+    AntiAir = {
+        'AntiAirThreatLevel',
+        'AirThreatLevel',
+        'MilitaryValue',
+    },
+}
+
+local function DefenseThreatValue(unit, threatType)
+    if not unit or unit.Dead or not unit.GetBlueprint then
+        return 0
+    end
+    local ok, bp = pcall(unit.GetBlueprint, unit)
+    if not ok or not bp then
+        return 0
+    end
+    local defense = bp.Defense
+    if not defense then
+        return 0
+    end
+    local best = 0
+    for _, key in ipairs(DefenseThreatFields[threatType] or {}) do
+        local value = defense[key]
+        if value and value > best then
+            best = value
+        end
+    end
+    if best > 0 then
+        return best
+    end
+    return defense.MilitaryValue or 0
+end
+
+local function AccumulateKnownDefenseThreat(position, defenses, threatType)
+    if not position or not defenses or TableGetn(defenses) == 0 then
+        return 0
+    end
+    local radiusSq = ThreatSampleRadius * ThreatSampleRadius
+    local px = position[1] or 0
+    local pz = position[3] or 0
+    local total = 0
+    for _, defense in ipairs(defenses) do
+        if defense and not defense.Dead and defense.GetPosition then
+            local okPos, dPos = pcall(defense.GetPosition, defense)
+            if okPos and dPos then
+                local dx = (dPos[1] or 0) - px
+                local dz = (dPos[3] or 0) - pz
+                if dx * dx + dz * dz <= radiusSq then
+                    total = total + DefenseThreatValue(defense, threatType)
+                end
+            end
+        end
+    end
+    return total
+end
+
+local function CalculateDefenseWeight(brain, unit, options, context)
     if not unit or unit.Dead then
         return math.huge
     end
-    local position = unit:GetPosition()
-    local threatType = DomainThreatType[options.Domain] or 'Overall'
-    return ThreatAt(brain, position, threatType)
+    options = options or {}
+    context = context or {}
+    context.Weights = context.Weights or {}
+    local weights = context.Weights
+    if weights[unit] then
+        return weights[unit]
+    end
+    local threatType = context.ThreatType
+    if not threatType then
+        threatType = DomainThreatType[options.Domain] or 'AntiSurface'
+        if threatType == 'Overall' then
+            threatType = 'AntiSurface'
+        end
+        context.ThreatType = threatType
+    end
+    if context.Defenses == nil then
+        context.Defenses = GatherEnemyUnits(brain, RaidDefenseCategory, options)
+    end
+    local okPos, position = unit.GetPosition and pcall(unit.GetPosition, unit)
+    if not okPos or not position then
+        weights[unit] = math.huge
+        return weights[unit]
+    end
+    local knownThreat = AccumulateKnownDefenseThreat(position, context.Defenses, threatType)
+    local weight = knownThreat
+    if not (options and options.IntelOnly) then
+        local mapThreat = ThreatAt(brain, position, threatType)
+        if mapThreat > weight then
+            weight = mapThreat
+        end
+    end
+    weights[unit] = weight
+    return weight
+end
+
+local function SortByDefense(units, brain, options)
+    local context = { Weights = {} }
+    if TableGetn(units) > 1 then
+        TableSort(units, function(a, b)
+            local aWeight = CalculateDefenseWeight(brain, a, options, context)
+            local bWeight = CalculateDefenseWeight(brain, b, options, context)
+            return aWeight < bWeight
+        end)
+    elseif TableGetn(units) == 1 then
+        CalculateDefenseWeight(brain, units[1], options, context)
+    end
+    return context
 end
 
 local function SelectClosestStructure(platoon, options, structures)
@@ -741,12 +900,6 @@ local function SelectStructureCluster(platoon, options, structures)
         return nil
     end
     return { Position = bestCenter }
-end
-
-local function SortByDefense(units, brain, options)
-    TableSort(units, function(a, b)
-        return TargetDefenseWeight(brain, a, options) < TargetDefenseWeight(brain, b, options)
-    end)
 end
 
 local function ResolveOptions(platoon, data)
@@ -1069,13 +1222,13 @@ local function ExecuteCull(platoon, options)
         WaitSeconds(RecheckDelay)
         return true
     end
-    SortByDefense(mobiles, brain, options)
+    local defenseContext = SortByDefense(mobiles, brain, options)
     local target = mobiles[1]
     if not target or target.Dead then
         WaitSeconds(RecheckDelay)
         return true
     end
-    local threat = TargetDefenseWeight(brain, target, options)
+    local threat = CalculateDefenseWeight(brain, target, options, defenseContext)
     local strength = CalculatePlatoonStrength(platoon, DomainThreatType[options.Domain])
     if threat > strength * 0.75 then
         -- wait nearby for safer opportunity
@@ -1106,13 +1259,15 @@ local function ExecuteHunt(platoon, options, params)
     local mobiles = SelectMobileTargets(platoon, options)
     local best
     local bestThreat = math.huge
+    local threatContext
     for _, unit in ipairs(mobiles) do
         local bp = unit:GetBlueprint()
         local id = bp and bp.BlueprintId and string.lower(bp.BlueprintId)
         if id and desired[id] then
             local threat = 0
             if params.WaitForSafeZone then
-                threat = TargetDefenseWeight(options.Brain, unit, options)
+                threatContext = threatContext or {}
+                threat = CalculateDefenseWeight(options.Brain, unit, options, threatContext)
             end
             if threat < bestThreat then
                 bestThreat = threat
