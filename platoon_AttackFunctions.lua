@@ -115,7 +115,6 @@ local NavUtils           = import('/lua/sim/NavUtils.lua')
 
 local TableGetn          = table.getn
 local TableInsert        = table.insert
-local TableSort          = table.sort
 local Random             = math.random
 local Floor              = math.floor
 local Min                = math.min
@@ -386,6 +385,32 @@ local function DetermineTargetBrains(brain, options)
     return brains
 end
 
+local function LocationVisibleToBrain(brain, armyIndex, position)
+    if not position then
+        return false
+    end
+
+    local visibilityFunc = rawget(_G, 'IsLocationVisible')
+    if type(visibilityFunc) == 'function' then
+        local okVisible, visible = pcall(visibilityFunc, armyIndex, position)
+        if okVisible then
+            return visible
+        end
+    end
+
+    if brain then
+        local getUnitsAroundPoint = brain.GetUnitsAroundPoint
+        if type(getUnitsAroundPoint) == 'function' then
+            local okUnits, units = pcall(getUnitsAroundPoint, brain, categories.ALLUNITS, position, 1, 'Ally')
+            if okUnits and units and next(units) then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
 local function IntelVisible(brain, unit, options)
     if not unit or unit.Dead then
         return false
@@ -402,8 +427,7 @@ local function IntelVisible(brain, unit, options)
     if unit.GetPosition then
         local okPos, position = pcall(unit.GetPosition, unit)
         if okPos and position then
-            local okVisible, visible = pcall(IsLocationVisible, armyIndex, position)
-            if okVisible and visible then
+            if LocationVisibleToBrain(brain, armyIndex, position) then
                 return true
             end
         end
@@ -510,7 +534,9 @@ local function GatherEnemyUnits(brain, category, options)
         local ok, units = pcall(enemyBrain.GetListOfUnits, enemyBrain, category or categories.ALLUNITS, false)
         if ok and units then
             for _, unit in ipairs(units) do
-                if unit and not unit.Dead then
+                if unit and not unit.Dead
+                    and (type(unit.GetPosition) == 'function')
+                then
                     if UnitMatchesDomain(unit, options.Domain, options) or EntityCategoryContains(StructureCategory, unit) then
                         if IntelVisible(brain, unit, options) then
                             TableInsert(targets, unit)
@@ -527,11 +553,39 @@ local function SortUnitsByDistance(units, reference)
     if not reference then
         return units
     end
-    TableSort(units, function(a, b)
-        local ap = a:GetPosition()
-        local bp = b:GetPosition()
-        return Distance2D(ap, reference) < Distance2D(bp, reference)
+
+    -- Build a sortable list of { unit = u, d = distance }
+    local sortable = {}
+    local count = 0
+
+    for _, u in ipairs(units or {}) do
+        if u and not u.Dead and type(u.GetPosition) == 'function' then
+            local okPos, pos = pcall(u.GetPosition, u)
+            if okPos and pos then
+                count = count + 1
+                sortable[count] = { unit = u, d = Distance2D(pos, reference) }
+            end
+        end
+    end
+
+    -- If everything filtered out, just clear the input to avoid later surprises
+    if count == 0 then
+        for i = TableGetn(units), 1, -1 do units[i] = nil end
+        return units
+    end
+
+    table.sort(sortable, function(a, b)
+        return (a.d or math.huge) < (b.d or math.huge)
     end)
+
+    -- Write back in order
+    for i = 1, count do
+        units[i] = sortable[i].unit
+    end
+    for i = TableGetn(units), count + 1, -1 do
+        units[i] = nil
+    end
+
     return units
 end
 
@@ -828,7 +882,10 @@ local function CalculateDefenseWeight(brain, unit, options, context)
     if context.Defenses == nil then
         context.Defenses = GatherEnemyUnits(brain, RaidDefenseCategory, options)
     end
-    local okPos, position = unit.GetPosition and pcall(unit.GetPosition, unit)
+    local okPos, position
+    if unit.GetPosition and type(unit.GetPosition) == 'function' then
+        okPos, position = pcall(unit.GetPosition, unit)
+    end
     if not okPos or not position then
         weights[unit] = math.huge
         return weights[unit]
@@ -848,11 +905,32 @@ end
 local function SortByDefense(units, brain, options)
     local context = { Weights = {} }
     if TableGetn(units) > 1 then
-        TableSort(units, function(a, b)
-            local aWeight = CalculateDefenseWeight(brain, a, options, context)
-            local bWeight = CalculateDefenseWeight(brain, b, options, context)
-            return aWeight < bWeight
-        end)
+        -- filter out anything without a callable GetPosition
+        local filtered = {}
+        for _, u in ipairs(units) do
+            if u and not u.Dead and type(u.GetPosition) == 'function' then
+                TableInsert(filtered, u)
+            end
+        end
+        if TableGetn(filtered) > 1 then
+            table.sort(filtered, function(a, b)
+                local aw = CalculateDefenseWeight(brain, a, options, context)
+                local bw = CalculateDefenseWeight(brain, b, options, context)
+                aw = tonumber(aw) or math.huge
+                bw = tonumber(bw) or math.huge
+                return aw < bw
+            end)
+            -- replace original
+            for i = 1, TableGetn(filtered) do units[i] = filtered[i] end
+            for i = TableGetn(units), TableGetn(filtered) + 1, -1 do units[i] = nil end
+        elseif TableGetn(filtered) == 1 then
+            CalculateDefenseWeight(brain, filtered[1], options, context)
+            units[1] = filtered[1]
+            for i = TableGetn(units), 2, -1 do units[i] = nil end
+        else
+            -- no valid entries
+            for i = TableGetn(units), 1, -1 do units[i] = nil end
+        end
     elseif TableGetn(units) == 1 then
         CalculateDefenseWeight(brain, units[1], options, context)
     end
