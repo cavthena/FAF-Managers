@@ -597,12 +597,23 @@ local function ClearTargetArea(platoon, position, opts)
 end
 
 local function NormaliseOptions(platoon, data)
-    local opts = {}
-    if type(data) == 'table' then
-        for k, v in pairs(data) do
-            opts[k] = v
-        end
+    if not platoon then
+        return {}
     end
+
+    local source = data
+    if type(source) ~= 'table' then
+        source = platoon.PlatoonData
+    end
+    if type(source) ~= 'table' then
+        source = {}
+    end
+
+    local opts = {}
+    for k, v in pairs(source) do
+        opts[k] = v
+    end
+
     opts.Formation = (type(opts.Formation) == 'string') and opts.Formation or nil
     opts.Underwater = opts.Underwater and true or false
     opts.UseTransports = opts.UseTransports and true or false
@@ -613,6 +624,8 @@ local function NormaliseOptions(platoon, data)
     if not opts.Formation then
         opts.Formation = LayerFormationDefault[opts.Layer] or 'GrowthFormation'
     end
+
+    platoon.PlatoonData = opts
     return opts
 end
 
