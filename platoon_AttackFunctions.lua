@@ -1,122 +1,168 @@
 --[[
 ================================================================================
-Platoon Attack Functions (FAF safe, Lua 5.0)
+Platoon Attack Functions (Lua 5.0, FAF safe)
 ================================================================================
 
-This module contains lightweight attack behaviours designed for the FAF Manager
-suite.  The functions are written to be safe for the vanilla FA Lua 5.0 runtime
-and can be used directly from manager_UnitBuilder.lua and
-manager_UnitSpawner.lua.
+Overview
+    Drop-in attack behaviours for the FAF Manager suite.  They can be assigned
+    directly to a platoon via `platoon:ForkAIThread` or indirectly by providing
+    `attackFn` and `attackData` when starting the UnitBuilder or UnitSpawner
+    managers.
 
-Usage overview
---------------
-    local Attacks = import('/maps/<map>/platoon_AttackFunctions.lua')
+    local AttackFns = import('/maps/<map>/platoon_AttackFunctions.lua')
 
-    -- Wave attack example ----------------------------------------------------
-    local platoonData = {
-        TargetType = 'concentration',
-        TargetArmy = {'Player1', 'Player2'},
-        Formation = 'AttackFormation',
-        UseTransports = true,
-        AvoidDef = true,
-    }
-    platoon:ForkAIThread(Attacks.WaveAttack, platoonData)
+    -- Wave attack -------------------------------------------------------------
+    function SpawnWave(platoon)
+        local data = {
+            Type        = 'cluster',       -- 'closest' | 'cluster' | 'value'
+            IntelOnly   = false,
+            TargetArmy  = { 'PLAYER_1' },
+            Formation   = 'GrowthFormation',
+            AvoidDef    = true,
+            Transport   = true,
+            Amphibious  = false,
+        }
+        AttackFns.WaveAttack(platoon, data)
+    end
 
-    -- Raid attack example ----------------------------------------------------
-    local raidData = {
-        TargetType = 'ECO',
-        TargetArmy = {'Player2'},
-        Underwater = false,
-    }
-    platoon:ForkAIThread(Attacks.RaidAttack, raidData)
+    -- Raid attack -------------------------------------------------------------
+    function LaunchRaid(platoon)
+        local data = {
+            Category    = 'ECO',           -- 'ECO' | 'BLD' | 'INT' | 'DEF' | 'SMT'
+            IntelOnly   = true,
+            TargetArmy  = { 2, 4 },
+            Formation   = 'AttackFormation',
+            Submersible = false,
+            Transport   = false,
+        }
+        AttackFns.RaidAttack(platoon, data)
+    end
 
-Global options
---------------
-Every function accepts a configuration table (`platoon.PlatoonData`) that may
-contain the following keys.  All options are optional unless stated otherwise.
+    -- Scout attack ------------------------------------------------------------
+    function PatrolScouts(platoon)
+        local data = {
+            IntelOnly = true,
+        }
+        AttackFns.ScoutAttack(platoon, data)
+    end
 
-    TargetArmy (table)
-        List of army names/indices that may be targeted.  When omitted every
-        enemy army is considered a valid target.
+Universal parameters
+    All attack functions accept the arguments listed below through their
+    `attackData` table.  Missing fields fall back to the stated defaults.
 
-    Formation (string, default = 'GrowthFormation')
-        Movement formation used for regular move orders.  Allowed values are
-        'AttackFormation', 'GrowthFormation', and 'NoFormation'.
+        IntelOnly   (boolean, default = false)
+            Search for targets only in areas with existing intel.  Threat heat
+            maps are sampled to find candidate positions.  When false, a
+            flood-fill search around the platoon's position discovers potential
+            locations.
 
-    Underwater (boolean, default = false)
-        When true the platoon will consider underwater targets.  When false,
-        underwater structures and units are ignored.
+        TargetArmy  (table | nil)
+            List of army indices or names that may be targeted.  Nil allows all
+            enemy armies.
 
-    UseTransports (boolean, default = false)
-        When true the platoon will request transports for moves longer than
-        200 units or when no direct path is available.
+        Formation   (string, default = 'GrowthFormation')
+            Movement formation used for move orders.  Allowed values are
+            'AttackFormation', 'GrowthFormation', or 'NoFormation'.
 
-    AvoidDef (boolean, default = false)
-        When true the platoon will attempt to steer around static defences that
-        are dangerous to its movement layer.  When no safer path exists the
-        direct path is used.
+        Submersible (boolean, default = false)
+            Include units with the SUBMERSIBLE category when evaluating targets.
 
-Attack behaviours
------------------
-WaveAttack
-    Standard wave style push.  Routes the platoon to structure targets and
-    clears the surrounding area before moving to the next target.  Set
-    `TargetType` to either 'concentration' (largest cluster of structures) or
-    'closest' (nearest structure).
+        AvoidDef    (boolean, default = false)
+            Attempt to route around defensive structures that can harm the
+            platoon's movement layer while travelling to a target.  When no
+            alternative exists the least threatening path is chosen.
 
-RaidAttack
-    Hit-and-run style behaviour.  Targets lightly defended structures in the
-    requested category.  Supported `TargetType` values: 'ECO', 'FAB', 'ENG',
-    'DEF', and 'SMT'.  'SMT' selects the least defended valid target regardless
-    of category.  When no target is available in the requested category the
-    search falls back in priority order: requested > ECO > FAB > ENG > DEF.
+        Transport   (boolean, default = false)
+            Allow the platoon to request transports to bypass impassable
+            terrain.  Transports are loaded at the platoon's current position
+            and unloaded near the target, after which the platoon proceeds under
+            its own power.
 
-All behaviours are intended to be forked as platoon AI threads and will exit
-when the platoon is destroyed.  Targets are re-evaluated every 10 seconds and
-orders are refreshed whenever the target changes.
+        Amphibious  (boolean, default = false)
+            Treat both land and water as passable terrain when routing.
+
+WaveAttack specifics
+        Type (string, default = 'closest')
+            Determines how targets are prioritised: 'closest', 'cluster', or
+            'value'.  Search areas are 50 units wide and the platoon clears all
+            structures within an area before moving on.
+
+RaidAttack specifics
+        Category (string, default = 'ECO')
+            Requested structure category: 'ECO', 'BLD', 'INT', 'DEF', or 'SMT'.
+            Areas are 25 units wide.  The priority chain is always
+            Requested > ECO > BLD > INT > DEF.
+
+ScoutAttack specifics
+        Designed for AIR platoons.  Each unit receives a move target.  Upon
+        arriving, the unit either selects a new destination or has a 10% chance
+        to orbit the location for up to two minutes.  Destinations are random
+        map positions with a 25% chance of being the hottest or coolest area on
+        the threat map.
 ================================================================================
 ]]
 
 local ScenarioFramework = import('/lua/ScenarioFramework.lua')
 local NavUtils           = import('/lua/sim/NavUtils.lua')
+local GetTerrainHeight   = GetTerrainHeight
+local GetSurfaceHeight   = GetSurfaceHeight
 
-local table_getn = table.getn
-local table_insert = table.insert
-local table_remove = table.remove
-local math_huge = math.huge
+local table_getn    = table.getn
+local table_insert  = table.insert
+local table_remove  = table.remove
+local math_sqrt     = math.sqrt
+local math_abs      = math.abs
+local math_min      = math.min
+local math_max      = math.max
+local math_floor    = math.floor
+local math_random   = math.random
+local math_cos      = math.cos
+local math_sin      = math.sin
+local math_huge     = math.huge
 
-local RecheckDelay = 10
-local TransportDistance = 200
-local ClusterRadius = 40
-local ClearRadius = 30
-local ThreatSampleRadius = 30
+local RecheckDelay           = 10
+local WaveAreaRadius         = 50
+local RaidAreaRadius         = 25
+local AreaClearRadius        = 35
+local TransportStagingOffset = 28
+local OrbitChance            = 0.10
+local HotColdChance          = 0.25
+local MaxScoutOrbitTime      = 120
+local FloodFillCell          = 32
+local FloodFillMaxRadius     = 512
+local ThreatSampleRing       = 32
+local AvoidThreatMultiplier  = 1.5
 
 local StructureCategory = categories.STRUCTURE - categories.WALL
-local UnderwaterCategory = categories.SUBMERSIBLE + (categories.NAVAL * categories.STRUCTURE)
+local NavalStructure    = categories.STRUCTURE * categories.NAVAL
+local LandStructure     = categories.STRUCTURE - categories.NAVAL
+local SubmersibleCat    = categories.SUBMERSIBLE
 
 local RaidCategories = {
-    ECO = categories.MASSEXTRACTION + categories.MASSPRODUCTION + categories.ENERGYPRODUCTION +
-          categories.MASSSTORAGE + categories.ENERGYSTORAGE,
-    FAB = categories.FACTORY + (categories.ANTIMISSILE * categories.STRUCTURE),
-    ENG = categories.ENGINEER + (categories.STRUCTURE * categories.ENGINEERSTATION),
-    DEF = categories.DEFENSE + categories.SHIELD + categories.RADAR + categories.SONAR,
+    ECO = categories.MASSEXTRACTION + categories.MASSPRODUCTION + categories.ENERGYPRODUCTION + categories.HYDROCARBON + categories.MASSSTORAGE + categories.ENERGYSTORAGE,
+    BLD = categories.FACTORY + categories.ENGINEER + (categories.STRUCTURE * categories.ENGINEERSTATION),
+    INT = categories.RADAR + categories.SONAR,
+    DEF = categories.DEFENSE + categories.ANTIMISSILE + categories.SHIELD,
 }
 
-local LayerThreatTypes = {
-    Land = 'AntiSurface',
-    Water = 'AntiSurface',
-    Amphibious = 'AntiSurface',
-    Air = 'AntiAir',
+local LayerMapping = {
+    LAND  = 'Land',
+    LAND1 = 'Land',
+    LAND2 = 'Land',
+    AIR   = 'Air',
+    NAVAL = 'Water',
+    WATER = 'Water',
+    HOVER = 'Amphibious',
+    AMPHIBIOUS = 'Amphibious',
 }
 
-local LayerFormationDefault = {
-    Land = 'GrowthFormation',
-    Water = 'GrowthFormation',
-    Amphibious = 'GrowthFormation',
-    Air = 'AttackFormation',
+local FormationOptions = {
+    AttackFormation = true,
+    GrowthFormation = true,
+    NoFormation     = true,
 }
 
-local function SafeWaitSeconds(seconds)
+local function SafeWait(seconds)
     if seconds and seconds > 0 then
         WaitSeconds(seconds)
     else
@@ -125,712 +171,775 @@ local function SafeWaitSeconds(seconds)
 end
 
 local function PlatoonAlive(platoon)
-    if not platoon then
-        return false
-    end
+    if not platoon then return false end
     local brain = platoon:GetBrain()
-    if not brain then
-        return false
-    end
-    if not brain:PlatoonExists(platoon) then
-        return false
-    end
+    if not brain then return false end
+    if not brain:PlatoonExists(platoon) then return false end
     local units = platoon:GetPlatoonUnits()
-    return units and table_getn(units) > 0
+    return (units and table_getn(units) > 0)
 end
 
 local function CopyVector(vec)
-    if not vec then
-        return nil
-    end
+    if not vec then return nil end
     return { vec[1], vec[2], vec[3] }
 end
 
-local function DetermineLayer(platoon)
-    if not platoon then
-        return 'Land'
+local function VectorAdd(a, b)
+    return { a[1] + b[1], a[2] + b[2], a[3] + b[3] }
+end
+
+local function DistanceSq(a, b)
+    local dx = a[1] - b[1]
+    local dz = a[3] - b[3]
+    return dx * dx + dz * dz
+end
+
+local function Distance(a, b)
+    return math_sqrt(DistanceSq(a, b))
+end
+
+local function DetermineLayer(platoon, amphibious)
+    if amphibious then
+        return 'Amphibious'
     end
+
     if platoon.MovementLayer then
-        return platoon.MovementLayer
+        return LayerMapping[string.upper(platoon.MovementLayer)] or platoon.MovementLayer
     end
+
     local units = platoon:GetPlatoonUnits() or {}
     for _, unit in ipairs(units) do
         if unit and not unit.Dead then
             if EntityCategoryContains(categories.AIR, unit) then
                 return 'Air'
+            elseif EntityCategoryContains(categories.AMPHIBIOUS, unit) or EntityCategoryContains(categories.HOVER, unit) then
+                return amphibious and 'Amphibious' or 'Land'
             elseif EntityCategoryContains(categories.NAVAL, unit) then
                 return 'Water'
-            elseif EntityCategoryContains(categories.AMPHIBIOUS, unit) then
-                return 'Amphibious'
+            else
+                return 'Land'
             end
         end
     end
+
     return 'Land'
 end
 
-local function IsUnitUnderwater(unit)
-    if not unit or unit.Dead then
-        return false
+local function ValidateFormation(value)
+    if value and FormationOptions[value] then
+        return value
     end
-    if EntityCategoryContains(UnderwaterCategory, unit) then
-        return true
-    end
-    local pos = unit:GetPosition()
-    if not pos then
-        return false
-    end
-    local surface = GetSurfaceHeight(pos[1], pos[3])
-    return pos[2] < surface - 0.2
+    return 'GrowthFormation'
 end
 
-local function GetArmyBrainByName(name)
-    if type(name) == 'number' then
-        return ArmyBrains[name]
-    end
-    if type(name) ~= 'string' then
-        return nil
-    end
-    if ScenarioInfo and ScenarioInfo.ArmySetup then
-        local setup = ScenarioInfo.ArmySetup[name]
-        if setup and setup.ArmyIndex then
-            return ArmyBrains[setup.ArmyIndex]
-        end
-        for key, info in pairs(ScenarioInfo.ArmySetup) do
-            if key == name or info.ArmyName == name or info.HumanPlayerName == name then
-                if info.ArmyIndex then
-                    return ArmyBrains[info.ArmyIndex]
-                end
-            end
+local function CopyOptions(data)
+    local opts = {}
+    if type(data) == 'table' then
+        for k, v in pairs(data) do
+            opts[k] = v
         end
     end
-    for idx, brain in pairs(ArmyBrains or {}) do
-        if brain and brain.Nickname == name then
-            return brain
-        end
-        if brain and brain.GetArmyName and brain:GetArmyName() == name then
-            return brain
+    opts.IntelOnly   = opts.IntelOnly   and true or false
+    opts.Submersible = opts.Submersible and true or false
+    opts.AvoidDef    = opts.AvoidDef    and true or false
+    opts.Transport   = opts.Transport   and true or false
+    opts.Amphibious  = opts.Amphibious  and true or false
+    opts.Formation   = ValidateFormation(opts.Formation)
+    return opts
+end
+
+local function GetPlatoonPosition(platoon)
+    local pos = platoon:GetPlatoonPosition()
+    if pos then
+        return { pos[1], pos[2], pos[3] }
+    end
+    local units = platoon:GetPlatoonUnits() or {}
+    for _, unit in ipairs(units) do
+        if unit and not unit.Dead then
+            return { unit:GetPositionXYZ() }
         end
     end
     return nil
 end
 
-local function ResolveTargetBrains(brain, opts)
-    local targets = {}
+local function BrainEnemies(brain, targetArmy)
+    if not brain then
+        return {}
+    end
+
+    -- collect all enemy army indices
     local myIndex = brain:GetArmyIndex()
-    if opts.TargetArmy then
-        for _, entry in ipairs(opts.TargetArmy) do
-            local targetBrain = entry
-            if type(targetBrain) ~= 'table' or not targetBrain.GetArmyIndex then
-                targetBrain = GetArmyBrainByName(entry)
-            end
-            if targetBrain and not targetBrain:IsDefeated() then
-                local idx = targetBrain:GetArmyIndex()
-                if idx and IsEnemy(myIndex, idx) then
-                    table_insert(targets, targetBrain)
-                end
-            end
-        end
-    else
-        for idx, targetBrain in pairs(ArmyBrains or {}) do
-            if targetBrain and targetBrain ~= brain and not targetBrain:IsDefeated() then
-                local enemyIdx = targetBrain:GetArmyIndex()
-                if enemyIdx and IsEnemy(myIndex, enemyIdx) then
-                    table_insert(targets, targetBrain)
-                end
+    local enemies = {}
+    for idx, ab in ipairs(ArmyBrains) do
+        -- skip invalid / destroyed brains and self
+        if ab and idx ~= myIndex then
+            local ok, isEnemy = pcall(IsEnemy, myIndex, idx)
+            if ok and isEnemy then
+                table_insert(enemies, idx)
             end
         end
     end
-    return targets
+
+    -- if no filter requested, we're done
+    if not targetArmy then
+        return enemies
+    end
+
+    -- build allow-list that can match either indices or army nicknames
+    local allow = {}
+    if type(targetArmy) == 'table' then
+        for _, entry in ipairs(targetArmy) do
+            allow[entry] = true
+        end
+    else
+        allow[targetArmy] = true
+    end
+
+    local filtered = {}
+    for _, idx in ipairs(enemies) do
+        local name = ArmyBrains[idx] and ArmyBrains[idx].Nickname
+        if allow[idx] or (name and allow[name]) then
+            table_insert(filtered, idx)
+        end
+    end
+
+    -- fall back to all enemies if filter didn't match anything
+    return (table_getn(filtered) > 0) and filtered or enemies
 end
 
-local function CollectUnitsFromBrains(brains, category, opts)
+
+local function AreaUnits(brain, enemies, position, radius, category)
+    if not position then return {} end
+    local list = brain:GetUnitsAroundPoint(category, position, radius, 'Enemy') or {}
+    if not enemies or table_getn(enemies) == 0 then
+        return list
+    end
+    local allow = {}
+    for _, enemy in ipairs(enemies) do
+        allow[enemy] = true
+    end
     local units = {}
-    for _, enemyBrain in ipairs(brains) do
-        local list = enemyBrain:GetListOfUnits(category, false, false) or {}
-        for _, unit in ipairs(list) do
-            if unit and not unit.Dead then
-                if opts.Underwater or not IsUnitUnderwater(unit) then
-                    table_insert(units, unit)
+    for _, unit in ipairs(list) do
+        if unit and not unit.Dead then
+            local ub = unit:GetAIBrain()
+            local idx = nil
+            local name = nil
+            if ub then
+                local ok, ai = pcall(ub.GetArmyIndex, ub)
+                if ok and ai then
+                    idx = ai
                 end
+                name = ub.Nickname
+            end
+            if (idx and allow[idx]) or (name and allow[name]) then
+                table_insert(units, unit)
             end
         end
     end
     return units
 end
 
-local function GetPlatoonPosition(platoon)
-    local pos = nil
-    if platoon and platoon.GetPlatoonPosition then
-        local ok, result = pcall(platoon.GetPlatoonPosition, platoon)
-        if ok then
-            pos = result
+local function FilterUnits(units, layer, submersible)
+    local out = {}
+    for _, unit in ipairs(units) do
+        if CanTargetUnit(layer, submersible, unit) then
+            table_insert(out, unit)
         end
     end
-    if not pos then
-        local units = platoon:GetPlatoonUnits() or {}
-        for _, unit in ipairs(units) do
-            if unit and not unit.Dead then
-                pos = unit:GetPosition()
-                break
-            end
-        end
-    end
-    return pos
+    return out
 end
 
-local function EnsureNavMesh(layer)
-    if not NavUtils or not NavUtils.IsGenerated then
-        return
-    end
-    local ok, generated = pcall(NavUtils.IsGenerated)
-    if ok and not generated and NavUtils.Generate then
-        pcall(NavUtils.Generate)
-    end
-end
-
-local function BuildPath(layer, start, goal, opts)
-    if not goal then
-        return nil
-    end
-    if not start then
-        return { CopyVector(goal) }
-    end
-    EnsureNavMesh(layer)
-    local path = nil
-    if opts.AvoidDef and NavUtils and NavUtils.PathToWithThreatThreshold then
-        local threatType = LayerThreatTypes[layer] or 'Overall'
-        local threatFunc = NavUtils.ThreatFunctions and NavUtils.ThreatFunctions[threatType]
-        if threatFunc then
-            local ok, safePath = pcall(NavUtils.PathToWithThreatThreshold, layer, start, goal, opts.Brain, threatFunc, opts.ThreatThreshold or 16, ThreatSampleRadius)
-            if ok and safePath and table_getn(safePath) > 0 then
-                path = safePath
-            end
-        end
-    end
-    if not path and NavUtils and NavUtils.PathTo then
-        local ok, straight = pcall(NavUtils.PathTo, layer, start, goal)
-        if ok and straight then
-            path = straight
-        end
-    end
-    if not path then
-        path = {}
-    end
-    if table_getn(path) == 0 then
-        table_insert(path, CopyVector(goal))
-    else
-        local final = path[table_getn(path)]
-        if not final or VDist2(final[1], final[3], goal[1], goal[3]) > 2 then
-            table_insert(path, CopyVector(goal))
-        end
-    end
-    return path
-end
-
-local function IssuePathOrders(platoon, path, formation, aggressiveFinal)
-    local units = platoon:GetPlatoonUnits() or {}
+local function ScoreStructureCluster(units, mode, distance)
     if table_getn(units) == 0 then
-        return false
+        return -math_huge
     end
-    IssueClearCommands(units)
-    local form = formation or 'GrowthFormation'
-    local useForm = (type(form) == 'string') and string.lower(form) ~= 'noformation'
-    for i = 1, table_getn(path) - 1 do
-        local waypoint = path[i]
-        if waypoint then
-            if useForm then
-                IssueFormMove(units, waypoint, form, 0)
+    if mode == 'closest' then
+        local dist = distance or 1
+        return -dist
+    elseif mode == 'value' then
+        local score = 0
+        for _, unit in ipairs(units) do
+            local bp = unit:GetBlueprint()
+            if bp and bp.Economy then
+                score = score + (bp.Economy.BuildCostMass or 1) + (bp.Economy.BuildCostEnergy or 0) * 0.002
             else
-                IssueMove(units, waypoint)
+                score = score + 1
             end
         end
-    end
-    local final = path[table_getn(path)]
-    if aggressiveFinal then
-        if useForm then
-            platoon:AggressiveMoveToLocation(final)
-        else
-            IssueAggressiveMove(units, final)
-        end
+        return score
     else
-        if useForm then
-            IssueFormMove(units, final, form, 0)
-        else
-            IssueMove(units, final)
-        end
+        return table_getn(units)
     end
-    return true
 end
 
-local function ShouldUseTransports(platoon, destination, opts)
-    if not opts.UseTransports or not destination then
-        return false
-    end
-    local origin = GetPlatoonPosition(platoon)
-    if not origin then
-        return true
-    end
-    if VDist3(origin, destination) > TransportDistance then
-        return true
-    end
-    if NavUtils and NavUtils.CanPathTo then
-        local layer = opts.Layer or 'Land'
-        local ok, can = pcall(NavUtils.CanPathTo, layer, origin, destination)
-        if ok and not can then
-            return true
-        end
-    end
-    return false
-end
-
-local function MoveWithTransports(platoon, destination)
-    local success = false
-    if ScenarioFramework and ScenarioFramework.PlatoonMoveWithTransports then
-        success = pcall(ScenarioFramework.PlatoonMoveWithTransports, platoon, destination, false)
-    end
-    if not success and ScenarioFramework and ScenarioFramework.PlatoonAttackWithTransports then
-        success = pcall(ScenarioFramework.PlatoonAttackWithTransports, platoon, destination, false)
-    end
-    return success
-end
-
-local function RoutePlatoon(platoon, destination, opts, aggressiveFinal)
-    if not PlatoonAlive(platoon) then
-        return false
-    end
-    destination = CopyVector(destination)
-    if not destination then
-        return false
-    end
-    local start = GetPlatoonPosition(platoon)
-    local path = BuildPath(opts.Layer or 'Land', start, destination, opts) or {}
-    if table_getn(path) == 0 then
-        return false
-    end
-    IssuePathOrders(platoon, path, opts.Formation, aggressiveFinal)
-    return true
-end
-
-local function AdvanceToDestination(platoon, destinationProvider, opts, aggressiveFinal)
-    local rerouteTimer = 0
-    local transported = false
-    while PlatoonAlive(platoon) do
-        local destination = destinationProvider()
-        if not destination then
-            return false
-        end
-        local pos = GetPlatoonPosition(platoon)
-        local arriveRadius = aggressiveFinal and 25 or 15
-        if pos and VDist3(pos, destination) <= arriveRadius then
-            return true
-        end
-        if rerouteTimer <= 0 then
-            local rerouted = false
-            if not transported and ShouldUseTransports(platoon, destination, opts) then
-                if MoveWithTransports(platoon, destination) then
-                    transported = true
-                    rerouteTimer = RecheckDelay
-                    rerouted = true
-                end
-            end
-            if not rerouted then
-                if RoutePlatoon(platoon, destination, opts, aggressiveFinal) then
-                    rerouteTimer = RecheckDelay
-                else
-                    rerouteTimer = 2
-                end
-            end
-        end
-        SafeWaitSeconds(1)
-        rerouteTimer = rerouteTimer - 1
-    end
-    return false
-end
-
-local function GetThreatAt(brain, position, threatType)
+local function SampleThreat(brain, position, threatType)
     if not brain or not position then
         return 0
     end
-    local ok, threat = pcall(brain.GetThreatAtPosition, brain, position, ThreatSampleRadius, true, threatType or 'Overall')
-    if ok and threat then
-        return threat
+    local ok, value = pcall(brain.GetThreatAtPosition, brain, position, ThreatSampleRing, true, threatType or 'AntiSurface')
+    if ok and value then
+        return value
     end
     return 0
 end
 
-local function DefenseScore(brain, position, opts)
-    local threatType = LayerThreatTypes[opts.Layer or 'Land'] or 'Overall'
-    local threat = GetThreatAt(brain, position, threatType)
-    if not opts.Underwater then
-        local surfaceThreat = GetThreatAt(brain, position, 'IndirectFire')
-        threat = threat + surfaceThreat * 0.5
+local function FindThreatLocations(brain, startPos, layer)
+    local results = {}
+    local ok, threats = pcall(brain.GetThreatsAroundPoint, brain, startPos, 16, true, 'Economy')
+    if not (ok and threats) then
+        return results
     end
-    return threat
+    for _, entry in ipairs(threats) do
+        local threat = entry[3] or entry[1]
+        local x = entry[1]
+        local z = entry[2]
+        if type(entry[1]) ~= 'number' or type(entry[2]) ~= 'number' then
+            x = entry[2]
+            z = entry[3]
+            threat = entry[1]
+        end
+        if threat and threat > 0 and type(x) == 'number' and type(z) == 'number' then
+            local pos = { x, GetSurfaceHeight(x, z), z }
+            table_insert(results, { pos = pos, threat = threat })
+        end
+    end
+    return results
 end
 
-local function ClusterPosition(units)
-    local count = table_getn(units)
-    if count == 0 then
-        return nil
+local function FloodFillLocations(brain, startPos)
+    local visited = {}
+    local queue = { startPos }
+    local results = {}
+    local size = ScenarioInfo and (ScenarioInfo.size or ScenarioInfo.MapSize) or { 512, 512 }
+    local function key(pos)
+        return string.format('%d:%d', math_floor(pos[1] / FloodFillCell), math_floor(pos[3] / FloodFillCell))
     end
-    local sx, sy, sz = 0, 0, 0
-    for _, unit in ipairs(units) do
-        local pos = unit:GetPosition()
-        sx = sx + pos[1]
-        sy = sy + pos[2]
-        sz = sz + pos[3]
-    end
-    return { sx / count, sy / count, sz / count }
-end
 
-local function FindStructureCluster(reference, structures)
-    if table_getn(structures) == 0 then
-        return nil, nil
-    end
-    local bestUnits = {}
-    local bestScore = -1
-    for _, anchor in ipairs(structures) do
-        local apos = anchor:GetPosition()
-        local cluster = {}
-        local score = 0
-        for _, candidate in ipairs(structures) do
-            local cpos = candidate:GetPosition()
-            if VDist2(apos[1], apos[3], cpos[1], cpos[3]) <= ClusterRadius then
-                table_insert(cluster, candidate)
-                score = score + 1
+    while table_getn(queue) > 0 do
+        local pos = table_remove(queue, 1)
+        local k = key(pos)
+        if not visited[k] then
+            visited[k] = true
+            table_insert(results, { pos = pos })
+            if Distance(startPos, pos) < FloodFillMaxRadius then
+                local offsets = {
+                    { FloodFillCell, 0, 0 },
+                    { -FloodFillCell, 0, 0 },
+                    { 0, 0, FloodFillCell },
+                    { 0, 0, -FloodFillCell },
+                }
+                for _, off in ipairs(offsets) do
+                    local nextPos = VectorAdd(pos, off)
+                    nextPos[1] = math_min(math_max(nextPos[1], 0), size[1])
+                    nextPos[3] = math_min(math_max(nextPos[3], 0), size[2])
+                    nextPos[2] = GetSurfaceHeight(nextPos[1], nextPos[3])
+                    table_insert(queue, nextPos)
+                end
             end
         end
-        if score > bestScore then
-            bestScore = score
-            bestUnits = cluster
-        end
     end
-    if bestScore <= 0 then
-        local single = structures[1]
-        return single, single:GetPosition()
-    end
-    return bestUnits[1], ClusterPosition(bestUnits)
+
+    return results
 end
 
-local function FindClosestStructure(reference, structures)
-    if table_getn(structures) == 0 then
-        return nil, nil
-    end
-    local best = nil
-    local bestDist = math_huge
-    for _, structure in ipairs(structures) do
-        local pos = structure:GetPosition()
-        local dist = VDist2(reference[1], reference[3], pos[1], pos[3])
-        if dist < bestDist then
-            best = structure
-            bestDist = dist
-        end
-    end
-    if not best then
-        return nil, nil
-    end
-    return best, best:GetPosition()
-end
-
-local function FilterAlive(units)
-    local index = 1
-    while index <= table_getn(units) do
-        local unit = units[index]
-        if not unit or unit.Dead then
-            table_remove(units, index)
-        else
-            index = index + 1
-        end
-    end
-    return units
-end
-
-local function PruneBrains(brainList)
-    local index = 1
-    while index <= table_getn(brainList) do
-        local enemyBrain = brainList[index]
-        if not enemyBrain or enemyBrain:IsDefeated() then
-            table_remove(brainList, index)
-        else
-            index = index + 1
-        end
-    end
-    return brainList
-end
-
-local function WaitForTargetDestruction(target, timeout)
-    timeout = timeout or 60
-    local elapsed = 0
-    while elapsed < timeout do
-        if not target or target.Dead then
-            return true
-        end
-        SafeWaitSeconds(1)
-        elapsed = elapsed + 1
-    end
-    return target.Dead
-end
-
-local function ClearTargetArea(platoon, position, opts)
-    if not PlatoonAlive(platoon) or not position then
-        return
-    end
-    local brain = platoon:GetBrain()
-    local units = platoon:GetPlatoonUnits() or {}
-    if table_getn(units) == 0 then
-        return
-    end
-    IssueAggressiveMove(units, position)
-    local tries = 0
-    while PlatoonAlive(platoon) and tries < 6 do
-        SafeWaitSeconds(5)
-        tries = tries + 1
-        if not brain then
-            break
-        end
-        local hostiles = brain:GetUnitsAroundPoint(StructureCategory, position, ClearRadius, 'Enemy') or {}
-        FilterAlive(hostiles)
-        if table_getn(hostiles) == 0 then
-            break
-        end
-    end
-end
-
-local function NormaliseOptions(platoon, data)
-    if not platoon then
+local function CollectCandidateAreas(brain, startPos, opts, layer)
+    if not startPos then
         return {}
     end
-
-    local source = data
-    if type(source) ~= 'table' then
-        source = platoon.PlatoonData
+    if opts.IntelOnly then
+        return FindThreatLocations(brain, startPos, layer)
+    else
+        return FloodFillLocations(brain, startPos)
     end
-    if type(source) ~= 'table' then
-        source = {}
-    end
-
-    local opts = {}
-    for k, v in pairs(source) do
-        opts[k] = v
-    end
-
-    opts.Formation = (type(opts.Formation) == 'string') and opts.Formation or nil
-    opts.Underwater = opts.Underwater and true or false
-    opts.UseTransports = opts.UseTransports and true or false
-    opts.AvoidDef = opts.AvoidDef and true or false
-    opts.TargetArmy = (type(opts.TargetArmy) == 'table') and opts.TargetArmy or nil
-    opts.Brain = platoon:GetBrain()
-    opts.Layer = DetermineLayer(platoon)
-    if not opts.Formation then
-        opts.Formation = LayerFormationDefault[opts.Layer] or 'GrowthFormation'
-    end
-
-    platoon.PlatoonData = opts
-    return opts
 end
 
-local function SelectRaidTarget(platoon, opts, enemyBrains)
-    local brain = platoon:GetBrain()
-    local basePriority = { opts.TargetType, 'ECO', 'FAB', 'ENG', 'DEF' }
-    local seen = {}
-    local priorities = {}
-    for _, entry in ipairs(basePriority) do
-        if entry and RaidCategories[entry] and not seen[entry] then
-            table_insert(priorities, entry)
-            seen[entry] = true
+local function DefenseThreatNear(brain, position, layer)
+    if not position then return 0 end
+    local threatType = (layer == 'Air') and 'AntiAir' or 'AntiSurface'
+    return SampleThreat(brain, position, threatType)
+end
+
+local function AdjustForAvoidance(brain, candidates, layer)
+    if not candidates then return candidates end
+    for _, c in ipairs(candidates) do
+        c.threat = (c.threat or 0) + DefenseThreatNear(brain, c.pos, layer)
+    end
+    table.sort(candidates, function(a, b)
+        local ta = a.threat or 0
+        local tb = b.threat or 0
+        if math_abs(ta - tb) < 0.001 then
+            return (a.pos[1] + a.pos[3]) < (b.pos[1] + b.pos[3])
         end
+        return ta < tb
+    end)
+    return candidates
+end
+
+local function ChooseBestArea(brain, platoon, opts, layer, areaRadius, mode, category)
+    local startPos = GetPlatoonPosition(platoon)
+    if not startPos then return nil end
+
+    local candidates = CollectCandidateAreas(brain, startPos, opts, layer)
+    if opts.AvoidDef then
+        AdjustForAvoidance(brain, candidates, layer)
     end
 
-    local function chooseFromCategory(categoryName)
-        local units = CollectUnitsFromBrains(enemyBrains, RaidCategories[categoryName], opts)
-        FilterAlive(units)
-        if table_getn(units) == 0 then
-            return nil
-        end
-        local best = nil
-        local bestThreat = math_huge
-        for _, unit in ipairs(units) do
-            local pos = unit:GetPosition()
-            local threat = DefenseScore(brain, pos, opts)
-            if threat < bestThreat then
-                bestThreat = threat
-                best = unit
-            end
-        end
-        return best
-    end
+    local enemies = BrainEnemies(brain, opts.TargetArmy)
+    local bestScore = -1e9
+    local best = nil
 
-    if opts.TargetType == 'SMT' then
-        local all = {}
-        for key, cat in pairs(RaidCategories) do
-            local units = CollectUnitsFromBrains(enemyBrains, cat, opts)
-            for _, unit in ipairs(units) do
-                table_insert(all, unit)
-            end
-        end
-        FilterAlive(all)
-        if table_getn(all) > 0 then
-            local best = nil
-            local bestThreat = math_huge
-            for _, unit in ipairs(all) do
-                local pos = unit:GetPosition()
-                local threat = DefenseScore(brain, pos, opts)
-                if threat < bestThreat then
-                    bestThreat = threat
-                    best = unit
+    for _, entry in ipairs(candidates) do
+        local pos = entry.pos
+        if pos then
+            local units = AreaUnits(brain, enemies, pos, areaRadius, category)
+            units = FilterUnits(units, layer, opts.Submersible)
+            if table_getn(units) > 0 then
+                local distance = Distance(startPos, pos)
+                local score = ScoreStructureCluster(units, mode, distance)
+                if opts.AvoidDef then
+                    score = score / (1 + DefenseThreatNear(brain, pos, layer) * AvoidThreatMultiplier)
+                end
+                if score > bestScore then
+                    bestScore = score
+                    best = {
+                        position = pos,
+                        units    = units,
+                        score    = score,
+                        radius   = areaRadius,
+                    }
                 end
             end
-            if best then
-                return best, best:GetPosition()
+        end
+    end
+
+    return best
+end
+
+local function FindRaidTarget(brain, platoon, opts, layer)
+    local startPos = GetPlatoonPosition(platoon)
+    if not startPos then return nil end
+
+    local priority = { opts.Category or 'ECO', 'ECO', 'BLD', 'INT', 'DEF' }
+    local considered = {}
+    local enemies = BrainEnemies(brain, opts.TargetArmy)
+
+    for _, id in ipairs(priority) do
+        if not considered[id] then
+            considered[id] = true
+            if id == 'SMT' then
+                local candidates = CollectCandidateAreas(brain, startPos, opts, layer)
+                if opts.AvoidDef then
+                    AdjustForAvoidance(brain, candidates, layer)
+                end
+                local bestScore = -1
+                local best
+                local labels = { 'ECO', 'BLD', 'INT', 'DEF' }
+                for _, entry in ipairs(candidates) do
+                    local pos = entry.pos
+                    if pos then
+                        local threat = DefenseThreatNear(brain, pos, layer)
+                        local localBestScore = -1
+                        local localBestCategory = nil
+                        local localUnits = nil
+                        for _, label in ipairs(labels) do
+                            local cat = RaidCategories[label]
+                            local units = AreaUnits(brain, enemies, pos, RaidAreaRadius, cat)
+                            units = FilterUnits(units, layer, opts.Submersible)
+                            local count = table_getn(units)
+                            if count > 0 then
+                                local score = count / math_max(1, threat + 1)
+                                if score > localBestScore then
+                                    localBestScore = score
+                                    localBestCategory = cat
+                                    localUnits = units
+                                end
+                            end
+                        end
+                        if localBestCategory and localBestScore > bestScore then
+                            bestScore = localBestScore
+                            best = {
+                                position = pos,
+                                units    = localUnits,
+                                radius   = RaidAreaRadius,
+                                category = localBestCategory,
+                            }
+                        end
+                    end
+                end
+                if best then
+                    return best
+                end
+            else
+                local category = RaidCategories[id]
+                if category then
+                    local candidates = CollectCandidateAreas(brain, startPos, opts, layer)
+                    if opts.AvoidDef then
+                        AdjustForAvoidance(brain, candidates, layer)
+                    end
+                    local bestScore = -1
+                    local best
+                    for _, entry in ipairs(candidates) do
+                        local pos = entry.pos
+                        if pos then
+                            local units = AreaUnits(brain, enemies, pos, RaidAreaRadius, category)
+                            units = FilterUnits(units, layer, opts.Submersible)
+                            if table_getn(units) > 0 then
+                                local threatPenalty = opts.AvoidDef and (1 + DefenseThreatNear(brain, pos, layer) * AvoidThreatMultiplier) or 1
+                                local score = table_getn(units) / threatPenalty
+                                if score > bestScore then
+                                    bestScore = score
+                                    best = {
+                                        position = pos,
+                                        units    = units,
+                                        radius   = RaidAreaRadius,
+                                        category = category,
+                                    }
+                                end
+                            end
+                        end
+                    end
+                    if best then
+                        return best
+                    end
+                end
             end
         end
     end
 
-    for _, categoryName in ipairs(priorities) do
-        local target = chooseFromCategory(categoryName)
-        if target then
-            return target, target:GetPosition()
-        end
-    end
-
-    return nil, nil
+    return nil
 end
 
-local function SelectWaveTarget(platoon, opts, enemyBrains)
-    local structures = CollectUnitsFromBrains(enemyBrains, StructureCategory, opts)
-    FilterAlive(structures)
-    if table_getn(structures) == 0 then
-        return nil, nil
+local function AmphibiousSurfaceHeight(layer, x, z)
+    if layer == 'Water' then
+        return GetSurfaceHeight(x, z)
     end
-    local position = GetPlatoonPosition(platoon)
-    if not position then
-        return nil, nil
-    end
-    if opts.TargetType == 'concentration' then
-        local unit, targetPos = FindStructureCluster(position, structures)
-        return unit, targetPos
-    else
-        local unit, targetPos = FindClosestStructure(position, structures)
-        return unit, targetPos
-    end
+    return GetTerrainHeight(x, z)
 end
 
-local function AttackTarget(platoon, target, position, opts, aggressive)
-    if not PlatoonAlive(platoon) or not position then
+local function CanPathTo(platoon, layer, destination)
+    local startPos = GetPlatoonPosition(platoon)
+    if not (startPos and destination) then
         return false
     end
-    local lastPos = CopyVector(position)
-    local function destinationProvider()
-        if target and not target.Dead then
-            local tpos = target:GetPosition()
-            if tpos then
-                lastPos = tpos
-            end
-        end
-        return lastPos
-    end
-    local arrived = AdvanceToDestination(platoon, destinationProvider, opts, aggressive)
-    if not arrived then
+    local ok, can = pcall(NavUtils.CanPathTo, layer, startPos, destination)
+    if not ok then
         return false
     end
+    return can
+end
+
+local function FindSafePath(platoon, layer, destination)
+    local startPos = GetPlatoonPosition(platoon)
+    if not (startPos and destination) then
+        return nil
+    end
+
+    local ok, path = pcall(NavUtils.PathTo, layer, startPos, destination)
+    if ok and path then
+        return path
+    end
+
+    return { destination }
+end
+
+local function RequestTransports(brain, platoon, destination)
     local units = platoon:GetPlatoonUnits() or {}
     if table_getn(units) == 0 then
         return false
     end
-    if aggressive then
-        IssueAggressiveMove(units, lastPos)
+
+    local ok, transports = pcall(ScenarioFramework.UseTransports, units, brain, destination)
+    if ok and transports then
+        return true
+    end
+
+    return false
+end
+
+local function MoveAlongPath(platoon, path, formation)
+    if not (path and table_getn(path) > 0) then
+        return
+    end
+
+    local units = platoon:GetPlatoonUnits() or {}
+    if table_getn(units) == 0 then
+        return
+    end
+
+    if formation ~= 'NoFormation' then
+        platoon:SetPlatoonFormationOverride(formation)
     else
-        IssueClearCommands(units)
-        if target and not target.Dead then
-            IssueAttack(units, target)
-        else
-            IssueMove(units, lastPos)
-        end
+        platoon:SetPlatoonFormationOverride('NoFormation')
     end
-    return true
+
+    IssueClearCommands(units)
+    for _, waypoint in ipairs(path) do
+        IssueFormMove(units, waypoint, formation, 0)
+    end
 end
 
-local function WaveBehaviour(platoon, opts)
+local function TransportAndMove(platoon, destination, opts)
     local brain = platoon:GetBrain()
-    if not brain then
-        return
+    if not brain then return false end
+    if not opts.Transport then
+        return false
     end
-    local enemyBrains = ResolveTargetBrains(brain, opts)
-    while PlatoonAlive(platoon) do
-        PruneBrains(enemyBrains)
-        if table_getn(enemyBrains) == 0 then
-            enemyBrains = ResolveTargetBrains(brain, opts)
+
+    local startPos = GetPlatoonPosition(platoon)
+    if not startPos then return false end
+
+    local drop = CopyVector(destination)
+    if drop then
+        local size = ScenarioInfo and (ScenarioInfo.size or ScenarioInfo.MapSize) or { 512, 512 }
+        drop[1] = math_min(math_max(drop[1] - TransportStagingOffset, 0), size[1])
+        drop[3] = math_min(math_max(drop[3] - TransportStagingOffset, 0), size[2])
+    else
+        drop = startPos
+    end
+
+    local loaded = RequestTransports(brain, platoon, drop)
+    if loaded then
+        SafeWait(1)
+        return true
+    end
+
+    return false
+end
+
+local function AttackTargetArea(platoon, target, opts)
+    local brain = platoon:GetBrain()
+    if not brain or not target or not target.position then
+        return 'fail'
+    end
+
+    local layer = DetermineLayer(platoon, opts.Amphibious)
+    if not CanPathTo(platoon, layer, target.position) then
+        if opts.Transport then
+            if not TransportAndMove(platoon, target.position, opts) then
+                return 'fail'
+            end
+        else
+            return 'fail'
         end
-        local target, position = SelectWaveTarget(platoon, opts, enemyBrains)
-        if target and position then
-            local lastPos = CopyVector(position)
-            local function provider()
-                if target and not target.Dead then
-                    local tpos = target:GetPosition()
-                    if tpos then
-                        lastPos = tpos
-                    end
+    end
+
+    local path = FindSafePath(platoon, layer, target.position)
+    MoveAlongPath(platoon, path, opts.Formation)
+
+    local arrived = false
+    local units = platoon:GetPlatoonUnits() or {}
+    local elapsed = 0
+    while PlatoonAlive(platoon) do
+        local pos = GetPlatoonPosition(platoon)
+        if not pos then break end
+        if DistanceSq(pos, target.position) < (target.radius * target.radius) then
+            arrived = true
+            break
+        end
+        SafeWait(1)
+        elapsed = elapsed + 1
+        if elapsed >= RecheckDelay then
+            return 'repath'
+        end
+    end
+
+    if not arrived then
+        return 'fail'
+    end
+
+    units = platoon:GetPlatoonUnits() or {}
+    if table_getn(units) == 0 then
+        return 'fail'
+    end
+
+    IssueClearCommands(units)
+    IssueAggressiveMove(units, target.position)
+
+    while PlatoonAlive(platoon) do
+        local category = target.category or StructureCategory
+        local remaining = AreaUnits(brain, BrainEnemies(brain, opts.TargetArmy), target.position, target.radius + AreaClearRadius, category)
+        remaining = FilterUnits(remaining, layer, opts.Submersible)
+        if table_getn(remaining) == 0 then
+            break
+        end
+        SafeWait(3)
+    end
+
+    return 'success'
+end
+
+local function WaitForTargets(brain, delay)
+    SafeWait(delay or RecheckDelay)
+end
+
+local function AttackLoop(platoon, resolver, opts)
+    local brain = platoon:GetBrain()
+    if not brain then return end
+    local layer = DetermineLayer(platoon, opts.Amphibious)
+
+    local currentTarget = nil
+
+    while PlatoonAlive(platoon) do
+        if not currentTarget then
+            currentTarget = resolver(brain, platoon, opts, layer)
+            if not currentTarget then
+                WaitForTargets(brain, RecheckDelay)
+            end
+        end
+
+        if currentTarget then
+            local result = AttackTargetArea(platoon, currentTarget, opts)
+            if result == 'success' then
+                currentTarget = nil
+                SafeWait(1)
+            elseif result == 'repath' then
+                local newTarget = resolver(brain, platoon, opts, layer)
+                if newTarget then
+                    currentTarget = newTarget
+                else
+                    currentTarget = nil
+                    WaitForTargets(brain, RecheckDelay)
                 end
-                return lastPos
-            end
-            if AdvanceToDestination(platoon, provider, opts, false) then
-                ClearTargetArea(platoon, lastPos, opts)
             else
-                SafeWaitSeconds(RecheckDelay)
+                currentTarget = nil
+                SafeWait(RecheckDelay)
             end
-        else
-            SafeWaitSeconds(RecheckDelay)
         end
     end
 end
 
-local function RaidBehaviour(platoon, opts)
-    local brain = platoon:GetBrain()
-    if not brain then
-        return
+local function RandomPoint()
+    if not ScenarioInfo then
+        return { 0, 0, 0 }
     end
-    local enemyBrains = ResolveTargetBrains(brain, opts)
-    while PlatoonAlive(platoon) do
-        PruneBrains(enemyBrains)
-        if table_getn(enemyBrains) == 0 then
-            enemyBrains = ResolveTargetBrains(brain, opts)
-        end
-        local target, position = SelectRaidTarget(platoon, opts, enemyBrains)
-        if target and position then
-            local units = platoon:GetPlatoonUnits()
-            if units and table_getn(units) > 0 then
-                IssueClearCommands(units)
-            end
-            if AttackTarget(platoon, target, position, opts, false) then
-                WaitForTargetDestruction(target, 45)
-            else
-                SafeWaitSeconds(RecheckDelay)
-            end
+    local size = ScenarioInfo.size or ScenarioInfo.MapSize or { 512, 512 }
+    local x = math_random(0, size[1])
+    local z = math_random(0, size[2])
+    local y = GetSurfaceHeight(x, z)
+    return { x, y, z }
+end
+
+local function HottestColdestPosition(brain, hottest)
+    if not ScenarioInfo then
+        return RandomPoint()
+    end
+    local size = ScenarioInfo.size or ScenarioInfo.MapSize or { 512, 512 }
+    local start = { size[1] * 0.5, 0, size[2] * 0.5 }
+    start[2] = GetSurfaceHeight(start[1], start[3])
+    local list = FindThreatLocations(brain, start, 'Air')
+    if table_getn(list) == 0 then
+        return RandomPoint()
+    end
+    table.sort(list, function(a, b)
+        if hottest then
+            return (a.threat or 0) > (b.threat or 0)
         else
-            SafeWaitSeconds(RecheckDelay)
+            return (a.threat or 0) < (b.threat or 0)
         end
+    end)
+    return CopyVector(list[1].pos)
+end
+
+local function SelectScoutDestination(brain, opts)
+    local roll = math_random()
+    if opts.IntelOnly and roll < HotColdChance then
+        return HottestColdestPosition(brain, true)
+    elseif opts.IntelOnly and roll < HotColdChance * 2 then
+        return HottestColdestPosition(brain, false)
+    else
+        return RandomPoint()
     end
 end
 
---=======================Expose==================
+local function AssignScoutOrder(unit, destination)
+    if not unit or unit.Dead then return end
+    IssueClearCommands({ unit })
+    IssueMove({ unit }, destination)
+end
+
+local function OrbitUnit(unit, center)
+    if not unit or unit.Dead then return end
+    local points = 6
+    local radius = 30
+    for i = 1, points do
+        local angle = (i / points) * 6.28318
+        local x = center[1] + math_cos(angle) * radius
+        local z = center[3] + math_sin(angle) * radius
+        local y = GetSurfaceHeight(x, z)
+        IssueMove({ unit }, { x, y, z })
+    end
+end
 
 function WaveAttack(platoon, data)
-    local opts = NormaliseOptions(platoon, data)
-    if not opts.Brain then
-        return
+    local opts = CopyOptions(data)
+    opts.Type = opts.Type or opts.TargetType or 'closest'
+    local function resolver(brain, p, o, layer)
+        return ChooseBestArea(brain, p, o, layer, WaveAreaRadius, opts.Type, StructureCategory)
     end
-    WaveBehaviour(platoon, opts)
+    AttackLoop(platoon, resolver, opts)
 end
 
 function RaidAttack(platoon, data)
-    local opts = NormaliseOptions(platoon, data)
-    if not opts.Brain then
-        return
+    local opts = CopyOptions(data)
+    opts.Category = opts.Category or opts.TargetType or 'ECO'
+    local function resolver(brain, p, o, layer)
+        return FindRaidTarget(brain, p, o, layer)
     end
-    RaidBehaviour(platoon, opts)
+    AttackLoop(platoon, resolver, opts)
+end
+
+function ScoutAttack(platoon, data)
+    local opts = CopyOptions(data)
+    local brain = platoon:GetBrain()
+    if not brain then return end
+    local units = platoon:GetPlatoonUnits() or {}
+    if table_getn(units) == 0 then return end
+
+    local state = {}
+    for _, unit in ipairs(units) do
+        state[unit.EntityId] = { destination = SelectScoutDestination(brain, opts), orbiting = false, orbitTime = 0 }
+        AssignScoutOrder(unit, state[unit.EntityId].destination)
+    end
+
+    while PlatoonAlive(platoon) do
+        SafeWait(RecheckDelay)
+        units = platoon:GetPlatoonUnits() or {}
+        if table_getn(units) == 0 then break end
+        for _, unit in ipairs(units) do
+            if unit and not unit.Dead then
+                local info = state[unit.EntityId]
+                if not info then
+                    info = { destination = SelectScoutDestination(brain, opts), orbiting = false, orbitTime = 0 }
+                    state[unit.EntityId] = info
+                    AssignScoutOrder(unit, info.destination)
+                end
+                if info.orbiting then
+                    info.orbitTime = info.orbitTime - RecheckDelay
+                    if info.orbitTime <= 0 then
+                        info.orbiting = false
+                        info.destination = SelectScoutDestination(brain, opts)
+                        AssignScoutOrder(unit, info.destination)
+                    end
+                end
+                local pos = unit:GetPosition()
+                local dest = info.destination
+                if dest and pos and DistanceSq(pos, dest) < 400 then
+                    if not info.orbiting and math_random() < OrbitChance then
+                        info.orbiting = true
+                        info.orbitTime = math_random(10, MaxScoutOrbitTime)
+                        OrbitUnit(unit, dest)
+                    elseif not info.orbiting then
+                        info.destination = SelectScoutDestination(brain, opts)
+                        AssignScoutOrder(unit, info.destination)
+                    end
+                end
+            end
+        end
+    end
 end
 
 return {
     WaveAttack = WaveAttack,
     RaidAttack = RaidAttack,
+    ScoutAttack = ScoutAttack,
 }
