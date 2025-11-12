@@ -339,6 +339,27 @@ local function AreaUnits(brain, enemies, position, radius, category)
     return units
 end
 
+local function CanTargetUnit(layer, submersible, unit)
+    if not unit or unit.Dead then
+        return false
+    end
+
+    if not submersible and EntityCategoryContains(SubmersibleCat, unit) then
+        return false
+    end
+
+    if layer == 'Water' then
+        return EntityCategoryContains(categories.NAVAL + NavalStructure, unit)
+    elseif layer == 'Amphibious' then
+        return true
+    elseif layer == 'Air' then
+        return true
+    end
+
+    -- default to land movement layer
+    return not EntityCategoryContains(categories.NAVAL + NavalStructure, unit)
+end
+
 local function FilterUnits(units, layer, submersible)
     local out = {}
     for _, unit in ipairs(units) do
