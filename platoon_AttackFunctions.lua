@@ -132,6 +132,7 @@ local FloodFillCell          = 32
 local FloodFillMaxRadius     = 512
 local ThreatSampleRing       = 32
 local AvoidThreatMultiplier  = 1.5
+local PlayableIngressTimeout = 30
 
 local StructureCategory = categories.STRUCTURE - categories.WALL
 local NavalStructure    = categories.STRUCTURE * categories.NAVAL
@@ -260,6 +261,99 @@ local function GetPlatoonPosition(platoon)
         end
     end
     return nil
+end
+
+local function GetPlayableArea()
+    if not ScenarioInfo then
+        return nil
+    end
+
+    if ScenarioInfo.PlayableArea then
+        return ScenarioInfo.PlayableArea
+    end
+
+    local size = ScenarioInfo.size or ScenarioInfo.MapSize
+    if size then
+        return { 0, 0, size[1], size[2] }
+    end
+
+    return nil
+end
+
+local function PositionInPlayableArea(position, area)
+    if not (position and area) then
+        return true
+    end
+
+    return position[1] >= area[1]
+        and position[1] <= area[3]
+        and position[3] >= area[2]
+        and position[3] <= area[4]
+end
+
+local function ClampToPlayableArea(position, area)
+    if not (position and area) then
+        return position
+    end
+
+    local x = math_min(math_max(position[1], area[1]), area[3])
+    local z = math_min(math_max(position[3], area[2]), area[4])
+    local y = GetSurfaceHeight(x, z)
+
+    return { x, y, z }
+end
+
+local function Midpoint(a, b)
+    return { (a[1] + b[1]) * 0.5, 0, (a[3] + b[3]) * 0.5 }
+end
+
+local function SurfacePoint(vec)
+    if not vec then return nil end
+    local x = vec[1]
+    local z = vec[3]
+    return { x, GetSurfaceHeight(x, z), z }
+end
+
+local function SegmentPlayableIngress(outside, inside, area)
+    if not (outside and inside and area) then
+        return nil
+    end
+
+    -- Binary search along the segment until we find a point just inside the playable area
+    local entry = CopyVector(inside)
+    local exit = CopyVector(outside)
+
+    for _ = 1, 12 do
+        local mid = Midpoint(entry, exit)
+        if PositionInPlayableArea(mid, area) then
+            entry = mid
+        else
+            exit = mid
+        end
+    end
+
+    return SurfacePoint(entry)
+end
+
+local function NearestPlayablePointOnPath(startPos, path, area)
+    if PositionInPlayableArea(startPos, area) then
+        return SurfacePoint(startPos)
+    end
+
+    if not (path and table_getn(path) > 0) then
+        return ClampToPlayableArea(startPos, area)
+    end
+
+    local previous = startPos
+    for _, waypoint in ipairs(path) do
+        if PositionInPlayableArea(waypoint, area) then
+            return SegmentPlayableIngress(previous, waypoint, area) or SurfacePoint(waypoint)
+        end
+        previous = waypoint
+    end
+
+    -- If no point on the path is inside, fall back to clamping the final waypoint
+    return ClampToPlayableArea(path[table_getn(path)], area)
 end
 
 local function BrainEnemies(brain, targetArmy)
@@ -649,17 +743,6 @@ local function CanPathTo(platoon, layer, destination)
     return can
 end
 
-local function FindSafePath(platoon, layer, destination)
-    local startPos = GetPlatoonPosition(platoon)
-    if not (startPos and destination) then return nil end
-
-    local ok, path = pcall(NavUtils.PathTo, layer, startPos, destination)
-    if ok and path then
-        return AppendDestination(path, destination)
-    end
-    return { CopyVector(destination) }
-end
-
 local function AppendDestination(path, destination)
     path = path or {}
     if not destination then return path end
@@ -673,6 +756,17 @@ local function AppendDestination(path, destination)
         table_insert(path, CopyVector(destination))
     end
     return path
+end
+
+local function FindSafePath(platoon, layer, destination)
+    local startPos = GetPlatoonPosition(platoon)
+    if not (startPos and destination) then return nil end
+
+    local ok, path = pcall(NavUtils.PathTo, layer, startPos, destination)
+    if ok and path then
+        return AppendDestination(path, destination)
+    end
+    return { CopyVector(destination) }
 end
 
 local function RequestTransports(brain, platoon, destination)
@@ -714,6 +808,42 @@ local function MoveAlongPath(platoon, path, formation)
     end
 end
 
+local function EnsurePlatoonInPlayableArea(platoon, path, formation)
+    local area = GetPlayableArea()
+    if not area then
+        return true
+    end
+
+    local pos = GetPlatoonPosition(platoon)
+    if not pos then
+        return false
+    end
+
+    if PositionInPlayableArea(pos, area) then
+        return true
+    end
+
+    local target = NearestPlayablePointOnPath(pos, path, area)
+    MoveAlongPath(platoon, { target }, formation or 'GrowthFormation')
+
+    local elapsed = 0
+    while PlatoonAlive(platoon) do
+        SafeWait(1)
+        elapsed = elapsed + 1
+
+        pos = GetPlatoonPosition(platoon)
+        if pos and PositionInPlayableArea(pos, area) then
+            return true
+        end
+
+        if elapsed >= PlayableIngressTimeout then
+            break
+        end
+    end
+
+    return false
+end
+
 local function TransportAndMove(platoon, destination, opts)
     local brain = platoon:GetBrain()
     if not brain then return false end
@@ -749,6 +879,12 @@ local function AttackTargetArea(platoon, target, opts)
     end
 
     local layer = DetermineLayer(platoon, opts.Amphibious)
+    local plannedPath = FindSafePath(platoon, layer, target.position)
+
+    if not EnsurePlatoonInPlayableArea(platoon, plannedPath, opts.Formation) then
+        return 'fail'
+    end
+
     if not CanPathTo(platoon, layer, target.position) then
         if opts.Transport then
             if not TransportAndMove(platoon, target.position, opts) then
