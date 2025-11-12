@@ -651,16 +651,28 @@ end
 
 local function FindSafePath(platoon, layer, destination)
     local startPos = GetPlatoonPosition(platoon)
-    if not (startPos and destination) then
-        return nil
-    end
+    if not (startPos and destination) then return nil end
 
     local ok, path = pcall(NavUtils.PathTo, layer, startPos, destination)
     if ok and path then
+        return AppendDestination(path, destination)
+    end
+    return { CopyVector(destination) }
+end
+
+local function AppendDestination(path, destination)
+    path = path or {}
+    if not destination then return path end
+    local function close(a, b) return DistanceSq(a, b) < 4 end -- ~2 units
+    if table.getn(path) == 0 then
+        table_insert(path, CopyVector(destination))
         return path
     end
-
-    return { destination }
+    local last = path[table_getn(path)]
+    if not close(last, destination) then
+        table_insert(path, CopyVector(destination))
+    end
+    return path
 end
 
 local function RequestTransports(brain, platoon, destination)
@@ -678,14 +690,10 @@ local function RequestTransports(brain, platoon, destination)
 end
 
 local function MoveAlongPath(platoon, path, formation)
-    if not (path and table_getn(path) > 0) then
-        return
-    end
+    if not (path and table_getn(path) > 0) then return end
 
     local units = platoon:GetPlatoonUnits() or {}
-    if table_getn(units) == 0 then
-        return
-    end
+    if table_getn(units) == 0 then return end
 
     if formation ~= 'NoFormation' then
         platoon:SetPlatoonFormationOverride(formation)
@@ -694,8 +702,15 @@ local function MoveAlongPath(platoon, path, formation)
     end
 
     IssueClearCommands(units)
-    for _, waypoint in ipairs(path) do
-        IssueFormMove(units, waypoint, formation, 0)
+
+    if formation == 'NoFormation' then
+        for _, waypoint in ipairs(path) do
+            IssueMove(units, waypoint)
+        end
+    else
+        for _, waypoint in ipairs(path) do
+            IssueFormMove(units, waypoint, formation, 0)
+        end
     end
 end
 
@@ -748,12 +763,13 @@ local function AttackTargetArea(platoon, target, opts)
     MoveAlongPath(platoon, path, opts.Formation)
 
     local arrived = false
+    local epsilon = 5
     local units = platoon:GetPlatoonUnits() or {}
     local elapsed = 0
     while PlatoonAlive(platoon) do
         local pos = GetPlatoonPosition(platoon)
         if not pos then break end
-        if DistanceSq(pos, target.position) < (target.radius * target.radius) then
+        if DistanceSq(pos, target.position) < ((target.radius + epsilon) * (target.radius + epsilon)) then
             arrived = true
             break
         end
