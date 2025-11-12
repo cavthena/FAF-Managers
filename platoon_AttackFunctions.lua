@@ -199,6 +199,32 @@ local function Distance(a, b)
     return math_sqrt(DistanceSq(a, b))
 end
 
+local function PrependWaypoint(path, waypoint)
+    if not waypoint then
+        return path
+    end
+
+    path = path or {}
+    local count = table_getn(path)
+
+    if count == 0 then
+        table_insert(path, CopyVector(waypoint))
+        return path
+    end
+
+    local first = path[1]
+    if not first then
+        table_insert(path, 1, CopyVector(waypoint))
+        return path
+    end
+
+    if DistanceSq(first, waypoint) > 1 then
+        table_insert(path, 1, CopyVector(waypoint))
+    end
+
+    return path
+end
+
 local function DetermineLayer(platoon, amphibious)
     if amphibious then
         return 'Amphibious'
@@ -808,35 +834,23 @@ local function MoveAlongPath(platoon, path, formation)
     end
 end
 
-local function EnsurePlatoonInPlayableArea(platoon, path, formation)
-    local area = GetPlayableArea()
+local function WaitForPlayableIngress(platoon, area, timeout)
+    area = area or GetPlayableArea()
     if not area then
         return true
     end
-
-    local pos = GetPlatoonPosition(platoon)
-    if not pos then
-        return false
-    end
-
-    if PositionInPlayableArea(pos, area) then
-        return true
-    end
-
-    local target = NearestPlayablePointOnPath(pos, path, area)
-    MoveAlongPath(platoon, { target }, formation or 'GrowthFormation')
 
     local elapsed = 0
     while PlatoonAlive(platoon) do
         SafeWait(1)
         elapsed = elapsed + 1
 
-        pos = GetPlatoonPosition(platoon)
+        local pos = GetPlatoonPosition(platoon)
         if pos and PositionInPlayableArea(pos, area) then
             return true
         end
 
-        if elapsed >= PlayableIngressTimeout then
+        if timeout and elapsed >= timeout then
             break
         end
     end
@@ -879,10 +893,20 @@ local function AttackTargetArea(platoon, target, opts)
     end
 
     local layer = DetermineLayer(platoon, opts.Amphibious)
-    local plannedPath = FindSafePath(platoon, layer, target.position)
-
-    if not EnsurePlatoonInPlayableArea(platoon, plannedPath, opts.Formation) then
+    local area = GetPlayableArea()
+    local startPos = GetPlatoonPosition(platoon)
+    if not startPos then
         return 'fail'
+    end
+
+    local startedOutside = area and not PositionInPlayableArea(startPos, area)
+
+    local path = FindSafePath(platoon, layer, target.position)
+    if startedOutside then
+        local ingress = NearestPlayablePointOnPath(startPos, path, area)
+        if ingress then
+            path = PrependWaypoint(path, ingress)
+        end
     end
 
     if not CanPathTo(platoon, layer, target.position) then
@@ -895,8 +919,13 @@ local function AttackTargetArea(platoon, target, opts)
         end
     end
 
-    local path = FindSafePath(platoon, layer, target.position)
     MoveAlongPath(platoon, path, opts.Formation)
+
+    if startedOutside then
+        if not WaitForPlayableIngress(platoon, area, PlayableIngressTimeout * 2) then
+            return 'fail'
+        end
+    end
 
     local arrived = false
     local epsilon = 5
@@ -928,14 +957,77 @@ local function AttackTargetArea(platoon, target, opts)
     IssueClearCommands(units)
     IssueAggressiveMove(units, target.position)
 
-    while PlatoonAlive(platoon) do
-        local category = target.category or StructureCategory
-        local remaining = AreaUnits(brain, BrainEnemies(brain, opts.TargetArmy), target.position, target.radius + AreaClearRadius, category)
-        remaining = FilterUnits(remaining, layer, opts.Submersible)
-        if table_getn(remaining) == 0 then
-            break
+    local issuedTargets = {}
+    local enemyBrains = BrainEnemies(brain, opts.TargetArmy)
+    local function UpdateStructureAttacks()
+        units = platoon:GetPlatoonUnits() or {}
+        if table_getn(units) == 0 then
+            return 'fail'
         end
+
+        local category = target.category or StructureCategory
+        local combined = {}
+        if target.units then
+            for _, structure in ipairs(target.units) do
+                table_insert(combined, structure)
+            end
+        end
+
+        local radius = (target.radius or 0) + AreaClearRadius
+        local areaUnits = AreaUnits(brain, enemyBrains, target.position, radius, category) or {}
+        for _, structure in ipairs(areaUnits) do
+            table_insert(combined, structure)
+        end
+
+        combined = FilterUnits(combined, layer, opts.Submersible)
+
+        local unique = {}
+        local remaining = {}
+        for _, structure in ipairs(combined) do
+            if structure and not structure.Dead then
+                local id = structure.EntityId
+                if id and not unique[id] then
+                    unique[id] = true
+                    table_insert(remaining, structure)
+                end
+            end
+        end
+
+        if table_getn(remaining) == 0 then
+            return 'success'
+        end
+
+        local newTargets = {}
+        for _, structure in ipairs(remaining) do
+            local id = structure.EntityId
+            if id and not issuedTargets[id] then
+                issuedTargets[id] = true
+                table_insert(newTargets, structure)
+            end
+        end
+
+        if table_getn(newTargets) > 0 then
+            for _, structure in ipairs(newTargets) do
+                if structure and not structure.Dead then
+                    IssueAttack(units, structure)
+                end
+            end
+        end
+
+        return 'continue'
+    end
+
+    local attackState = UpdateStructureAttacks()
+    if attackState == 'fail' then
+        return 'fail'
+    end
+
+    while PlatoonAlive(platoon) and attackState ~= 'success' do
         SafeWait(3)
+        attackState = UpdateStructureAttacks()
+        if attackState == 'fail' then
+            return 'fail'
+        end
     end
 
     return 'success'
