@@ -120,19 +120,20 @@ local math_cos      = math.cos
 local math_sin      = math.sin
 local math_huge     = math.huge
 
-local RecheckDelay           = 10
-local WaveAreaRadius         = 50
-local RaidAreaRadius         = 25
-local AreaClearRadius        = 35
-local TransportStagingOffset = 28
-local OrbitChance            = 0.10
-local HotColdChance          = 0.25
-local MaxScoutOrbitTime      = 120
-local FloodFillCell          = 32
-local FloodFillMaxRadius     = 512
-local ThreatSampleRing       = 32
-local AvoidThreatMultiplier  = 1.5
-local PlayableIngressTimeout = 30
+local RecheckDelay            = 10
+local WaveAreaRadius          = 50
+local RaidAreaRadius          = 25
+local AreaClearRadius         = 35
+local TransportStagingOffset  = 28
+local OrbitChance             = 0.10
+local HotColdChance           = 0.25
+local MaxScoutOrbitTime       = 120
+local FloodFillCell           = 32
+local FloodFillMaxRadius      = 512
+local ThreatSampleRing        = 32
+local AvoidThreatMultiplier   = 1.5
+local PlayableIngressTimeout  = 60
+local PlayableIngressBuffer   = 10
 
 local StructureCategory = categories.STRUCTURE - categories.WALL
 local NavalStructure    = categories.STRUCTURE * categories.NAVAL
@@ -317,13 +318,29 @@ local function PositionInPlayableArea(position, area)
         and position[3] <= area[4]
 end
 
-local function ClampToPlayableArea(position, area)
+local function ClampToPlayableArea(position, area, buffer)
     if not (position and area) then
         return position
     end
 
-    local x = math_min(math_max(position[1], area[1]), area[3])
-    local z = math_min(math_max(position[3], area[2]), area[4])
+    buffer = buffer or 0
+    local minX = area[1] + buffer
+    local maxX = area[3] - buffer
+    if minX > maxX then
+        local mid = (area[1] + area[3]) * 0.5
+        minX = mid
+        maxX = mid
+    end
+    local minZ = area[2] + buffer
+    local maxZ = area[4] - buffer
+    if minZ > maxZ then
+        local mid = (area[2] + area[4]) * 0.5
+        minZ = mid
+        maxZ = mid
+    end
+
+    local x = math_min(math_max(position[1], minX), maxX)
+    local z = math_min(math_max(position[3], minZ), maxZ)
     local y = GetSurfaceHeight(x, z)
 
     return { x, y, z }
@@ -358,7 +375,25 @@ local function SegmentPlayableIngress(outside, inside, area)
         end
     end
 
-    return SurfacePoint(entry)
+    local entryPoint = SurfacePoint(entry)
+    if not entryPoint then
+        return nil
+    end
+
+    if PlayableIngressBuffer > 0 then
+        local dirX = entry[1] - exit[1]
+        local dirZ = entry[3] - exit[3]
+        local len = math_sqrt(dirX * dirX + dirZ * dirZ)
+        if len > 0 then
+            local scale = PlayableIngressBuffer / len
+            entryPoint[1] = entryPoint[1] + dirX * scale
+            entryPoint[3] = entryPoint[3] + dirZ * scale
+            entryPoint[2] = GetSurfaceHeight(entryPoint[1], entryPoint[3])
+        end
+        entryPoint = ClampToPlayableArea(entryPoint, area, PlayableIngressBuffer)
+    end
+
+    return entryPoint
 end
 
 local function NearestPlayablePointOnPath(startPos, path, area)
@@ -367,7 +402,7 @@ local function NearestPlayablePointOnPath(startPos, path, area)
     end
 
     if not (path and table_getn(path) > 0) then
-        return ClampToPlayableArea(startPos, area)
+        return ClampToPlayableArea(startPos, area, PlayableIngressBuffer)
     end
 
     local previous = startPos
@@ -379,7 +414,7 @@ local function NearestPlayablePointOnPath(startPos, path, area)
     end
 
     -- If no point on the path is inside, fall back to clamping the final waypoint
-    return ClampToPlayableArea(path[table_getn(path)], area)
+    return ClampToPlayableArea(path[table_getn(path)], area, PlayableIngressBuffer)
 end
 
 local function BrainEnemies(brain, targetArmy)
@@ -600,6 +635,53 @@ local function DefenseThreatNear(brain, position, layer)
     return SampleThreat(brain, position, threatType)
 end
 
+local function LeastDefendedStructures(brain, layer, structures)
+    if not (brain and layer and structures) then
+        return {}
+    end
+
+    local scored = {}
+    local minThreat = math_huge
+
+    for _, structure in ipairs(structures) do
+        if structure and not structure.Dead then
+            local pos = structure:GetPosition()
+            if pos then
+                local threat = DefenseThreatNear(brain, pos, layer)
+                minThreat = math_min(minThreat, threat)
+                table_insert(scored, { unit = structure, threat = threat })
+            end
+        end
+    end
+
+    if table_getn(scored) == 0 then
+        return {}
+    end
+
+    table.sort(scored, function(a, b)
+        if math_abs(a.threat - b.threat) < 0.001 then
+            return (a.unit.EntityId or 0) < (b.unit.EntityId or 0)
+        end
+        return a.threat < b.threat
+    end)
+
+    local threshold = minThreat + 0.1
+    local selected = {}
+    for _, entry in ipairs(scored) do
+        if entry.threat <= threshold then
+            table_insert(selected, entry.unit)
+        else
+            break
+        end
+    end
+
+    if table_getn(selected) == 0 then
+        table_insert(selected, scored[1].unit)
+    end
+
+    return selected
+end
+
 local function AdjustForAvoidance(brain, candidates, layer)
     if not candidates then return candidates end
     for _, c in ipairs(candidates) do
@@ -698,12 +780,17 @@ local function FindRaidTarget(brain, platoon, opts, layer)
                         end
                         if localBestCategory and localBestScore > bestScore then
                             bestScore = localBestScore
-                            best = {
-                                position = pos,
-                                units    = localUnits,
-                                radius   = RaidAreaRadius,
-                                category = localBestCategory,
-                            }
+                            local selected = LeastDefendedStructures(brain, layer, localUnits)
+                            if table_getn(selected) > 0 then
+                                best = {
+                                    position            = pos,
+                                    units               = selected,
+                                    radius              = RaidAreaRadius,
+                                    category            = localBestCategory,
+                                    restrictStructures  = true,
+                                    finalAggressiveMove = false,
+                                }
+                            end
                         end
                     end
                 end
@@ -729,12 +816,17 @@ local function FindRaidTarget(brain, platoon, opts, layer)
                                 local score = table_getn(units) / threatPenalty
                                 if score > bestScore then
                                     bestScore = score
-                                    best = {
-                                        position = pos,
-                                        units    = units,
-                                        radius   = RaidAreaRadius,
-                                        category = category,
-                                    }
+                                    local selected = LeastDefendedStructures(brain, layer, units)
+                                    if table_getn(selected) > 0 then
+                                        best = {
+                                            position            = pos,
+                                            units               = selected,
+                                            radius              = RaidAreaRadius,
+                                            category            = category,
+                                            restrictStructures  = true,
+                                            finalAggressiveMove = false,
+                                        }
+                                    end
                                 end
                             end
                         end
@@ -925,6 +1017,12 @@ local function AttackTargetArea(platoon, target, opts)
         if not WaitForPlayableIngress(platoon, area, PlayableIngressTimeout * 2) then
             return 'fail'
         end
+
+        local insidePos = GetPlatoonPosition(platoon)
+        if insidePos then
+            local newPath = FindSafePath(platoon, layer, target.position)
+            MoveAlongPath(platoon, newPath, opts.Formation)
+        end
     end
 
     local arrived = false
@@ -955,7 +1053,15 @@ local function AttackTargetArea(platoon, target, opts)
     end
 
     IssueClearCommands(units)
-    IssueAggressiveMove(units, target.position)
+    local finalAggressive = target and target.finalAggressiveMove
+    if finalAggressive == nil then
+        finalAggressive = true
+    end
+    if finalAggressive then
+        IssueAggressiveMove(units, target.position)
+    else
+        IssueMove(units, target.position)
+    end
 
     local issuedTargets = {}
     local enemyBrains = BrainEnemies(brain, opts.TargetArmy)
@@ -973,10 +1079,13 @@ local function AttackTargetArea(platoon, target, opts)
             end
         end
 
-        local radius = (target.radius or 0) + AreaClearRadius
-        local areaUnits = AreaUnits(brain, enemyBrains, target.position, radius, category) or {}
-        for _, structure in ipairs(areaUnits) do
-            table_insert(combined, structure)
+        local restrictStructures = target and target.restrictStructures
+        if not restrictStructures then
+            local radius = (target.radius or 0) + AreaClearRadius
+            local areaUnits = AreaUnits(brain, enemyBrains, target.position, radius, category) or {}
+            for _, structure in ipairs(areaUnits) do
+                table_insert(combined, structure)
+            end
         end
 
         combined = FilterUnits(combined, layer, opts.Submersible)
