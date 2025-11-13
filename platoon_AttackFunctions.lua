@@ -1007,9 +1007,13 @@ local function AttackTargetArea(platoon, target, opts)
     local startedOutside = area and not PositionInPlayableArea(startPos, area)
 
     local path = FindSafePath(platoon, layer, target.position)
+    local needsIngressRepath = false
     if startedOutside then
         local ingress = NearestPlayablePointOnPath(startPos, path, area)
         if ingress then
+            if not (path and table_getn(path) > 0) then
+                needsIngressRepath = true
+            end
             path = PrependWaypoint(path, ingress)
         end
     end
