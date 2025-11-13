@@ -1069,6 +1069,12 @@ local function AttackTargetArea(platoon, target, opts)
 
         local insidePos = GetPlatoonPosition(platoon)
         if insidePos then
+            local units = platoon:GetPlatoonUnits() or {}
+            if table_getn(units) > 0 then
+                IssueStop(units)
+                IssueClearCommands(units)
+            end
+
             local newPath = FindSafePath(platoon, layer, target.position)
             MoveAlongPath(platoon, newPath, opts.Formation)
         end
