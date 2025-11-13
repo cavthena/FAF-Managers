@@ -648,6 +648,7 @@ local function LeastDefendedStructures(brain, layer, structures)
             local pos = structure:GetPosition()
             if pos then
                 local threat = DefenseThreatNear(brain, pos, layer)
+                threat = tonumber(threat) or 0
                 minThreat = math_min(minThreat, threat)
                 table_insert(scored, { unit = structure, threat = threat })
             end
