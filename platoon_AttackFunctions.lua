@@ -130,7 +130,7 @@ local HotColdChance           = 0.25
 local MaxScoutOrbitTime       = 120
 local FloodFillCell           = 32
 local FloodFillMaxRadius      = 512
-local ThreatSampleRing        = 32
+local ThreatSampleRing        = 48
 local AvoidThreatMultiplier   = 1.5
 local PlayableIngressTimeout  = 60
 local PlayableIngressBuffer   = 10
@@ -795,8 +795,14 @@ local function FindRaidTarget(brain, platoon, opts, layer)
                             bestScore = localBestScore
                             local selected = LeastDefendedStructures(brain, layer, localUnits)
                             if table_getn(selected) > 0 then
+                                -- Move towards the least-defended structure instead of the area center
+                                local targetPos = pos
+                                if selected[1] and not selected[1].Dead then
+                                    targetPos = selected[1]:GetPosition()
+                                end
+
                                 best = {
-                                    position            = pos,
+                                    position            = targetPos,
                                     units               = selected,
                                     radius              = RaidAreaRadius,
                                     category            = localBestCategory,
@@ -831,8 +837,13 @@ local function FindRaidTarget(brain, platoon, opts, layer)
                                     bestScore = score
                                     local selected = LeastDefendedStructures(brain, layer, units)
                                     if table_getn(selected) > 0 then
+                                        local targetPos = pos
+                                        if selected[1] and not selected[1].Dead then
+                                            targetPos = selected[1]:GetPosition()
+                                        end
+
                                         best = {
-                                            position            = pos,
+                                            position            = targetPos,
                                             units               = selected,
                                             radius              = RaidAreaRadius,
                                             category            = category,
@@ -914,11 +925,32 @@ local function RequestTransports(brain, platoon, destination)
     return false
 end
 
+local function ClampPathToPlayableArea(path, buffer)
+    local area = GetPlayableArea()
+    if not (area and path and table_getn(path) > 0) then
+        return path
+    end
+
+    buffer = buffer or 0
+
+    local clamped = {}
+    for _, waypoint in ipairs(path) do
+        if waypoint then
+            table_insert(clamped, ClampToPlayableArea(waypoint, area, buffer))
+        end
+    end
+
+    return clamped
+end
+
 local function MoveAlongPath(platoon, path, formation)
     if not (path and table_getn(path) > 0) then return end
 
     local units = platoon:GetPlatoonUnits() or {}
     if table_getn(units) == 0 then return end
+
+    -- Make sure we never issue move orders outside the playable area
+    path = ClampPathToPlayableArea(path, PlayableIngressBuffer)
 
     if formation ~= 'NoFormation' then
         platoon:SetPlatoonFormationOverride(formation)
