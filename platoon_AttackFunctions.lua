@@ -118,7 +118,7 @@ local math_floor    = math.floor
 local math_random   = math.random
 local math_cos      = math.cos
 local math_sin      = math.sin
-local math_huge     = math.huge
+local math_huge     = math.huge or 1e9
 
 local RecheckDelay            = 10
 local WaveAreaRadius          = 50
@@ -406,15 +406,27 @@ local function NearestPlayablePointOnPath(startPos, path, area)
     end
 
     local previous = startPos
-    for _, waypoint in ipairs(path) do
+    for index, waypoint in ipairs(path) do
         if PositionInPlayableArea(waypoint, area) then
+            -- Remove any waypoints that are still outside the playable area so we
+            -- don't order the platoon to leave the map again after ingress.
+            for _ = 1, index - 1 do
+                table_remove(path, 1)
+            end
             return SegmentPlayableIngress(previous, waypoint, area) or SurfacePoint(waypoint)
         end
         previous = waypoint
     end
 
-    -- If no point on the path is inside, fall back to clamping the final waypoint
-    return ClampToPlayableArea(path[table_getn(path)], area, PlayableIngressBuffer)
+    -- If no point on the path is inside, fall back to clamping the final
+    -- waypoint and clear the path so that we only order the platoon to move to
+    -- the entry point. The full path will be recalculated once the platoon is
+    -- inside the playable area.
+    local last = path[table_getn(path)]
+    for i = table_getn(path), 1, -1 do
+        path[i] = nil
+    end
+    return ClampToPlayableArea(last, area, PlayableIngressBuffer)
 end
 
 local function BrainEnemies(brain, targetArmy)
