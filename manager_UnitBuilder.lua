@@ -429,27 +429,22 @@ function Builder:_AllFactoriesIdle()
     return any and allIdle
 end
 
--- NEW: Immediate handoff with whatever we have right now
 function Builder:EarlyHandoff(aliveList)
     local flist = _LiveFactoriesList(self, false)
     _ClearQueuesRestoreRally(self)
 
-    local attackPlatoon = nil
-    if self.stagingPlatoon and self.brain:PlatoonExists(self.stagingPlatoon) then
-        if self.stagingPlatoon.SetPlatoonLabel then
-            self.stagingPlatoon:SetPlatoonLabel(self.attackName)
+    -- Always create a fresh attack platoon and only add units with our tag
+    local attackPlatoon = self.brain:MakePlatoon(self.attackName or (self.tag..'_Attack'), '')
+    local assign = {}
+    for _, u in ipairs(aliveList or {}) do
+        if isComplete(u) and u.ub_tag == self.tag then
+            table.insert(assign, u)
         end
-        attackPlatoon = self.stagingPlatoon
-    else
-        attackPlatoon = self.brain:MakePlatoon(self.attackName or (self.tag..'_Attack'), '')
-        local assign = {}
-        for _, u in ipairs(aliveList or {}) do
-            if isComplete(u) then table.insert(assign, u) end
-        end
-        if table.getn(assign) > 0 then
-            IssueClearCommands(assign)
-            self.brain:AssignUnitsToPlatoon(attackPlatoon, assign, 'Attack', 'GrowthFormation')
-        end
+    end
+
+    if table.getn(assign) > 0 then
+        IssueClearCommands(assign)
+        self.brain:AssignUnitsToPlatoon(attackPlatoon, assign, 'Attack', 'GrowthFormation')
     end
 
     if self.params.attackFn then
@@ -474,13 +469,12 @@ function Builder:EarlyHandoff(aliveList)
         self:WaitForMode2Gate(attackPlatoon)
     end
 
-    -- Cooldown between waves
     WaitSeconds(math.max(0, self.params.waveCooldown or 0))
-
-    -- NEW: run cleanup if due
     self:RunCleanup()
 
-    if not self.stopped then self:BeginWaveLoop() end
+    if not self.stopped then
+        self:BeginWaveLoop()
+    end
 end
 
 -- Returns a map { bpId -> count } of actual build orders in leased factory queues.
@@ -946,28 +940,25 @@ function Builder:MonitorLoop()
                 -- =============== HANDOFF ===============
                 _ClearQueuesRestoreRally(self)
 
-                local staged = self.stagingPlatoon
-                local stagedExists = staged and self.brain:PlatoonExists(staged) or false
-
-                self.stagingPlatoon = nil
-
-                if stagedExists then
-                    if staged.SetPlatoonLabel then staged:SetPlatoonLabel(self.attackName) end
-                    attackPlatoon = staged
-                else
-                    self:Warn('Handoff Fallback: staging platoon missing; creating new attack platoon and assigning alive units')
-                    attackPlatoon = self.brain:MakePlatoon(self.attackName, '')
-                    local assign = {}
-                    for _, u in ipairs(aliveList or {}) do if isComplete(u) then table.insert(assign, u) end end
-                    if table.getn(assign) > 0 then
-                        IssueClearCommands(assign)
-                        self.brain:AssignUnitsToPlatoon(attackPlatoon, assign, 'Attack', 'GrowthFormation')
+                -- Build the attack platoon strictly from our tagged aliveList
+                attackPlatoon = self.brain:MakePlatoon(self.attackName, '')
+                local assign = {}
+                for _, u in ipairs(aliveList or {}) do
+                    if isComplete(u) and u.ub_tag == self.tag then
+                        table.insert(assign, u)
                     end
+                end
+
+                if table.getn(assign) > 0 then
+                    IssueClearCommands(assign)
+                    self.brain:AssignUnitsToPlatoon(attackPlatoon, assign, 'Attack', 'GrowthFormation')
                 end
 
                 local units = attackPlatoon:GetPlatoonUnits() or {}
                 self:Dbg(('Handoff: attackPlatoon label=%s units=%d exists=%s')
-                    :format((attackPlatoon.GetPlatoonLabel and attackPlatoon:GetPlatoonLabel()) or 'nil', table.getn(units), tostring(self.brain:PlatoonExists(attackPlatoon))))
+                    :format((attackPlatoon.GetPlatoonLabel and attackPlatoon:GetPlatoonLabel()) or 'nil',
+                            table.getn(units),
+                            tostring(self.brain:PlatoonExists(attackPlatoon))))
 
                 if self.params.attackFn then
                     attackPlatoon.PlatoonData = self.params.attackData or {}
@@ -991,13 +982,11 @@ function Builder:MonitorLoop()
                     self:WaitForMode2Gate(attackPlatoon)
                 end
 
-                -- Cooldown between waves (builder is "on cooldown" here)
                 WaitSeconds(math.max(0, self.params.waveCooldown or 0))
-
-                -- NEW: one-shot cleanup if timer says it's due
                 self:RunCleanup()
-
-                if not self.stopped then self:BeginWaveLoop() end
+                if not self.stopped then
+                    self:BeginWaveLoop()
+                end
                 return
             end
         end

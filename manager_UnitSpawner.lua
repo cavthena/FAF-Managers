@@ -66,12 +66,13 @@ local ScenarioUtils = import('/lua/sim/ScenarioUtilities.lua')
          local bp        = entry[1]
          local cnt       = normalizeCounts(entry[2])
          local label     = entry[3]
-         local waveStart = entry[4] or 1
+         local waveStart = entry[4]
 
         if type(label) == 'number' and waveStart == nil then
             waveStart = label
             label     = nil
         end
+        waveStart = waveStart or 1
 
          out[i] = {
              blueprint = bp,
