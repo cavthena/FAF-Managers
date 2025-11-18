@@ -120,7 +120,7 @@ local math_cos      = math.cos
 local math_sin      = math.sin
 local math_huge     = math.huge or 1e9
 
-local RecheckDelay            = 10
+local RecheckDelay            = 60
 local WaveAreaRadius          = 50
 local RaidAreaRadius          = 25
 local AreaClearRadius         = 35
@@ -475,34 +475,68 @@ local function BrainEnemies(brain, targetArmy)
 end
 
 
-local function AreaUnits(brain, enemies, position, radius, category)
+local function AreaUnits(brain, enemies, position, radius, category, intelOnly)
     if not position then return {} end
-    local list = brain:GetUnitsAroundPoint(category, position, radius, 'Enemy') or {}
-    if not enemies or table_getn(enemies) == 0 then
-        return list
-    end
-    local allow = {}
-    for _, enemy in ipairs(enemies) do
-        allow[enemy] = true
-    end
-    local units = {}
-    for _, unit in ipairs(list) do
-        if unit and not unit.Dead then
-            local ub = unit:GetAIBrain()
-            local idx = nil
-            local name = nil
-            if ub then
-                local ok, ai = pcall(ub.GetArmyIndex, ub)
-                if ok and ai then
-                    idx = ai
+    radius = radius or 1
+
+    -- Intel path: current behaviour (uses fog-of-war)
+    if intelOnly then
+        local list = brain:GetUnitsAroundPoint(category, position, radius, 'Enemy') or {}
+        if not enemies or table_getn(enemies) == 0 then
+            return list
+        end
+
+        local allow = {}
+        for _, enemy in ipairs(enemies) do
+            allow[enemy] = true
+        end
+
+        local units = {}
+        for _, unit in ipairs(list) do
+            if unit and not unit.Dead then
+                local ub = unit:GetAIBrain()
+                local idx, name = nil, nil
+                if ub then
+                    local ok, ai = pcall(ub.GetArmyIndex, ub)
+                    if ok and ai then
+                        idx = ai
+                    end
+                    name = ub.Nickname
                 end
-                name = ub.Nickname
+                if (idx and allow[idx]) or (name and allow[name]) then
+                    table_insert(units, unit)
+                end
             end
-            if (idx and allow[idx]) or (name and allow[name]) then
-                table_insert(units, unit)
+        end
+
+        return units
+    end
+
+    -- Non-intel path: build our own "threat map" from enemy brains, ignoring fog-of-war
+    local units = {}
+    local r2 = radius * radius
+    enemies = enemies or BrainEnemies(brain, nil)
+
+    for _, enemyIndex in ipairs(enemies) do
+        local eBrain = ArmyBrains[enemyIndex]
+        if eBrain then
+            -- This returns all units owned by that brain, regardless of our intel
+            local list = eBrain:GetListOfUnits(category or categories.ALLUNITS, false) or {}
+            for _, unit in ipairs(list) do
+                if unit and not unit.Dead then
+                    local pos = unit:GetPosition()
+                    if pos then
+                        local dx = pos[1] - position[1]
+                        local dz = pos[3] - position[3]
+                        if dx * dx + dz * dz <= r2 then
+                            table_insert(units, unit)
+                        end
+                    end
+                end
             end
         end
     end
+
     return units
 end
 
@@ -727,7 +761,7 @@ local function ChooseBestArea(brain, platoon, opts, layer, areaRadius, mode, cat
     for _, entry in ipairs(candidates) do
         local pos = entry.pos
         if pos then
-            local units = AreaUnits(brain, enemies, pos, areaRadius, category)
+            local units = AreaUnits(brain, enemies, pos, areaRadius, category, opts.IntelOnly)
             units = FilterUnits(units, layer, opts.Submersible)
             if table_getn(units) > 0 then
                 local distance = Distance(startPos, pos)
@@ -779,7 +813,7 @@ local function FindRaidTarget(brain, platoon, opts, layer)
                         local localUnits = nil
                         for _, label in ipairs(labels) do
                             local cat = RaidCategories[label]
-                            local units = AreaUnits(brain, enemies, pos, RaidAreaRadius, cat)
+                            local units = AreaUnits(brain, enemies, pos, RaidAreaRadius, cat, opts.IntelOnly)
                             units = FilterUnits(units, layer, opts.Submersible)
                             local count = table_getn(units)
                             if count > 0 then
@@ -823,38 +857,54 @@ local function FindRaidTarget(brain, platoon, opts, layer)
                     if opts.AvoidDef then
                         AdjustForAvoidance(brain, candidates, layer)
                     end
-                    local bestScore = -1
+
                     local best
+                    local bestThreat   = math_huge   -- lowest local defence wins
+                    local bestDistance = math_huge   -- tie-breaker: closer is better
+                    local bestCount    = -1          -- secondary tie-breaker: more eco in that area
+
                     for _, entry in ipairs(candidates) do
                         local pos = entry.pos
                         if pos then
-                            local units = AreaUnits(brain, enemies, pos, RaidAreaRadius, category)
+                            local units = AreaUnits(brain, enemies, pos, RaidAreaRadius, category, opts.IntelOnly)
                             units = FilterUnits(units, layer, opts.Submersible)
-                            if table_getn(units) > 0 then
-                                local threatPenalty = opts.AvoidDef and (1 + DefenseThreatNear(brain, pos, layer) * AvoidThreatMultiplier) or 1
-                                local score = table_getn(units) / threatPenalty
-                                if score > bestScore then
-                                    bestScore = score
-                                    local selected = LeastDefendedStructures(brain, layer, units)
-                                    if table_getn(selected) > 0 then
-                                        local targetPos = pos
-                                        if selected[1] and not selected[1].Dead then
-                                            targetPos = selected[1]:GetPosition()
-                                        end
+                            local count = table_getn(units)
+                            if count > 0 then
+                                -- Find the least defended structure *in this area*
+                                local selected = LeastDefendedStructures(brain, layer, units)
+                                if table_getn(selected) > 0 then
+                                    local structure = selected[1]
+                                    if structure and not structure.Dead then
+                                        local sPos        = structure:GetPosition()
+                                        local localThreat = DefenseThreatNear(brain, sPos, layer)
+                                        local distance    = Distance(startPos, sPos)
 
-                                        best = {
-                                            position            = targetPos,
-                                            units               = selected,
-                                            radius              = RaidAreaRadius,
-                                            category            = category,
-                                            restrictStructures  = true,
-                                            finalAggressiveMove = false,
-                                        }
+                                        -- Compare by threat, then by distance, then by how much eco is nearby
+                                        local better =
+                                            (localThreat < bestThreat - 0.001) or
+                                            (math_abs(localThreat - bestThreat) < 0.001 and distance < bestDistance - 0.1) or
+                                            (math_abs(localThreat - bestThreat) < 0.001 and math_abs(distance - bestDistance) < 0.1 and count > bestCount)
+
+                                        if better then
+                                            bestThreat   = localThreat
+                                            bestDistance = distance
+                                            bestCount    = count
+
+                                            best = {
+                                                position            = sPos,
+                                                units               = selected,
+                                                radius              = RaidAreaRadius,
+                                                category            = category,
+                                                restrictStructures  = true,
+                                                finalAggressiveMove = false,
+                                            }
+                                        end
                                     end
                                 end
                             end
                         end
                     end
+
                     if best then
                         return best
                     end
@@ -900,8 +950,8 @@ local function AppendDestination(path, destination)
     return path
 end
 
-local function FindSafePath(platoon, layer, destination)
-    local startPos = GetPlatoonPosition(platoon)
+local function FindSafePath(platoon, layer, destination, startOverride)
+    local startPos = startOverride or GetPlatoonPosition(platoon)
     if not (startPos and destination) then return nil end
 
     local ok, path = pcall(NavUtils.PathTo, layer, startPos, destination)
@@ -909,6 +959,28 @@ local function FindSafePath(platoon, layer, destination)
         return AppendDestination(path, destination)
     end
     return { CopyVector(destination) }
+end
+
+local function MergePathSegments(segments)
+    local merged = {}
+    if not segments then
+        return merged
+    end
+
+    for _, segment in ipairs(segments) do
+        if segment then
+            for _, waypoint in ipairs(segment) do
+                if waypoint then
+                    local last = merged[table_getn(merged)]
+                    if not (last and DistanceSq(last, waypoint) < 1) then
+                        table_insert(merged, CopyVector(waypoint))
+                    end
+                end
+            end
+        end
+    end
+
+    return merged
 end
 
 local function RequestTransports(brain, platoon, destination)
@@ -1039,14 +1111,12 @@ local function AttackTargetArea(platoon, target, opts)
     local startedOutside = area and not PositionInPlayableArea(startPos, area)
 
     local path = FindSafePath(platoon, layer, target.position)
-    local needsIngressRepath = false
     if startedOutside then
         local ingress = NearestPlayablePointOnPath(startPos, path, area)
         if ingress then
-            if not (path and table_getn(path) > 0) then
-                needsIngressRepath = true
-            end
-            path = PrependWaypoint(path, ingress)
+            local ingressSegment = { CopyVector(ingress) }
+            local interiorPath = FindSafePath(platoon, layer, target.position, ingress)
+            path = MergePathSegments({ ingressSegment, interiorPath })
         end
     end
 
@@ -1066,20 +1136,8 @@ local function AttackTargetArea(platoon, target, opts)
         if not WaitForPlayableIngress(platoon, area, PlayableIngressTimeout * 2) then
             return 'fail'
         end
-
-        local insidePos = GetPlatoonPosition(platoon)
-        if insidePos then
-            local units = platoon:GetPlatoonUnits() or {}
-            if table_getn(units) > 0 then
-                IssueStop(units)
-                IssueClearCommands(units)
-            end
-
-            local newPath = FindSafePath(platoon, layer, target.position)
-            MoveAlongPath(platoon, newPath, opts.Formation)
-        end
     end
-
+    
     local arrived = false
     local epsilon = 5
     local units = platoon:GetPlatoonUnits() or {}
@@ -1108,14 +1166,22 @@ local function AttackTargetArea(platoon, target, opts)
     end
 
     IssueClearCommands(units)
-    local finalAggressive = target and target.finalAggressiveMove
-    if finalAggressive == nil then
-        finalAggressive = true
-    end
-    if finalAggressive then
-        IssueAggressiveMove(units, target.position)
+    local formation = opts.Formation or 'GrowthFormation'
+    if formation ~= 'NoFormation' then
+        -- Keep the platoon in the requested formation for the final approach
+        platoon:SetPlatoonFormationOverride(formation)
+        IssueFormMove(units, target.position, formation, 0)
     else
-        IssueMove(units, target.position)
+        -- No formation requested: fall back to original behaviour
+        local finalAggressive = target and target.finalAggressiveMove
+        if finalAggressive == nil then
+            finalAggressive = true
+        end
+        if finalAggressive then
+            IssueAggressiveMove(units, target.position)
+        else
+            IssueMove(units, target.position)
+        end
     end
 
     local issuedTargets = {}
@@ -1137,7 +1203,7 @@ local function AttackTargetArea(platoon, target, opts)
         local restrictStructures = target and target.restrictStructures
         if not restrictStructures then
             local radius = (target.radius or 0) + AreaClearRadius
-            local areaUnits = AreaUnits(brain, enemyBrains, target.position, radius, category) or {}
+            local areaUnits = AreaUnits(brain, enemyBrains, target.position, radius, category, opts.IntelOnly) or {}
             for _, structure in ipairs(areaUnits) do
                 table_insert(combined, structure)
             end

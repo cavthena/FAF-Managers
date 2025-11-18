@@ -474,7 +474,12 @@ function Builder:EarlyHandoff(aliveList)
         self:WaitForMode2Gate(attackPlatoon)
     end
 
+    -- Cooldown between waves
     WaitSeconds(math.max(0, self.params.waveCooldown or 0))
+
+    -- NEW: run cleanup if due
+    self:RunCleanup()
+
     if not self.stopped then self:BeginWaveLoop() end
 end
 
@@ -592,6 +597,11 @@ function Builder:RequestLease()
 end
 
 function Builder:Start()
+    if not self.cleanupTimerThread and self.brain and self.brain.ForkThread then
+        self._cleanupDue = false
+        self.cleanupTimerThread = self.brain:ForkThread(function() self:CleanupTimerLoop() end)
+    end
+
     if self.params.spawnFirstDirect then
         self.wave = (self.wave or 0) + 1
         local p = self:SpawnDirectAndSend(self.wave)
@@ -604,7 +614,10 @@ function Builder:Start()
         else
             self.brain:ForkThread(function()
                 WaitSeconds(math.max(0, self.params.waveCooldown or 0))
-                self:BeginWaveLoop()
+                self:RunCleanup()
+                if not self.stopped then
+                    self:BeginWaveLoop()
+                end
             end)
         end
     else
@@ -978,7 +991,12 @@ function Builder:MonitorLoop()
                     self:WaitForMode2Gate(attackPlatoon)
                 end
 
+                -- Cooldown between waves (builder is "on cooldown" here)
                 WaitSeconds(math.max(0, self.params.waveCooldown or 0))
+
+                -- NEW: one-shot cleanup if timer says it's due
+                self:RunCleanup()
+
                 if not self.stopped then self:BeginWaveLoop() end
                 return
             end
@@ -1110,6 +1128,69 @@ function Builder:RallyKeeperLoop()
     while not self.stopped do
         _RallySweep(self)
         WaitSeconds(10)
+    end
+end
+
+function Builder:CleanupTimerLoop()
+    -- Fires a "cleanup due" flag every 5 minutes.
+    while not self.stopped do
+        WaitSeconds(300)  -- 5 minutes
+        if self.stopped then break end
+        self._cleanupDue = true
+        self:Dbg('CleanupTimer: cleanup due flag set')
+    end
+end
+
+-- Scan the base radius for idle units with this builder's tag and hand them
+-- off to the attackFn as a small cleanup platoon (once per timer tick).
+function Builder:RunCleanup()
+    if self.stopped or not self._cleanupDue then
+        return
+    end
+
+    self._cleanupDue = false
+
+    local center = self.basePos or (self.base and self.base.basePos)
+    local radius = (self.params and self.params.radius) or (self.base and self.base.radius) or 60
+    local brain  = self.brain
+
+    if not (center and brain) then
+        return
+    end
+
+    local units = brain:GetUnitsAroundPoint(categories.MOBILE, center, radius, 'Ally') or {}
+    local idle = {}
+
+    for _, u in ipairs(units) do
+        if u and not u.Dead and isComplete(u) and u:GetAIBrain() == brain and u.ub_tag == self.tag then
+            local q = (u.GetCommandQueue and u:GetCommandQueue()) or {}
+            if table.getn(q) == 0 then
+                table.insert(idle, u)
+            end
+        end
+    end
+
+    local count = table.getn(idle)
+    if count == 0 then
+        self:Dbg('Cleanup: no idle tagged units in base radius')
+        return
+    end
+
+    self.cleanupWave = (self.cleanupWave or 0) + 1
+    local label = string.format('%s_Cleanup_%d', self.tag, self.cleanupWave)
+    local p = brain:MakePlatoon(label, '')
+
+    IssueClearCommands(idle)
+    brain:AssignUnitsToPlatoon(p, idle, 'Attack', 'GrowthFormation')
+
+    self:Dbg(('Cleanup: handed %d idle units to attackFn as platoon %s')
+        :format(count, label))
+
+    if self.params.attackFn then
+        p.PlatoonData = self.params.attackData or {}
+        _ForkAttack(p, self.params.attackFn, p.PlatoonData, self.tag)
+    else
+        self:Warn('Cleanup: no attackFn provided; cleanup platoon will idle')
     end
 end
 
@@ -1292,6 +1373,7 @@ function Builder:Stop()
     if self.collectThread then KillThread(self.collectThread) self.collectThread = nil end
     if self.monitorThread then KillThread(self.monitorThread) self.monitorThread = nil end
     if self.rallyKeeperThread then KillThread(self.rallyKeeperThread) self.rallyKeeperThread = nil end
+    if self.cleanupTimerThread then KillThread(self.cleanupTimerThread) self.cleanupTimerThread = nil end
 end
 
 -- ========== Public API ==========

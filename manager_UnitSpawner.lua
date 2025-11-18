@@ -67,6 +67,12 @@ local ScenarioUtils = import('/lua/sim/ScenarioUtilities.lua')
          local cnt       = normalizeCounts(entry[2])
          local label     = entry[3]
          local waveStart = entry[4] or 1
+
+        if type(label) == 'number' and waveStart == nil then
+            waveStart = label
+            label     = nil
+        end
+
          out[i] = {
              blueprint = bp,
              counts    = cnt,
@@ -256,7 +262,7 @@ function Spawner:HandOffToAttack(platoon)
              :format((p.GetPlatoonLabel and p:GetPlatoonLabel()) or '?',
                      table.getn(p:GetPlatoonUnits() or {}),
                      type(fn)))
-         if type(fn) == 'function' then
+        if type(fn) == 'function' then
             return fn(p, self.params.attackData)
         elseif type(fn) == 'string' then
             local ref = _G and _G[fn]
