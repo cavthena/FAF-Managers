@@ -4,12 +4,13 @@
 -- What it does
 --   • Spawns a platoon at a given marker using a composition { {bp, {e,n,h}, [label], [waveStart]}, ... }
 --   • Hands the platoon to your attack function immediately (ForkAIThread)
---   • Three modes:
+--   • Four modes:
 --       1) Wave: spawn → handoff → wait waveCooldown → next wave
 --       2) Loss-gated: spawn → handoff → wait until the platoon has lost >= mode2LossThreshold → next wave,
 --          and if (and only if) the current platoon has been wiped out, apply waveCooldown before spawning again.
 --       3) Limited waves: spawn → handoff → wait a shrinking waveCooldown → next wave, until mode3WaveCount is reached.
 --          Composition entries can specify the wave they join via a 4th field (wave start, 1-indexed).
+--       4) Batched window: spawn a fixed number of platoons (mode4PlatoonCount) evenly spaced over waveCooldown, then stop.
 --   • Can be cancelled at any time via Stop(handle)
 --   • Safe to run multiple spawners in parallel (unique tag per instance; no shared state)
 --
@@ -25,9 +26,10 @@
 --     difficulty         = ScenarioInfo.Options.Difficulty or 2,  -- 1..3
 --     attackFn           = 'Platoon_BasicAttack',                 -- function or global function name
 --     waveCooldown       = 15,                                    -- seconds; in mode 2 it is applied only after a wipe
---     mode               = 1,                                     -- 1: cooldown, 2: gate by losses, 3: finite waves
+--     mode               = 1,                                     -- 1: cooldown, 2: gate by losses, 3: finite waves, 4: batched waves
 --     mode2LossThreshold = 0.50,                                  -- fraction lost to trigger next wave
 --     mode3WaveCount     = 5,                                     -- number of waves for mode 3
+--     mode4PlatoonCount  = 3,                                     -- platoons per cooldown window for mode 4
 --     spawnerTag         = 'NorthWaves',                          -- optional unique tag
 --     spawnSpread        = 6,                                     -- random XY spread around marker
 --     formation          = 'GrowthFormation',                     -- assigned formation
@@ -427,20 +429,42 @@ function Spawner:RunMode3()
     end
     self.stopped = true
 end
+
+function Spawner:RunMode4()
+    local batchCount = math.max(1, math.floor(self.params.mode4PlatoonCount or 1))
+    local totalWindow = math.max(0, self.params.waveCooldown or 0)
+    local interval = (batchCount > 0) and (totalWindow / batchCount) or 0
+
+    for _ = 1, batchCount do
+        if self.stopped then break end
+        self.wave = (self.wave or 0) + 1
+        local platoon, units, unitCount, wanted = self:SpawnWave(self.wave, self.baseWanted)
+        local called, keepRunning = self:InvokeCallback('onWaveCreated', self.wave, platoon, unitCount, wanted)
+        if called and keepRunning == false then
+            self:Stop()
+        end
+        if self.stopped then break end
+        if interval > 0 then
+            WaitSeconds(interval)
+        end
+    end
+end
  
- function Spawner:MainLoop()
-     self:Dbg('MainLoop: start')
-     local mode = self.params.mode or 1
-     if mode == 2 then
-         self:RunMode2()
-     elseif mode == 3 then
-         self:RunMode3()
-     else
-         self:RunMode1()
-     end
-     self:Dbg('MainLoop: end')
-     self.mainThread = nil
- end
+function Spawner:MainLoop()
+    self:Dbg('MainLoop: start')
+    local mode = self.params.mode or 1
+    if mode == 2 then
+        self:RunMode2()
+    elseif mode == 3 then
+        self:RunMode3()
+    elseif mode == 4 then
+        self:RunMode4()
+    else
+        self:RunMode1()
+    end
+    self:Dbg('MainLoop: end')
+    self.mainThread = nil
+end
  
  function Spawner:Start()
      self.mainThread = self.brain:ForkThread(function() self:MainLoop() end)
@@ -467,6 +491,7 @@ end
          mode               = p.mode or 1,
         mode2LossThreshold = (p.mode2LossThreshold ~= nil) and p.mode2LossThreshold or 0.5,
         mode3WaveCount     = p.mode3WaveCount or 0,
+        mode4PlatoonCount  = (p.mode4PlatoonCount ~= nil) and p.mode4PlatoonCount or 1,
         spawnerTag         = p.spawnerTag,
         spawnSpread        = (p.spawnSpread ~= nil) and p.spawnSpread or 6,
         formation          = p.formation or 'GrowthFormation',
