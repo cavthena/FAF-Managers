@@ -46,6 +46,18 @@ Overview
         AttackFns.ScoutAttack(platoon, data)
     end
 
+    -- Hunt attack -------------------------------------------------------------
+    function AssassinateExperimentals(platoon)
+        local data = {
+            Blueprints  = { 'uel0401', 'xrl0403', 'xsl0401', 'ual0401' },
+            Marker      = 'Base_Staging_A',
+            IntelOnly   = true,
+            Vulnerable  = true,
+            Formation   = 'GrowthFormation',
+        }
+        AttackFns.HuntAttack(platoon, data)
+    end
+
 Universal parameters
     All attack functions accept the arguments listed below through their
     `attackData` table.  Missing fields fall back to the stated defaults.
@@ -99,14 +111,25 @@ ScoutAttack specifics
         to orbit the location for up to two minutes.  Destinations are random
         map positions with a 25% chance of being the hottest or coolest area on
         the threat map.
+
+HuntAttack specifics
+        Accepts `Blueprint`, `Blueprints`, `TargetBP`, or `TargetBlueprints`
+        containing a single id or list of blueprint ids to pursue.  The platoon
+        locks on to the closest matching unit, travelling through safe paths
+        and refusing to switch targets until the victim is destroyed or intel
+        contact is lost.  When `IntelOnly` is true the target must be scouted
+        or have an existing blip.  Setting `Vulnerable` forces the platoon to
+        avoid defended targets, waiting for them to leave the threat ring or
+        switching if another safe target exists.  If no targets are available,
+        the platoon idles at `Marker`/`IdleMarker` (air platoons orbit).
 ================================================================================
 ]]
 
 local ScenarioFramework = import('/lua/ScenarioFramework.lua')
-local NavUtils           = import('/lua/sim/NavUtils.lua')
-local GetTerrainHeight   = GetTerrainHeight
-local GetSurfaceHeight   = GetSurfaceHeight
-
+local ScenarioUtils     = import('/lua/sim/ScenarioUtilities.lua')
+local NavUtils          = import('/lua/sim/NavUtils.lua')
+local GetTerrainHeight  = GetTerrainHeight
+local GetSurfaceHeight  = GetSurfaceHeight
 local table_getn    = table.getn
 local table_insert  = table.insert
 local table_remove  = table.remove
@@ -134,6 +157,9 @@ local ThreatSampleRing        = 48
 local AvoidThreatMultiplier   = 1.5
 local PlayableIngressTimeout  = 60
 local PlayableIngressBuffer   = 10
+local HuntRepathDistanceSq    = 400
+local HuntAttackDistanceSq    = 2500
+local HuntDefenseWait         = 5
 
 local StructureCategory = categories.STRUCTURE - categories.WALL
 local NavalStructure    = categories.STRUCTURE * categories.NAVAL
@@ -1015,7 +1041,7 @@ local function ClampPathToPlayableArea(path, buffer)
     return clamped
 end
 
-local function MoveAlongPath(platoon, path, formation)
+local function MoveAlongPath(platoon, path, formation, aggressiveFinal)
     if not (path and table_getn(path) > 0) then return end
 
     local units = platoon:GetPlatoonUnits() or {}
@@ -1032,12 +1058,14 @@ local function MoveAlongPath(platoon, path, formation)
 
     IssueClearCommands(units)
 
-    if formation == 'NoFormation' then
-        for _, waypoint in ipairs(path) do
+    local count = table_getn(path)
+    for index, waypoint in ipairs(path) do
+        local isFinal = aggressiveFinal and (index == count)
+        if isFinal then
+            IssueAggressiveMove(units, waypoint)
+        elseif formation == 'NoFormation' then
             IssueMove(units, waypoint)
-        end
-    else
-        for _, waypoint in ipairs(path) do
+        else
             IssueFormMove(units, waypoint, formation, 0)
         end
     end
@@ -1365,6 +1393,242 @@ local function OrbitUnit(unit, center)
     end
 end
 
+local function NormalizeBlueprintSet(value)
+    local set = {}
+    if type(value) == 'string' then
+        set[string.lower(value)] = true
+    elseif type(value) == 'table' then
+        for _, entry in ipairs(value) do
+            if type(entry) == 'string' then
+                set[string.lower(entry)] = true
+            end
+        end
+    end
+    return set
+end
+
+local function UnitBlueprintId(unit)
+    if not unit then return nil end
+    if unit.BlueprintID then
+        return string.lower(unit.BlueprintID)
+    end
+    local bp = unit:GetBlueprint()
+    if bp and bp.BlueprintId then
+        return string.lower(bp.BlueprintId)
+    end
+    return nil
+end
+
+local function UnitMatchesBlueprint(unit, set)
+    if not (unit and set) then
+        return false
+    end
+    local id = UnitBlueprintId(unit)
+    if not id then
+        return false
+    end
+    return set[id] == true
+end
+
+local function HasIntelOnUnit(brain, unit, intelOnly)
+    if not intelOnly then
+        return true
+    end
+    if not (brain and unit and not unit.Dead) then
+        return false
+    end
+    local army = brain:GetArmyIndex()
+    if not army then
+        return false
+    end
+    local ok, visible = pcall(IsUnitVisible, army, unit)
+    if ok and visible then
+        return true
+    end
+    local hasBlip = false
+    local success, blip = pcall(unit.GetBlip, unit, army)
+    if success and blip then
+        hasBlip = true
+    end
+    return hasBlip
+end
+
+local function ResolveMarkerPosition(marker)
+    if type(marker) == 'table' then
+        if marker[1] and marker[3] then
+            local y = marker[2] or GetSurfaceHeight(marker[1], marker[3])
+            return { marker[1], y, marker[3] }
+        end
+    elseif type(marker) == 'string' then
+        local ok, pos = pcall(ScenarioUtils.MarkerToPosition, marker)
+        if ok and pos then
+            return { pos[1], pos[2], pos[3] }
+        end
+    end
+    return nil
+end
+
+local function IdleAtMarker(platoon, markerPos, layer, formation)
+    if not (platoon and markerPos) then return end
+    local units = platoon:GetPlatoonUnits() or {}
+    if table_getn(units) == 0 then return end
+    IssueClearCommands(units)
+    if layer == 'Air' then
+        for _, unit in ipairs(units) do
+            OrbitUnit(unit, markerPos)
+        end
+    else
+        if formation ~= 'NoFormation' then
+            platoon:SetPlatoonFormationOverride(formation)
+            IssueFormMove(units, markerPos, formation, 0)
+        else
+            IssueMove(units, markerPos)
+        end
+    end
+end
+
+local function FindHuntTarget(brain, platoon, opts, layer, excluded, requireSafe)
+    if not (brain and platoon and opts and opts.HuntSet and next(opts.HuntSet)) then
+        return nil
+    end
+    local startPos = GetPlatoonPosition(platoon)
+    if not startPos then
+        return nil
+    end
+    local enemies = BrainEnemies(brain, opts.TargetArmy)
+    local excludedSet = excluded or {}
+    local best, bestDist = nil, math_huge
+    local bestSafe, bestSafeDist = nil, math_huge
+    for _, enemyIndex in ipairs(enemies) do
+        local eBrain = ArmyBrains[enemyIndex]
+        if eBrain then
+            local list = eBrain:GetListOfUnits(categories.ALLUNITS, false) or {}
+            for _, unit in ipairs(list) do
+                if unit and not unit.Dead then
+                    local id = unit.EntityId
+                    if not (id and excludedSet[id]) then
+                        if UnitMatchesBlueprint(unit, opts.HuntSet) and CanTargetUnit(layer, opts.Submersible, unit) then
+                            if not opts.IntelOnly or HasIntelOnUnit(brain, unit, true) then
+                                local unitPos = unit:GetPosition()
+                                if unitPos then
+                                    local dist = DistanceSq(startPos, unitPos)
+                                    local threat = opts.Vulnerable and DefenseThreatNear(brain, unitPos, layer) or 0
+                                    local info = {
+                                        unit = unit,
+                                        position = CopyVector(unitPos),
+                                        distance = dist,
+                                        threat = threat,
+                                    }
+                                    if dist < bestDist then
+                                        best = info
+                                        bestDist = dist
+                                    end
+                                    if threat <= 0 and dist < bestSafeDist then
+                                        bestSafe = info
+                                        bestSafeDist = dist
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if requireSafe then
+        return bestSafe
+    end
+    if opts.Vulnerable and bestSafe then
+        return bestSafe
+    end
+    return best
+end
+
+local function TrackHuntTarget(platoon, targetInfo, opts, layer)
+    local brain = platoon:GetBrain()
+    if not (brain and targetInfo and targetInfo.unit) then
+        return 'fail'
+    end
+    local unit = targetInfo.unit
+    local lastCommandPos = nil
+    while PlatoonAlive(platoon) do
+        if not (unit and not unit.Dead) then
+            return 'destroyed'
+        end
+        if not HasIntelOnUnit(brain, unit, opts.IntelOnly) then
+            return 'intel'
+        end
+        local skipIteration = false
+        local unitPos = unit:GetPosition()
+        if not unitPos then
+            SafeWait(1)
+            skipIteration = true
+        end
+        if not skipIteration and opts.Vulnerable then
+            local threat = DefenseThreatNear(brain, unitPos, layer)
+            if threat > 0 then
+                return 'defended'
+            end
+        end
+        if not skipIteration and (not lastCommandPos or DistanceSq(lastCommandPos, unitPos) > HuntRepathDistanceSq) then
+            if not CanPathTo(platoon, layer, unitPos) then
+                if not TransportAndMove(platoon, unitPos, opts) then
+                    SafeWait(RecheckDelay)
+                    skipIteration = true
+                end
+            end
+            if not skipIteration then
+                local path = FindSafePath(platoon, layer, unitPos)
+                if not path then
+                    SafeWait(RecheckDelay)
+                    skipIteration = true
+                else
+                    MoveAlongPath(platoon, path, opts.Formation, true)
+                    lastCommandPos = CopyVector(unitPos)
+                end
+            end
+        end
+        local platoonPos = nil
+        if not skipIteration then
+            platoonPos = GetPlatoonPosition(platoon)
+            if not platoonPos then
+                SafeWait(1)
+                skipIteration = true
+            end
+        end
+        if not skipIteration and DistanceSq(platoonPos, unitPos) <= HuntAttackDistanceSq then
+            local units = platoon:GetPlatoonUnits() or {}
+            if table_getn(units) == 0 then
+                return 'fail'
+            end
+            IssueAttack(units, unit)
+            local elapsed = 0
+            while PlatoonAlive(platoon) do
+                if not (unit and not unit.Dead) then
+                    return 'destroyed'
+                end
+                if opts.IntelOnly and not HasIntelOnUnit(brain, unit, true) then
+                    return 'intel'
+                end
+                if opts.Vulnerable then
+                    local threat = DefenseThreatNear(brain, unit:GetPosition(), layer)
+                    if threat > 0 then
+                        return 'defended'
+                    end
+                end
+                SafeWait(1)
+                elapsed = elapsed + 1
+                if elapsed >= RecheckDelay then
+                    break
+                end
+            end
+        elseif not skipIteration then
+            SafeWait(1)
+        end
+    end
+    return 'fail'
+end
+
 function WaveAttack(platoon, data)
     local opts = CopyOptions(data)
     opts.Type = opts.Type or opts.TargetType or 'closest'
@@ -1433,8 +1697,65 @@ function ScoutAttack(platoon, data)
     end
 end
 
+function HuntAttack(platoon, data)
+    local opts = CopyOptions(data)
+    opts.Vulnerable = opts.Vulnerable and true or false
+    local blueprintData = data and (data.Blueprints or data.Blueprint or data.TargetBlueprints or data.TargetBPs or data.TargetBP)
+    opts.HuntSet = NormalizeBlueprintSet(blueprintData)
+    if not next(opts.HuntSet) then
+        return
+    end
+
+    opts.MarkerPosition = ResolveMarkerPosition(opts.Marker or opts.IdleMarker)
+
+    local brain = platoon:GetBrain()
+    if not brain then return end
+    local layer = DetermineLayer(platoon, opts.Amphibious)
+
+    local currentTarget = nil
+    local idleIssued = false
+
+    while PlatoonAlive(platoon) do
+        if currentTarget then
+            local status = TrackHuntTarget(platoon, currentTarget, opts, layer)
+            if status == 'destroyed' or status == 'intel' or status == 'fail' then
+                currentTarget = nil
+            elseif status == 'defended' then
+                local excluded = {}
+                if currentTarget.unit and currentTarget.unit.EntityId then
+                    excluded[currentTarget.unit.EntityId] = true
+                end
+                local alternative = FindHuntTarget(brain, platoon, opts, layer, excluded, true)
+                if alternative then
+                    currentTarget = alternative
+                else
+                    SafeWait(HuntDefenseWait)
+                end
+            else
+                SafeWait(RecheckDelay)
+            end
+        else
+            local target = FindHuntTarget(brain, platoon, opts, layer)
+            if target then
+                currentTarget = target
+                idleIssued = false
+            else
+                if opts.MarkerPosition and not idleIssued then
+                    IdleAtMarker(platoon, opts.MarkerPosition, layer, opts.Formation)
+                    idleIssued = true
+                elseif opts.MarkerPosition and layer == 'Air' then
+                    -- keep air platoons orbiting while waiting
+                    IdleAtMarker(platoon, opts.MarkerPosition, layer, opts.Formation)
+                end
+                WaitForTargets(brain, RecheckDelay)
+            end
+        end
+    end
+end
+
 return {
     WaveAttack = WaveAttack,
     RaidAttack = RaidAttack,
     ScoutAttack = ScoutAttack,
+    HuntAttack = HuntAttack,
 }
