@@ -729,6 +729,22 @@ local function CollectCandidateAreas(brain, startPos, opts, layer)
     end
 end
 
+local function AdjustForAvoidance(brain, candidates, layer)
+    if not candidates then return candidates end
+    for _, c in ipairs(candidates) do
+        c.threat = (c.threat or 0) + DefenseThreatNear(brain, c.pos, layer)
+    end
+    table.sort(candidates, function(a, b)
+        local ta = a.threat or 0
+        local tb = b.threat or 0
+        if math_abs(ta - tb) < 0.001 then
+            return (a.pos[1] + a.pos[3]) < (b.pos[1] + b.pos[3])
+        end
+        return ta < tb
+    end)
+    return candidates
+end
+
 local function CollectAdjustedCandidates(brain, startPos, opts, layer)
     local candidates = CollectCandidateAreas(brain, startPos, opts, layer)
     if opts.AvoidDef then
@@ -789,22 +805,6 @@ local function LeastDefendedStructures(brain, layer, structures)
     end
 
     return selected
-end
-
-local function AdjustForAvoidance(brain, candidates, layer)
-    if not candidates then return candidates end
-    for _, c in ipairs(candidates) do
-        c.threat = (c.threat or 0) + DefenseThreatNear(brain, c.pos, layer)
-    end
-    table.sort(candidates, function(a, b)
-        local ta = a.threat or 0
-        local tb = b.threat or 0
-        if math_abs(ta - tb) < 0.001 then
-            return (a.pos[1] + a.pos[3]) < (b.pos[1] + b.pos[3])
-        end
-        return ta < tb
-    end)
-    return candidates
 end
 
 local function ChooseBestArea(brain, platoon, opts, layer, areaRadius, mode, category)
