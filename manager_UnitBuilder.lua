@@ -37,12 +37,20 @@ Usage
         debug            = false,                     -- optional verbose logging
     }
 
-Public API
-    UnitBuilder.Start(params)
-        Validates the request, acquires a base handle, and starts the builder.
+    Public API
+        UnitBuilder.Start(params)
+            Validates the request, acquires a base handle, and starts the builder.
 
-    UnitBuilder.Stop(handle)
-        Stops the running builder and frees any factory leases.
+        UnitBuilder.Stop(handle)
+            Stops the running builder and frees any factory leases.
+
+        UnitBuilder.AddCallback(handle, fn, eventName)
+            Registers a platoon callback using the same shape as unit callbacks
+            (function or global name, optional event string; defaults to 'OnHandoff').
+
+    Platoon callback events
+        OnHandoff   Fired after the platoon is created and handed to attackFn
+                    (wave handoff, sustain handoff, cleanup/Stop handoff).
 
 Behavioral notes
     * Units must be complete and within 18 units of the rally marker before
@@ -168,6 +176,67 @@ local function _ForkAttack(platoon, fn, opts, tag)
             platoon:ForkAIThread(function(p) return fn(p, p.PlatoonData) end)
         end
     end)
+end
+
+local function _NormalizeCallbacks(spec, defaultEvent, tag)
+    local out = {}
+    defaultEvent = defaultEvent or 'OnHandoff'
+
+    local function add(fn, ev)
+        if type(fn) == 'string' then
+            fn = rawget(_G, fn)
+        end
+        if type(fn) ~= 'function' then
+            WARN(('[UB:%s] platoon callback is not callable; skipping'):format(tag or '?'))
+            return
+        end
+        table.insert(out, { fn, ev or defaultEvent })
+    end
+
+    if spec == nil then
+        return out
+    end
+
+    local stype = type(spec)
+    if stype == 'function' or stype == 'string' then
+        add(spec, defaultEvent)
+    elseif stype == 'table' then
+        local first = spec[1]
+        if type(first) == 'function' or type(first) == 'string' then
+            add(first, spec[2] or defaultEvent)
+        else
+            for _, entry in ipairs(spec) do
+                if type(entry) == 'function' or type(entry) == 'string' then
+                    add(entry, defaultEvent)
+                elseif type(entry) == 'table' then
+                    add(entry[1], entry[2] or defaultEvent)
+                end
+            end
+        end
+    end
+
+    return out
+end
+
+local function _CallPlatoonCallbacks(callbacks, platoon, eventName, tag)
+    if not callbacks or table.getn(callbacks) == 0 then
+        return
+    end
+    for _, cb in ipairs(callbacks) do
+        local fn, ev = cb[1], cb[2] or eventName
+        local ok, err = pcall(fn, platoon, ev or eventName)
+        if not ok then
+            WARN(('[UB:%s] platoon callback error: %s'):format(tag or '?', tostring(err)))
+        end
+    end
+end
+
+local function _AppendCallbacks(target, spec, defaultEvent, tag)
+    if not target then return end
+    local entries = _NormalizeCallbacks(spec, defaultEvent, tag)
+    for _, cb in ipairs(entries) do
+        table.insert(target, cb)
+    end
 end
 
 local function flattenCounts(composition, difficulty)
@@ -390,7 +459,14 @@ function Builder:SetHoldBuild(flag)
     end
 end
 
--- NEW: Ask allocator to try to raise us to wantFactories if currently short
+-- Register a platoon callback at any time (function or global name, optional event)
+function Builder:AddCallback(fn, eventName)
+    if self.stopped then return end
+    self.platoonCallbacks = self.platoonCallbacks or {}
+    _AppendCallbacks(self.platoonCallbacks, { fn, eventName }, eventName or 'OnHandoff', self.tag)
+end
+
+-- Ask allocator to try to raise us to wantFactories if currently short
 function Builder:EnsureFactoryQuota()
     local want = math.max(0, (self.params and self.params.wantFactories) or 0)
     if want == 0 then return end
@@ -406,7 +482,7 @@ function Builder:EnsureFactoryQuota()
     end
 end
 
--- NEW: Are all leased factories idle (no Building state and empty queue)?
+-- Are all leased factories idle (no Building state and empty queue)?
 function Builder:_AllFactoriesIdle()
     local any = false
     local allIdle = true
@@ -429,12 +505,36 @@ function Builder:_AllFactoriesIdle()
     return any and allIdle
 end
 
+function Builder:_HandOffPlatoon(units, label)
+    local platoon = self.brain:MakePlatoon(label or (self.tag .. '_Attack'), '')
+    local assign = {}
+    for _, u in ipairs(units or {}) do
+        if u and not u.Dead then
+            table.insert(assign, u)
+        end
+    end
+
+    if table.getn(assign) > 0 then
+        IssueClearCommands(assign)
+        self.brain:AssignUnitsToPlatoon(platoon, assign, 'Attack', 'GrowthFormation')
+    end
+
+    if self.params.attackFn then
+        platoon.PlatoonData = self.params.attackData or {}
+        _ForkAttack(platoon, self.params.attackFn, platoon.PlatoonData, self.tag)
+    else
+        self:Warn('No attackFn provided; platoon will idle')
+    end
+
+    _CallPlatoonCallbacks(self.platoonCallbacks, platoon, 'OnHandoff', self.tag)
+    return platoon
+end
+
 function Builder:EarlyHandoff(aliveList)
     local flist = _LiveFactoriesList(self, false)
     _ClearQueuesRestoreRally(self)
 
     -- Always create a fresh attack platoon and only add units with our tag
-    local attackPlatoon = self.brain:MakePlatoon(self.attackName or (self.tag..'_Attack'), '')
     local assign = {}
     for _, u in ipairs(aliveList or {}) do
         if isComplete(u) and u.ub_tag == self.tag then
@@ -442,16 +542,9 @@ function Builder:EarlyHandoff(aliveList)
         end
     end
 
-    if table.getn(assign) > 0 then
-        IssueClearCommands(assign)
-        self.brain:AssignUnitsToPlatoon(attackPlatoon, assign, 'Attack', 'GrowthFormation')
-    end
-
-    if self.params.attackFn then
-        attackPlatoon.PlatoonData = self.params.attackData or {}
-        _ForkAttack(attackPlatoon, self.params.attackFn, attackPlatoon.PlatoonData, self.tag)
-    else
-        self:Warn('EarlyHandoff: no attackFn; platoon will idle')
+    local attackPlatoon = self:_HandOffPlatoon(assign, self.attackName or (self.tag..'_Attack'))
+    if not attackPlatoon then
+        self:Warn('EarlyHandoff: no platoon created for handoff')
     end
 
     if self.leaseId then
@@ -747,15 +840,7 @@ function Builder:SpawnDirectAndSend(waveNo)
             end
         end
     end
-    local p = self.brain:MakePlatoon(string.format('%s_Attack_%d', self.tag, waveNo or 1), '')
-    self.brain:AssignUnitsToPlatoon(p, spawned, 'Attack', 'GrowthFormation')
-    if self.params.attackFn then
-        p.PlatoonData = self.params.attackData or {}
-        _ForkAttack(p, self.params.attackFn, p.PlatoonData, self.tag)
-    else
-        WARN(('[UB:%s] No attackFn provided; spawned platoon will idle.'):format(self.tag))
-    end
-    return p
+    return self:_HandOffPlatoon(spawned, string.format('%s_Attack_%d', self.tag, waveNo or 1))
 end
 
 function Builder:CollectorLoop()
@@ -941,7 +1026,6 @@ function Builder:MonitorLoop()
                 _ClearQueuesRestoreRally(self)
 
                 -- Build the attack platoon strictly from our tagged aliveList
-                attackPlatoon = self.brain:MakePlatoon(self.attackName, '')
                 local assign = {}
                 for _, u in ipairs(aliveList or {}) do
                     if isComplete(u) and u.ub_tag == self.tag then
@@ -949,23 +1033,12 @@ function Builder:MonitorLoop()
                     end
                 end
 
-                if table.getn(assign) > 0 then
-                    IssueClearCommands(assign)
-                    self.brain:AssignUnitsToPlatoon(attackPlatoon, assign, 'Attack', 'GrowthFormation')
-                end
-
-                local units = attackPlatoon:GetPlatoonUnits() or {}
+                attackPlatoon = self:_HandOffPlatoon(assign, self.attackName)
+                local units = attackPlatoon and attackPlatoon:GetPlatoonUnits() or {}
                 self:Dbg(('Handoff: attackPlatoon label=%s units=%d exists=%s')
-                    :format((attackPlatoon.GetPlatoonLabel and attackPlatoon:GetPlatoonLabel()) or 'nil',
+                    :format((attackPlatoon and attackPlatoon.GetPlatoonLabel and attackPlatoon:GetPlatoonLabel()) or 'nil',
                             table.getn(units),
-                            tostring(self.brain:PlatoonExists(attackPlatoon))))
-
-                if self.params.attackFn then
-                    attackPlatoon.PlatoonData = self.params.attackData or {}
-                    _ForkAttack(attackPlatoon, self.params.attackFn, attackPlatoon.PlatoonData, self.tag)
-                else
-                    self:Warn('No attackFn provided; not forking AI thread')
-                end
+                            tostring(attackPlatoon and self.brain:PlatoonExists(attackPlatoon))))
 
                 if self.leaseId then
                     self.base:ReturnLease(self.leaseId)
@@ -1167,20 +1240,9 @@ function Builder:RunCleanup()
 
     self.cleanupWave = (self.cleanupWave or 0) + 1
     local label = string.format('%s_Cleanup_%d', self.tag, self.cleanupWave)
-    local p = brain:MakePlatoon(label, '')
-
-    IssueClearCommands(idle)
-    brain:AssignUnitsToPlatoon(p, idle, 'Attack', 'GrowthFormation')
-
     self:Dbg(('Cleanup: handed %d idle units to attackFn as platoon %s')
         :format(count, label))
-
-    if self.params.attackFn then
-        p.PlatoonData = self.params.attackData or {}
-        _ForkAttack(p, self.params.attackFn, p.PlatoonData, self.tag)
-    else
-        self:Warn('Cleanup: no attackFn provided; cleanup platoon will idle')
-    end
+    self:_HandOffPlatoon(idle, label)
 end
 
 function Builder:WaitForMode2Gate(p)
@@ -1311,7 +1373,10 @@ function Builder:Mode3Loop(p)
             -- start AI if needed
             if self.params.attackFn then
                 _ForkAttack(p, self.params.attackFn, self.params.attackData or {}, self.tag)
+            else
+                self:Warn('Mode3: no attackFn provided; sustain platoon will idle')
             end
+            _CallPlatoonCallbacks(self.platoonCallbacks, p, 'OnHandoff', self.tag)
             if self.leaseId then
                 self.base:ReturnLease(self.leaseId)
                 self.leaseId = nil
@@ -1351,18 +1416,67 @@ function Builder:Mode3Loop(p)
     end
 end
 
+function Builder:_CollectStopHandoffUnits()
+    local collected, seen = {}, {}
+    local function add(u, requireIdle)
+        if not (u and not u.Dead and isComplete(u) and u:GetAIBrain() == self.brain and u.ub_tag == self.tag) then
+            return
+        end
+        if requireIdle then
+            local q = (u.GetCommandQueue and u:GetCommandQueue()) or {}
+            if table.getn(q) > 0 then
+                return
+            end
+        end
+        local id = u:GetEntityId()
+        if not seen[id] then
+            seen[id] = true
+            table.insert(collected, u)
+        end
+    end
+
+    for _, u in pairs(self.stagingSet or {}) do
+        add(u, false)
+    end
+    if self.stagingPlatoon and self.brain:PlatoonExists(self.stagingPlatoon) then
+        for _, u in ipairs(self.stagingPlatoon:GetPlatoonUnits() or {}) do
+            add(u, false)
+        end
+    end
+
+    local center = self.basePos or (self.base and self.base.basePos)
+    local radius = (self.params and self.params.radius) or (self.base and self.base.radius) or 60
+    if center and self.brain then
+        for _, u in ipairs(self.brain:GetUnitsAroundPoint(categories.MOBILE, center, radius, 'Ally') or {}) do
+            add(u, true)
+        end
+    end
+
+    return collected
+end
+
 function Builder:Stop()
     if self.stopped then return end
     self.stopped = true
 
-    if self.leaseId then
-        self.base:ReturnLease(self.leaseId)
-        self.leaseId = nil
-    end
+    local handoff = self:_CollectStopHandoffUnits()
+    local handoffCount = table.getn(handoff)
+
     if self.collectThread then KillThread(self.collectThread) self.collectThread = nil end
     if self.monitorThread then KillThread(self.monitorThread) self.monitorThread = nil end
     if self.rallyKeeperThread then KillThread(self.rallyKeeperThread) self.rallyKeeperThread = nil end
     if self.cleanupTimerThread then KillThread(self.cleanupTimerThread) self.cleanupTimerThread = nil end
+
+    _ClearQueuesRestoreRally(self)
+    if self.leaseId then
+        self.base:ReturnLease(self.leaseId)
+        self.leaseId = nil
+    end
+
+    if handoffCount > 0 then
+        self:Dbg(('Stop: handing off %d units before shutdown'):format(handoffCount))
+        self:_HandOffPlatoon(handoff, self.attackName or (self.tag .. '_Stop'))
+    end
 end
 
 -- ========== Public API ==========
@@ -1385,8 +1499,16 @@ function Start(params)
     o.stopped = false
     if not o.basePos then error('Invalid baseMarker: '.. tostring(params.baseMarker)) end
     o.wanted, o.bpOrder = flattenCounts(params.composition, params.difficulty or 2)
+    o.platoonCallbacks = _NormalizeCallbacks(o.params.platoonCallbacks, 'OnHandoff', o.tag)
     o:Start()
     return o
 end
 
 function Stop(handle) if handle and handle.Stop then handle:Stop() end end
+
+-- Add a platoon callback after creation; fn may be a function or global name; eventName defaults to 'OnHandoff'.
+function AddCallback(handle, fn, eventName)
+    if handle and handle.AddCallback then
+        handle:AddCallback(fn, eventName)
+    end
+end

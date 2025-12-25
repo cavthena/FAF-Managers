@@ -36,19 +36,26 @@
 --     debug              = false,
 --   }
 --
+-- Callbacks can be added at any time (before or after Start) just like unit callbacks:
+--   handle:AddCallback(fn, 'OnWaveCreated')
+--   handle:AddCallback(fn, 'OnWaveNumber', targetWaveNumber)   -- targetWaveNumber is required for this event
+--   handle:AddCallback(fn, 'OnSpawnerComplete')
+--   handle:AddCallback(fn, 'OnMode2ThresholdMet')
 -- Optional callbacks (function handle or global function name). They are skipped when nil/false.
---   onPlatoonCreated(spawner, waveIndex, platoon, units, wanted)
---       • May return replacement values for platoon, units, and wanted.
---       • Use this to provide PlatoonData or alter the spawned set before handoff.
---   onWaveCreated(spawner, waveIndex, platoon, unitCount, wanted)
---       • Return false to stop the spawner after the callback finishes; any other value keeps it running.
---       • Use this to gate later waves based on scenario logic.
---   onMode3Complete(spawner, totalWaves)
---       • Invoked once when mode 3 finishes normally (not called when stopped early).
+--   OnWaveCreated(spawner, waveIndex, platoon, unitCount, wanted)
+--       • Returns true by default; return false to stop the spawner after the callback finishes.
+--       • Use this to gate later waves based on scenario logic or to confirm creation.
+--   OnWaveNumber(spawner, waveIndex, platoon, unitCount, wanted)
+--       • Invoked only when the wave number matches the callback’s registered target wave. Returns true by default.
+--   OnSpawnerComplete(spawner, mode, waveCount)
+--       • Invoked when mode 3 or mode 4 finishes normally. Returns true by default.
+--   OnMode2ThresholdMet(spawner, platoon, aliveCount, expectedCount, threshold)
+--       • Invoked in mode 2 when the loss-gated threshold is met. Returns true by default.
 -- Example defaults (no custom behaviour):
---   onPlatoonCreated = nil
---   onWaveCreated    = nil
---   onMode3Complete  = nil
+--   OnWaveCreated    = nil
+--   OnWaveNumber     = nil
+--   OnSpawnerComplete = nil
+--   OnMode2ThresholdMet = nil
 --   Spawner.Stop(handle)
 
 local ScenarioUtils = import('/lua/sim/ScenarioUtilities.lua')
@@ -222,8 +229,8 @@ end
          end
      end
      return wanted
- end
- 
+end
+
 function Spawner:CreatePlatoon(label, units)
     local platoon = self.brain:MakePlatoon(label, '')
     if units and table.getn(units) > 0 then
@@ -232,25 +239,70 @@ function Spawner:CreatePlatoon(label, units)
     return platoon
 end
 
-function Spawner:InvokeCallback(field, a, b, c, d, e)
-    local cb = self.params and self.params[field]
-    if not cb then return false end
+function Spawner:AddCallback(cb, eventName, eventData)
+    if not cb or not eventName then
+        return
+    end
+    self.callbacks = self.callbacks or {}
+    self.callbacks[eventName] = self.callbacks[eventName] or {}
+    table.insert(self.callbacks[eventName], { fn = cb, data = eventData })
+end
 
-    local fn = resolveCallback(cb)
-    if not fn then
-        self:Warn(('Callback %s is not callable: %s'):format(field, tostring(cb)))
-        return false
+local function _CallbackEntry(cb)
+    if type(cb) == 'table' then
+        return cb.fn or cb[1], cb.data or cb[2]
+    end
+    return cb, nil
+end
+
+function Spawner:InvokeBooleanCallbacks(eventName, defaultReturn, a, b, c, d, e)
+    local list = self.callbacks and self.callbacks[eventName]
+    if not list or table.getn(list) == 0 then
+        return defaultReturn
     end
 
-    -- pcall passes args directly; no varargs needed
-    local ok, r1, r2, r3, r4 = pcall(fn, self, a, b, c, d, e)
-    if not ok then
-        self:Warn(('Callback %s failed: %s'):format(field, tostring(r1)))
-        return false
-    end
+    local result = defaultReturn
+    for _, cb in ipairs(list) do
+        local fn, data = _CallbackEntry(cb)
+        local shouldProcess = true
+        if eventName == 'OnWaveNumber' and data ~= nil and data ~= a then
+            shouldProcess = false
+        end
 
-    -- return “called” plus any values the callback returned
-    return true, r1, r2, r3, r4
+        if shouldProcess then
+            fn = resolveCallback(fn)
+            if not fn then
+                self:Warn(('Callback %s is not callable: %s'):format(eventName, tostring(cb)))
+            else
+                local ok, r1 = pcall(fn, self, a, b, c, d, e)
+                if not ok then
+                    self:Warn(('Callback %s failed: %s'):format(eventName, tostring(r1)))
+                elseif r1 ~= nil then
+                    if r1 == false then
+                        result = false
+                    elseif result ~= false then
+                        result = r1
+                    end
+                end
+            end
+        end
+    end
+    return result
+end
+
+function Spawner:RegisterInitialCallbacks()
+    local initial = {
+        OnWaveCreated        = self.params.onWaveCreated or self.params.OnWaveCreated,
+        OnWaveNumber         = self.params.onWaveNumber or self.params.OnWaveNumber,
+        OnSpawnerComplete    = self.params.onSpawnerComplete or self.params.OnSpawnerComplete,
+        OnMode2ThresholdMet  = self.params.onMode2ThresholdMet or self.params.OnMode2ThresholdMet,
+    }
+
+    for eventName, cb in pairs(initial) do
+        if cb then
+            self:AddCallback(cb, eventName)
+        end
+    end
 end
 
 
@@ -307,25 +359,12 @@ function Spawner:SpawnWave(waveNo, wanted)
 
     local label = string.format('%s_Wave_%d', self.tag, waveNo or 1)
     local platoon = self:CreatePlatoon(label, spawned)
-    local usedWanted = wanted
-    local called, newPlatoon, newUnits, newWanted = self:InvokeCallback('onPlatoonCreated', waveNo or 1, platoon, spawned, wanted)
-    if called then
-        if newPlatoon ~= nil then
-            platoon = newPlatoon
-        end
-        if newUnits ~= nil then
-            spawned = newUnits
-        end
-        if newWanted ~= nil then
-            usedWanted = newWanted
-        end
-    end
 
     self:HandOffToAttack(platoon)
 
     local unitCount = resolveUnitCount(spawned)
     self:Dbg(('SpawnWave: spawned %d units as %s'):format(unitCount, label))
-    return platoon, spawned, unitCount, usedWanted
+    return platoon, spawned, unitCount, wanted
 end
  
  function Spawner:WaitForLossGate(platoon, expectedCount)
@@ -336,15 +375,20 @@ end
      end
  
      while not self.stopped do
-         if not platoon or not self.brain:PlatoonExists(platoon) then
-             self:Dbg('Mode2Gate: platoon gone; gate passed')
-             return
-         end
+        if not platoon or not self.brain:PlatoonExists(platoon) then
+            local alive = countComplete((platoon and platoon.GetPlatoonUnits and platoon:GetPlatoonUnits()) or {})
+            self:Dbg('Mode2Gate: platoon gone; gate passed')
+            self:InvokeBooleanCallbacks('OnMode2ThresholdMet', true, platoon, alive, wantTotal, thr)
+            return
+        end
          local alive = countComplete(platoon:GetPlatoonUnits() or {})
          local lost = math.max(0, wantTotal - alive)
          local frac = (wantTotal > 0) and (lost / wantTotal) or 1
          self:Dbg(('Mode2Gate: alive=%d lost=%d frac=%.2f thr=%.2f'):format(alive, lost, frac, thr))
-         if frac >= thr then return end
+        if frac >= thr then
+            self:InvokeBooleanCallbacks('OnMode2ThresholdMet', true, platoon, alive, wantTotal, thr)
+            return
+        end
          WaitSeconds(2)
      end
  end
@@ -371,8 +415,11 @@ function Spawner:RunMode1()
     while not self.stopped do
         self.wave = (self.wave or 0) + 1
         local platoon, units, unitCount, wanted = self:SpawnWave(self.wave, self.baseWanted)
-        local called, keepRunning = self:InvokeCallback('onWaveCreated', self.wave, platoon, unitCount, wanted)
-        if called and keepRunning == false then
+        local keepRunning = self:InvokeBooleanCallbacks('OnWaveNumber', true, self.wave, platoon, unitCount, wanted)
+        if keepRunning ~= false then
+            keepRunning = self:InvokeBooleanCallbacks('OnWaveCreated', keepRunning, self.wave, platoon, unitCount, wanted)
+        end
+        if keepRunning == false then
             self:Stop()
             break
         end
@@ -384,8 +431,11 @@ function Spawner:RunMode2()
     while not self.stopped do
         self.wave = (self.wave or 0) + 1
         local platoon, units, unitCount, wanted = self:SpawnWave(self.wave, self.baseWanted)
-        local called, keepRunning = self:InvokeCallback('onWaveCreated', self.wave, platoon, unitCount, wanted)
-        if called and keepRunning == false then
+        local keepRunning = self:InvokeBooleanCallbacks('OnWaveNumber', true, self.wave, platoon, unitCount, wanted)
+        if keepRunning ~= false then
+            keepRunning = self:InvokeBooleanCallbacks('OnWaveCreated', keepRunning, self.wave, platoon, unitCount, wanted)
+        end
+        if keepRunning == false then
             self:Stop()
         end
         if self.stopped then break end
@@ -412,8 +462,11 @@ function Spawner:RunMode3()
             self:Dbg(('Mode3: wave %d has no units to spawn'):format(wave))
         end
         local platoon, units, unitCount, usedWanted = self:SpawnWave(wave, wanted)
-        local called, keepRunning = self:InvokeCallback('onWaveCreated', wave, platoon, unitCount, usedWanted)
-        if called and keepRunning == false then
+        local keepRunning = self:InvokeBooleanCallbacks('OnWaveNumber', true, wave, platoon, unitCount, usedWanted)
+        if keepRunning ~= false then
+            keepRunning = self:InvokeBooleanCallbacks('OnWaveCreated', keepRunning, wave, platoon, unitCount, usedWanted)
+        end
+        if keepRunning == false then
             self:Stop()
             break
         end
@@ -425,7 +478,7 @@ function Spawner:RunMode3()
         end
     end
     if not self.stopped then
-        self:InvokeCallback('onMode3Complete', totalWaves)
+        self:InvokeBooleanCallbacks('OnSpawnerComplete', true, 3, totalWaves)
     end
     self.stopped = true
 end
@@ -439,8 +492,11 @@ function Spawner:RunMode4()
         if self.stopped then break end
         self.wave = (self.wave or 0) + 1
         local platoon, units, unitCount, wanted = self:SpawnWave(self.wave, self.baseWanted)
-        local called, keepRunning = self:InvokeCallback('onWaveCreated', self.wave, platoon, unitCount, wanted)
-        if called and keepRunning == false then
+        local keepRunning = self:InvokeBooleanCallbacks('OnWaveNumber', true, self.wave, platoon, unitCount, wanted)
+        if keepRunning ~= false then
+            keepRunning = self:InvokeBooleanCallbacks('OnWaveCreated', keepRunning, self.wave, platoon, unitCount, wanted)
+        end
+        if keepRunning == false then
             self:Stop()
         end
         if self.stopped then break end
@@ -448,6 +504,10 @@ function Spawner:RunMode4()
             WaitSeconds(interval)
         end
     end
+    if not self.stopped then
+        self:InvokeBooleanCallbacks('OnSpawnerComplete', true, 4, self.wave or batchCount)
+    end
+    self.stopped = true
 end
  
 function Spawner:MainLoop()
@@ -497,8 +557,9 @@ end
         formation          = p.formation or 'GrowthFormation',
         debug              = p.debug and true or false,
         onWaveCreated      = p.onWaveCreated,
-        onPlatoonCreated   = p.onPlatoonCreated,
-        onMode3Complete    = p.onMode3Complete,
+        onWaveNumber       = p.onWaveNumber,
+        onSpawnerComplete  = p.onSpawnerComplete,
+        onMode2ThresholdMet = p.onMode2ThresholdMet,
     }
 end
  
@@ -514,16 +575,18 @@ end
      if table.getn(o.spawnPositions) == 0 then
          error('Invalid spawnMarker: '.. tostring(o.params.spawnMarker))
      end
-     o.lastSpawnIndex = 0
-     o.stopped     = false
-     o.wave        = 0
-     o.composition = o.params.composition
-     o.baseWanted  = o:BuildWantedForWave(nil)
-     o:Start()
-     return o
- end
+    o.lastSpawnIndex = 0
+    o.stopped     = false
+    o.wave        = 0
+    o.composition = o.params.composition
+    o.baseWanted  = o:BuildWantedForWave(nil)
+    o.callbacks   = {}
+    o:RegisterInitialCallbacks()
+    o:Start()
+    return o
+end
  
- function Stop(handle)
+function Stop(handle)
      if handle and handle.Stop then handle:Stop() end
  end
  

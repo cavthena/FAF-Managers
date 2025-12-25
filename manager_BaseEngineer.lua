@@ -56,6 +56,7 @@ Public API
         baseHandle:UpdateEngineerTasks(preferencesTable)
             -- Accepts Start.tasks fields (weights/exp) to tweak severity or experimental config at runtime
         baseHandle:GetStructureSnapshot()
+        baseHandle:AddBuildGroup(structGroupName)
         baseHandle:GetEngineerHandle()
         baseHandle:Stop()
 
@@ -892,39 +893,131 @@ function M:_AssignEngineer(id, u, task)
     end
 end
 
-function M:_InitStructTemplate()
-    self.struct = { slots = {} }
-    local seen = {}
+local function _SpecPosition(spec)
+    if not spec then return nil end
+    return spec.Position or spec.position or spec.Pos or spec.pos
+end
 
-    for _, gname in ipairs(self.params.structGroups or {}) do
-        -- NEW: prefer the live units we spawned; fall back to editor group lookup
-        local units = (self.structGroupUnits and self.structGroupUnits[gname]) or _TryGetUnitsFromGroup(gname) or {}
-        for i = 1, table.getn(units) do
-            local u = units[i]
+local function _SpecFacing(spec)
+    if not spec then return 0 end
+    local o = spec.Orientation or spec.orientation or {}
+    return o[1] or 0
+end
+
+local function _SpecBlueprintId(spec)
+    if not spec then return nil end
+    local id = spec.type or spec.bp or spec.bpId or spec.BlueprintId or spec.blueprintId or spec.UnitId
+    if type(id) == 'string' then
+        return string.lower(id)
+    end
+    return nil
+end
+
+function M:_StructKey(bp, pos)
+    if not (bp and pos and pos[1] and pos[3]) then return nil end
+    return string.format('%s@%.1f,%.1f,%.1f', bp, pos[1], pos[2] or 0, pos[3])
+end
+
+function M:_EnsureStructState()
+    self.struct = self.struct or { slots = {} }
+    self.structKeys = self.structKeys or {}
+end
+
+function M:_GetGroupUnitsOrSpec(gname)
+    if not gname then return {}, false end
+
+    local liveUnits = (self.structGroupUnits and self.structGroupUnits[gname]) or _TryGetUnitsFromGroup(gname) or {}
+    if table.getn(liveUnits) > 0 then
+        return liveUnits, true
+    end
+
+    local armyName = _ArmyNameFromBrain(self.brain)
+    if armyName and ScenarioUtils.AssembleArmyGroup then
+        local ok, spec = pcall(function() return ScenarioUtils.AssembleArmyGroup(armyName, gname) end)
+        if ok and type(spec) == 'table' and next(spec) then
+            return spec, false
+        end
+    end
+
+    return {}, false
+end
+
+function M:_AbsorbStructGroup(gname)
+    if not gname then return 0 end
+    self:_EnsureStructState()
+
+    local slotsAdded = 0
+    local slots, isLive = self:_GetGroupUnitsOrSpec(gname)
+
+    local function addSlot(bpTarget, pos, facing)
+        if not (bpTarget and pos and pos[1] and pos[3]) then return end
+        local target = string.lower(bpTarget)
+        local key = self:_StructKey(target, pos)
+        if key and not self.structKeys[key] then
+            table.insert(self.struct.slots, {
+                bpTarget = target,
+                bpRoot   = _ChainRoot(target) or target,
+                pos      = pos,
+                facing   = facing or 0,
+            })
+            self.structKeys[key] = true
+            slotsAdded = slotsAdded + 1
+        end
+    end
+
+    if isLive then
+        for i = 1, table.getn(slots) do
+            local u = slots[i]
             if _unitIsStructure(u) then
-                local targetBp = _bpIdFromUnit(u)
-                local pos      = _posOf(u)
-                if targetBp and pos then
-                    local slot = {
-                        bpTarget = targetBp,
-                        bpRoot   = _ChainRoot(targetBp) or targetBp,
-                        pos      = pos,
-                        facing   = _headingOf(u),
-                    }
-                    local key = string.format('%s@%.1f,%.1f,%.1f', slot.bpTarget, pos[1], pos[2], pos[3])
-                    if not seen[key] then
-                        table.insert(self.struct.slots, slot)
-                        seen[key] = true
-                    end
-                end
+                addSlot(_bpIdFromUnit(u), _posOf(u), _headingOf(u))
             end
         end
+    else
+        for _, spec in pairs(slots or {}) do
+            addSlot(_SpecBlueprintId(spec), _SpecPosition(spec), _SpecFacing(spec))
+        end
+    end
+
+    return slotsAdded
+end
+
+function M:_InitStructTemplate()
+    self.struct = { slots = {} }
+    self.structKeys = {}
+
+    local total = 0
+    for _, gname in ipairs(self.params.structGroups or {}) do
+        total = total + (self:_AbsorbStructGroup(gname) or 0)
     end
 
     if self.params.debug then
         self:Dbg(('StructTemplate: %d slots captured from %d group(s)')
             :format(table.getn(self.struct.slots or {}), table.getn(self.params.structGroups or {})))
     end
+end
+
+function M:AddBuildGroup(gname)
+    if not gname then return 0 end
+    self.params.structGroups = self.params.structGroups or {}
+    local exists = false
+    for _, name in ipairs(self.params.structGroups) do
+        if name == gname then
+            exists = true
+            break
+        end
+    end
+    if not exists then
+        table.insert(self.params.structGroups, gname)
+    end
+
+    local added = self:_AbsorbStructGroup(gname) or 0
+    if added > 0 then
+        self:Dbg(('Struct group added to snapshot: "%s" (%d slots)'):format(gname, added))
+        self:_SyncStructureDemand()
+    elseif self.params.debug then
+        self:Dbg(('Struct group "%s" added but no new slots captured'):format(tostring(gname)))
+    end
+    return added
 end
 
 function M:_SyncStructureDemand()
@@ -2246,6 +2339,26 @@ function Base:PushEngineerBuildTask(bp, pos, facing)
     if self.engineers and self.engineers.PushBuildTask then
         self.engineers:PushBuildTask(bp, pos, facing)
     end
+end
+
+function Base:AddBuildGroup(groupName)
+    if not groupName then return 0 end
+    self.params.structGroups = self.params.structGroups or {}
+    local seen = false
+    for _, name in ipairs(self.params.structGroups) do
+        if name == groupName then
+            seen = true
+            break
+        end
+    end
+    if not seen then
+        table.insert(self.params.structGroups, groupName)
+    end
+
+    if self.engineers and self.engineers.AddBuildGroup then
+        return self.engineers:AddBuildGroup(groupName)
+    end
+    return 0
 end
 
 function Base:UpdateEngineerTasks(prefs)

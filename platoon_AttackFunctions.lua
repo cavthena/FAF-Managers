@@ -58,6 +58,18 @@ Overview
         AttackFns.HuntAttack(platoon, data)
     end
 
+    -- Defense patrol ---------------------------------------------------------
+    function GuardApproaches(platoon)
+        local data = {
+            BaseMarker     = 'Main_Base_Marker', -- marker or position to defend
+            VectorMargin   = 12,                 -- bucket size for approach angles (degrees)
+            PatrolWidth    = 80,                 -- width of the patrol arc (degrees)
+            PatrolDistance = 100,                -- distance from base for patrol points
+            Formation      = 'GrowthFormation',
+        }
+        AttackFns.DefensePatrol(platoon, data)
+    end
+
 Universal parameters
     All attack functions accept the arguments listed below through their
     `attackData` table.  Missing fields fall back to the stated defaults.
@@ -122,6 +134,14 @@ HuntAttack specifics
         avoid defended targets, waiting for them to leave the threat ring or
         switching if another safe target exists.  If no targets are available,
         the platoon idles at `Marker`/`IdleMarker` (air platoons orbit).
+
+DefensePatrol specifics
+        The platoon defends the specified base marker/position by selecting a
+        unique approach vector toward enemy bases using `VectorMargin` degree
+        buckets to avoid overlap with other patrols.  It builds a patrol arc of
+        width `PatrolWidth` degrees at `PatrolDistance` from the base, clamped
+        to passable terrain for the platoon’s movement layer, and loops along
+        that route while alive.
 ================================================================================
 ]]
 
@@ -138,10 +158,13 @@ local math_abs      = math.abs
 local math_min      = math.min
 local math_max      = math.max
 local math_floor    = math.floor
+local math_atan2    = math.atan2 or math.atan
 local math_random   = math.random
 local math_cos      = math.cos
 local math_sin      = math.sin
+local math_pi       = math.pi
 local math_huge     = math.huge or 1e9
+local math_mod      = math.mod or math.fmod
 
 local RecheckDelay            = 60
 local WaveAreaRadius          = 50
@@ -160,6 +183,9 @@ local PlayableIngressBuffer   = 10
 local HuntRepathDistanceSq    = 400
 local HuntAttackDistanceSq    = 2500
 local HuntDefenseWait         = 5
+local DefaultVectorMargin     = 10
+local DefaultPatrolWidth      = 60
+local DefaultPatrolDistance   = 80
 
 local StructureCategory = categories.STRUCTURE - categories.WALL
 local NavalStructure    = categories.STRUCTURE * categories.NAVAL
@@ -189,6 +215,8 @@ local FormationOptions = {
     GrowthFormation = true,
     NoFormation     = true,
 }
+
+local DefensePatrolAssignments = {}
 
 local function SafeWait(seconds)
     if seconds and seconds > 0 then
@@ -701,6 +729,14 @@ local function CollectCandidateAreas(brain, startPos, opts, layer)
     end
 end
 
+local function CollectAdjustedCandidates(brain, startPos, opts, layer)
+    local candidates = CollectCandidateAreas(brain, startPos, opts, layer)
+    if opts.AvoidDef then
+        AdjustForAvoidance(brain, candidates, layer)
+    end
+    return candidates
+end
+
 local function DefenseThreatNear(brain, position, layer)
     if not position then return 0 end
     local threatType = (layer == 'Air') and 'AntiAir' or 'AntiSurface'
@@ -775,10 +811,7 @@ local function ChooseBestArea(brain, platoon, opts, layer, areaRadius, mode, cat
     local startPos = GetPlatoonPosition(platoon)
     if not startPos then return nil end
 
-    local candidates = CollectCandidateAreas(brain, startPos, opts, layer)
-    if opts.AvoidDef then
-        AdjustForAvoidance(brain, candidates, layer)
-    end
+    local candidates = CollectAdjustedCandidates(brain, startPos, opts, layer)
 
     local enemies = BrainEnemies(brain, opts.TargetArmy)
     local bestScore = -1e9
@@ -823,10 +856,7 @@ local function FindRaidTarget(brain, platoon, opts, layer)
         if not considered[id] then
             considered[id] = true
             if id == 'SMT' then
-                local candidates = CollectCandidateAreas(brain, startPos, opts, layer)
-                if opts.AvoidDef then
-                    AdjustForAvoidance(brain, candidates, layer)
-                end
+                local candidates = CollectAdjustedCandidates(brain, startPos, opts, layer)
                 local bestScore = -1
                 local best
                 local labels = { 'ECO', 'BLD', 'INT', 'DEF' }
@@ -879,10 +909,7 @@ local function FindRaidTarget(brain, platoon, opts, layer)
             else
                 local category = RaidCategories[id]
                 if category then
-                    local candidates = CollectCandidateAreas(brain, startPos, opts, layer)
-                    if opts.AvoidDef then
-                        AdjustForAvoidance(brain, candidates, layer)
-                    end
+                    local candidates = CollectAdjustedCandidates(brain, startPos, opts, layer)
 
                     local best
                     local bestThreat   = math_huge   -- lowest local defence wins
@@ -984,7 +1011,7 @@ local function FindSafePath(platoon, layer, destination, startOverride)
     if ok and path then
         return AppendDestination(path, destination)
     end
-    return { CopyVector(destination) }
+    return nil
 end
 
 local function MergePathSegments(segments)
@@ -1148,14 +1175,22 @@ local function AttackTargetArea(platoon, target, opts)
         end
     end
 
-    if not CanPathTo(platoon, layer, target.position) then
+    local canPath = CanPathTo(platoon, layer, target.position)
+    if not canPath then
         if opts.Transport then
             if not TransportAndMove(platoon, target.position, opts) then
                 return 'fail'
             end
+            path = FindSafePath(platoon, layer, target.position)
         else
             return 'fail'
         end
+    elseif not path then
+        path = FindSafePath(platoon, layer, target.position)
+    end
+
+    if not path then
+        return 'fail'
     end
 
     MoveAlongPath(platoon, path, opts.Formation)
@@ -1487,6 +1522,200 @@ local function IdleAtMarker(platoon, markerPos, layer, formation)
     end
 end
 
+local function NormalizeDegrees(deg)
+    deg = math_mod(deg, 360)
+    if deg < 0 then
+        deg = deg + 360
+    end
+    return deg
+end
+
+local function AngleBetweenPositions(a, b)
+    local dx = b[1] - a[1]
+    local dz = b[3] - a[3]
+    return NormalizeDegrees(math_atan2(dz, dx) * 180 / math_pi)
+end
+
+local function BucketAngle(deg, margin)
+    margin = margin or DefaultVectorMargin
+    if margin <= 0 then
+        return NormalizeDegrees(deg)
+    end
+    local bucket = math_floor((deg + (margin * 0.5)) / margin) * margin
+    return NormalizeDegrees(bucket)
+end
+
+local function PruneDefensePatrolAssignments()
+    for bucket, platoon in pairs(DefensePatrolAssignments) do
+        if not PlatoonAlive(platoon) then
+            DefensePatrolAssignments[bucket] = nil
+        end
+    end
+end
+
+local function CanPathBetween(layer, a, b)
+    if not (a and b) then
+        return false
+    end
+    local ok, can = pcall(NavUtils.CanPathTo, layer, a, b)
+    return ok and can
+end
+
+local function SafePatrolPoint(layer, basePos, angleDeg, distance)
+    local attempts = 3
+    local dist = distance
+    local angleRad = angleDeg * math_pi / 180
+    while attempts > 0 do
+        local x = basePos[1] + math_cos(angleRad) * dist
+        local z = basePos[3] + math_sin(angleRad) * dist
+        local point = { x, GetSurfaceHeight(x, z), z }
+        if CanPathBetween(layer, basePos, point) then
+            return point
+        end
+        dist = dist * 0.6
+        attempts = attempts - 1
+    end
+    return nil
+end
+
+local function BuildPatrolPoints(layer, basePos, angleDeg, widthDeg, distance)
+    local halfWidth = (widthDeg or DefaultPatrolWidth) * 0.5
+    local leftAngle = angleDeg - halfWidth
+    local rightAngle = angleDeg + halfWidth
+
+    local leftPoint = SafePatrolPoint(layer, basePos, leftAngle, distance)
+    local rightPoint = SafePatrolPoint(layer, basePos, rightAngle, distance)
+
+    if not (leftPoint and rightPoint) then
+        return nil
+    end
+
+    return {
+        leftPoint,
+        rightPoint,
+        basePos,
+    }
+end
+
+local function IssuePatrolRoute(platoon, points, formation)
+    if not (platoon and points and table_getn(points) > 0) then
+        return
+    end
+    local units = platoon:GetPlatoonUnits() or {}
+    if table_getn(units) == 0 then
+        return
+    end
+
+    IssueClearCommands(units)
+    platoon:SetPlatoonFormationOverride(formation or 'GrowthFormation')
+
+    for _, point in ipairs(points) do
+        IssuePatrol(units, point)
+    end
+
+    -- close the loop
+    IssuePatrol(units, points[1])
+end
+
+local function EnemyBasePositions(brain)
+    local positions = {}
+    if not brain then
+        return positions
+    end
+
+    local enemies = BrainEnemies(brain, nil)
+    local seen = {}
+
+    for _, enemyIndex in ipairs(enemies) do
+        local eBrain = ArmyBrains[enemyIndex]
+        if eBrain then
+            local candidates = {}
+            if eBrain.StartPos then
+                table_insert(candidates, eBrain.StartPos)
+            end
+            local name = eBrain.Nickname or eBrain.Name or string.format('ARMY_%s', enemyIndex)
+            if ScenarioInfo and ScenarioInfo.ArmySetup and name and ScenarioInfo.ArmySetup[name] and ScenarioInfo.ArmySetup[name].StartPos then
+                table_insert(candidates, ScenarioInfo.ArmySetup[name].StartPos)
+            end
+            local ok, markerPos = pcall(ScenarioUtils.MarkerToPosition, name)
+            if ok and markerPos then
+                table_insert(candidates, markerPos)
+            end
+            local commanders = eBrain:GetListOfUnits(categories.COMMAND, false) or {}
+            for _, commander in ipairs(commanders) do
+                if commander and not commander.Dead then
+                    local pos = commander:GetPosition()
+                    if pos then
+                        table_insert(candidates, pos)
+                    end
+                end
+            end
+
+            for _, pos in ipairs(candidates) do
+                if pos and pos[1] and pos[3] then
+                    local key = string.format('%.1f:%.1f', pos[1], pos[3])
+                    if not seen[key] then
+                        seen[key] = true
+                        table_insert(positions, { pos[1], GetSurfaceHeight(pos[1], pos[3]), pos[3] })
+                    end
+                end
+            end
+        end
+    end
+
+    return positions
+end
+
+local function BuildDefenseVectors(brain, basePos, margin)
+    local candidates = {}
+    local enemyBases = EnemyBasePositions(brain)
+    for _, targetPos in ipairs(enemyBases) do
+        local angle = AngleBetweenPositions(basePos, targetPos)
+        local bucket = BucketAngle(angle, margin)
+        local distance = Distance(basePos, targetPos)
+        local existing = candidates[bucket]
+        if (not existing) or distance < existing.distance then
+            candidates[bucket] = {
+                bucket = bucket,
+                angle = angle,
+                distance = distance,
+            }
+        end
+    end
+
+    local list = {}
+    for _, entry in pairs(candidates) do
+        table_insert(list, entry)
+    end
+
+    table.sort(list, function(a, b)
+        if math_abs(a.distance - b.distance) < 0.001 then
+            return a.bucket < b.bucket
+        end
+        return a.distance < b.distance
+    end)
+
+    return list
+end
+
+local function AssignDefenseVector(platoon, candidates)
+    if not candidates then
+        return nil
+    end
+
+    PruneDefensePatrolAssignments()
+
+    for _, entry in ipairs(candidates) do
+        local assigned = DefensePatrolAssignments[entry.bucket]
+        if not assigned or assigned == platoon then
+            DefensePatrolAssignments[entry.bucket] = platoon
+            return entry
+        end
+    end
+
+    return nil
+end
+
 local function FindHuntTarget(brain, platoon, opts, layer, excluded, requireSafe)
     if not (brain and platoon and opts and opts.HuntSet and next(opts.HuntSet)) then
         return nil
@@ -1714,11 +1943,15 @@ function HuntAttack(platoon, data)
 
     local currentTarget = nil
     local idleIssued = false
+    local excludedIntel = {}
 
     while PlatoonAlive(platoon) do
         if currentTarget then
             local status = TrackHuntTarget(platoon, currentTarget, opts, layer)
             if status == 'destroyed' or status == 'intel' or status == 'fail' then
+                if status == 'intel' and currentTarget.unit and currentTarget.unit.EntityId then
+                    excludedIntel[currentTarget.unit.EntityId] = true
+                end
                 currentTarget = nil
             elseif status == 'defended' then
                 local excluded = {}
@@ -1735,9 +1968,10 @@ function HuntAttack(platoon, data)
                 SafeWait(RecheckDelay)
             end
         else
-            local target = FindHuntTarget(brain, platoon, opts, layer)
+            local target = FindHuntTarget(brain, platoon, opts, layer, excludedIntel)
             if target then
                 currentTarget = target
+                excludedIntel = {}
                 idleIssued = false
             else
                 if opts.MarkerPosition and not idleIssued then
@@ -1753,9 +1987,47 @@ function HuntAttack(platoon, data)
     end
 end
 
+function DefensePatrol(platoon, data)
+    local opts = CopyOptions(data)
+    local brain = platoon:GetBrain()
+    if not brain then return end
+    local layer = DetermineLayer(platoon, opts.Amphibious)
+
+    local basePos = ResolveMarkerPosition(data and (data.BaseMarker or data.BasePosition)) or GetPlatoonPosition(platoon)
+    if not basePos then
+        return
+    end
+    basePos = SurfacePoint(basePos)
+
+    local vectorMargin   = math_max(1, (data and (data.VectorMargin or data.VectorSpread or data.MarginDegrees)) or DefaultVectorMargin)
+    local patrolWidthDeg = (data and (data.PatrolWidth or data.WidthDegrees or data.Width)) or DefaultPatrolWidth
+    local patrolDistance = (data and (data.PatrolDistance or data.Distance)) or DefaultPatrolDistance
+
+    local vectors = BuildDefenseVectors(brain, basePos, vectorMargin)
+    local selected = AssignDefenseVector(platoon, vectors)
+    if not selected then
+        return
+    end
+
+    local patrolPoints = BuildPatrolPoints(layer, basePos, selected.angle, patrolWidthDeg, patrolDistance)
+    if not patrolPoints then
+        DefensePatrolAssignments[selected.bucket] = nil
+        return
+    end
+
+    IssuePatrolRoute(platoon, patrolPoints, opts.Formation)
+
+    while PlatoonAlive(platoon) do
+        SafeWait(RecheckDelay)
+    end
+
+    DefensePatrolAssignments[selected.bucket] = nil
+end
+
 return {
     WaveAttack = WaveAttack,
     RaidAttack = RaidAttack,
     ScoutAttack = ScoutAttack,
     HuntAttack = HuntAttack,
+    DefensePatrol = DefensePatrol,
 }
