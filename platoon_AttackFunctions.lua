@@ -126,14 +126,16 @@ ScoutAttack specifics
 
 HuntAttack specifics
         Accepts `Blueprint`, `Blueprints`, `TargetBP`, or `TargetBlueprints`
-        containing a single id or list of blueprint ids to pursue.  The platoon
-        locks on to the closest matching unit, travelling through safe paths
-        and refusing to switch targets until the victim is destroyed or intel
-        contact is lost.  When `IntelOnly` is true the target must be scouted
-        or have an existing blip.  Setting `Vulnerable` forces the platoon to
-        avoid defended targets, waiting for them to leave the threat ring or
-        switching if another safe target exists.  If no targets are available,
-        the platoon idles at `Marker`/`IdleMarker` (air platoons orbit).
+        containing a single id or list of blueprint ids to pursue.  Category
+        targeting is available through `Category`, `Categories`,
+        `TargetCategory`, or `TargetCategories`.  The platoon locks on to the
+        closest matching unit, travelling through safe paths and refusing to
+        switch targets until the victim is destroyed or intel contact is lost.
+        When `IntelOnly` is true the target must be scouted or have an existing
+        blip.  Setting `Vulnerable` forces the platoon to avoid defended
+        targets, waiting for them to leave the threat ring or switching if
+        another safe target exists.  If no targets are available, the platoon
+        idles at `Marker`/`IdleMarker` (air platoons orbit).
 
 DefensePatrol specifics
         The platoon defends the specified base marker/position by selecting a
@@ -183,6 +185,9 @@ local PlayableIngressBuffer   = 10
 local HuntRepathDistanceSq    = 400
 local HuntAttackDistanceSq    = 2500
 local HuntDefenseWait         = 5
+local HuntRecheckInterval     = 1
+local HuntOrbitPoints         = 8
+local HuntOrbitRadius         = 32
 local DefaultVectorMargin     = 10
 local DefaultPatrolWidth      = 60
 local DefaultPatrolDistance   = 80
@@ -729,6 +734,12 @@ local function CollectCandidateAreas(brain, startPos, opts, layer)
     end
 end
 
+local function DefenseThreatNear(brain, position, layer)
+    if not position then return 0 end
+    local threatType = (layer == 'Air') and 'AntiAir' or 'AntiSurface'
+    return SampleThreat(brain, position, threatType)
+end
+
 local function AdjustForAvoidance(brain, candidates, layer)
     if not candidates then return candidates end
     for _, c in ipairs(candidates) do
@@ -751,12 +762,6 @@ local function CollectAdjustedCandidates(brain, startPos, opts, layer)
         AdjustForAvoidance(brain, candidates, layer)
     end
     return candidates
-end
-
-local function DefenseThreatNear(brain, position, layer)
-    if not position then return 0 end
-    local threatType = (layer == 'Air') and 'AntiAir' or 'AntiSurface'
-    return SampleThreat(brain, position, threatType)
 end
 
 local function LeastDefendedStructures(brain, layer, structures)
@@ -1428,6 +1433,21 @@ local function OrbitUnit(unit, center)
     end
 end
 
+local function OrbitWaypoints(center, count, radius)
+    local list = {}
+    if not center then
+        return list
+    end
+    for i = 1, count do
+        local angle = (i / count) * 6.28318
+        local x = center[1] + math_cos(angle) * radius
+        local z = center[3] + math_sin(angle) * radius
+        local y = GetSurfaceHeight(x, z)
+        table_insert(list, { x, y, z })
+    end
+    return list
+end
+
 local function NormalizeBlueprintSet(value)
     local set = {}
     if type(value) == 'string' then
@@ -1440,6 +1460,37 @@ local function NormalizeBlueprintSet(value)
         end
     end
     return set
+end
+
+local function NormalizeCategoryList(value)
+    local list = {}
+    local function add(cat)
+        if cat then
+            table_insert(list, cat)
+        end
+    end
+    local function parse(entry)
+        if type(entry) == 'string' then
+            local parser = _G.ParseEntityCategoryProper or _G.ParseEntityCategory
+            if parser then
+                local ok, parsed = pcall(parser, entry)
+                if ok then
+                    return parsed
+                end
+            end
+        end
+        return entry
+    end
+
+    if type(value) == 'table' then
+        for _, entry in ipairs(value) do
+            add(parse(entry))
+        end
+    elseif value then
+        add(parse(value))
+    end
+
+    return list
 end
 
 local function UnitBlueprintId(unit)
@@ -1463,6 +1514,18 @@ local function UnitMatchesBlueprint(unit, set)
         return false
     end
     return set[id] == true
+end
+
+local function UnitMatchesCategory(unit, categoriesList)
+    if not (unit and categoriesList and table_getn(categoriesList) > 0) then
+        return false
+    end
+    for _, category in ipairs(categoriesList) do
+        if category and EntityCategoryContains(category, unit) then
+            return true
+        end
+    end
+    return false
 end
 
 local function HasIntelOnUnit(brain, unit, intelOnly)
@@ -1509,8 +1572,12 @@ local function IdleAtMarker(platoon, markerPos, layer, formation)
     if table_getn(units) == 0 then return end
     IssueClearCommands(units)
     if layer == 'Air' then
-        for _, unit in ipairs(units) do
-            OrbitUnit(unit, markerPos)
+        local waypoints = OrbitWaypoints(markerPos, HuntOrbitPoints, HuntOrbitRadius)
+        for _, point in ipairs(waypoints) do
+            IssuePatrol(units, point)
+        end
+        if table_getn(waypoints) > 0 then
+            IssuePatrol(units, waypoints[1])
         end
     else
         if formation ~= 'NoFormation' then
@@ -1717,7 +1784,9 @@ local function AssignDefenseVector(platoon, candidates)
 end
 
 local function FindHuntTarget(brain, platoon, opts, layer, excluded, requireSafe)
-    if not (brain and platoon and opts and opts.HuntSet and next(opts.HuntSet)) then
+    local hasBlueprints = opts and opts.HuntSet and next(opts.HuntSet)
+    local hasCategories = opts and opts.HuntCategories and table_getn(opts.HuntCategories) > 0
+    if not (brain and platoon and (hasBlueprints or hasCategories)) then
         return nil
     end
     local startPos = GetPlatoonPosition(platoon)
@@ -1736,7 +1805,7 @@ local function FindHuntTarget(brain, platoon, opts, layer, excluded, requireSafe
                 if unit and not unit.Dead then
                     local id = unit.EntityId
                     if not (id and excludedSet[id]) then
-                        if UnitMatchesBlueprint(unit, opts.HuntSet) and CanTargetUnit(layer, opts.Submersible, unit) then
+                        if (UnitMatchesBlueprint(unit, opts.HuntSet) or UnitMatchesCategory(unit, opts.HuntCategories)) and CanTargetUnit(layer, opts.Submersible, unit) then
                             if not opts.IntelOnly or HasIntelOnUnit(brain, unit, true) then
                                 local unitPos = unit:GetPosition()
                                 if unitPos then
@@ -1931,7 +2000,8 @@ function HuntAttack(platoon, data)
     opts.Vulnerable = opts.Vulnerable and true or false
     local blueprintData = data and (data.Blueprints or data.Blueprint or data.TargetBlueprints or data.TargetBPs or data.TargetBP)
     opts.HuntSet = NormalizeBlueprintSet(blueprintData)
-    if not next(opts.HuntSet) then
+    opts.HuntCategories = NormalizeCategoryList(data and (data.Category or data.Categories or data.TargetCategory or data.TargetCategories))
+    if not (next(opts.HuntSet) or table_getn(opts.HuntCategories) > 0) then
         return
     end
 
@@ -1977,11 +2047,8 @@ function HuntAttack(platoon, data)
                 if opts.MarkerPosition and not idleIssued then
                     IdleAtMarker(platoon, opts.MarkerPosition, layer, opts.Formation)
                     idleIssued = true
-                elseif opts.MarkerPosition and layer == 'Air' then
-                    -- keep air platoons orbiting while waiting
-                    IdleAtMarker(platoon, opts.MarkerPosition, layer, opts.Formation)
                 end
-                WaitForTargets(brain, RecheckDelay)
+                WaitForTargets(brain, HuntRecheckInterval)
             end
         end
     end
