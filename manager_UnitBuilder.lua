@@ -34,6 +34,8 @@ Usage
         builderTag       = 'Forward_UB',              -- optional unique tag (defaults to auto-generated)
         mode             = 1,                         -- optional: 1=waves, 2=loss-gated, 3=sustain
         mode2LossThreshold = 0.5,                     -- optional [0..1] loss fraction before next wave in mode 2
+        escalationPercent = 0,                       -- optional percent increase applied cumulatively per escalationFrequency
+        escalationFrequency = 0,                     -- optional waves between each escalation step (1 = every wave)
         debug            = false,                     -- optional verbose logging
     }
 
@@ -143,6 +145,8 @@ local function normalizeParams(p)
         debug            = p.debug and true or false,
         mode             = p.mode or 1,
         mode2LossThreshold = (p.mode2LossThreshold ~= nil) and p.mode2LossThreshold or 0.5,
+        escalationPercent = p.escalationPercent,
+        escalationFrequency = p.escalationFrequency,
     }
 end
 
@@ -251,6 +255,30 @@ local function flattenCounts(composition, difficulty)
         end
     end
     return wanted, order
+end
+
+local function escalationFactor(params, waveNo)
+    local pct   = math.max(0, params and params.escalationPercent or 0)
+    local every = math.floor(params and params.escalationFrequency or 0)
+    if pct <= 0 or every <= 0 then return 1 end
+
+    local wave = math.max(1, waveNo or 1)
+    local steps = math.floor((wave - 1) / every)
+    if steps <= 0 then return 1 end
+
+    return (1 + pct / 100) ^ steps
+end
+
+local function scaledWanted(baseWanted, factor)
+    local out = {}
+    for bp, cnt in pairs(baseWanted or {}) do
+        local use = cnt or 0
+        if factor ~= 1 then
+            use = math.max(0, math.floor(use * factor))
+        end
+        out[bp] = use
+    end
+    return out
 end
 
 local function chainFirstPos(chainName)
@@ -683,6 +711,14 @@ function Builder:RequestLease()
     return self.leaseId
 end
 
+function Builder:GetEscalationFactor(waveNo)
+    return escalationFactor(self.params, waveNo)
+end
+
+function Builder:GetWantedForWave(waveNo)
+    return scaledWanted(self.baseWanted or {}, self:GetEscalationFactor(waveNo or 1))
+end
+
 function Builder:Start()
     if not self.cleanupTimerThread and self.brain and self.brain.ForkThread then
         self._cleanupDue = false
@@ -691,6 +727,7 @@ function Builder:Start()
 
     if self.params.spawnFirstDirect then
         self.wave = (self.wave or 0) + 1
+        self.wanted = self:GetWantedForWave(self.wave)
         local p = self:SpawnDirectAndSend(self.wave)
 
         if (self.params.mode or 1) == 3 then
@@ -716,6 +753,7 @@ function Builder:BeginWaveLoop()
     if self.stopped then return end
 
     self.wave = (self.wave or 0) + 1
+    self.wanted = self:GetWantedForWave(self.wave)
     self.stagingName   = string.format('%s_Stage_%d', self.tag, self.wave)
     self.attackName    = string.format('%s_Attack_%d', self.tag, self.wave)
     self.stagingPlatoon = self.brain:MakePlatoon(self.stagingName, '')
@@ -1336,7 +1374,9 @@ function Builder:Mode3Loop(p)
         if not exists or table.getn(p:GetPlatoonUnits() or {}) == 0 then
             -- Reform a new platoon to full strength
             self.wave = (self.wave or 0) + 1
+            self.wanted = self:GetWantedForWave(self.wave)
             self.attackName = string.format('%s_Attack_%d', self.tag, self.wave)
+            wantTotal = sumCounts(self.wanted)
             p = self.brain:MakePlatoon(self.attackName, '')
             self.inProd = {}
             -- request factories if needed
@@ -1498,7 +1538,8 @@ function Start(params)
     o.basePos = ScenarioUtils.MarkerToPosition(o.params.baseMarker) or o.base.basePos
     o.stopped = false
     if not o.basePos then error('Invalid baseMarker: '.. tostring(params.baseMarker)) end
-    o.wanted, o.bpOrder = flattenCounts(params.composition, params.difficulty or 2)
+    o.baseWanted, o.bpOrder = flattenCounts(params.composition, params.difficulty or 2)
+    o.wanted = o:GetWantedForWave(1)
     o.platoonCallbacks = _NormalizeCallbacks(o.params.platoonCallbacks, 'OnHandoff', o.tag)
     o:Start()
     return o

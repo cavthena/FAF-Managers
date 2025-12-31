@@ -33,6 +33,8 @@
 --     spawnerTag         = 'NorthWaves',                          -- optional unique tag
 --     spawnSpread        = 6,                                     -- random XY spread around marker
 --     formation          = 'GrowthFormation',                     -- assigned formation
+--     escalationPercent  = 0,                                     -- optional percent increase applied cumulatively per escalationFrequency
+--     escalationFrequency= 0,                                     -- optional waves between each escalation step (1 = every wave)
 --     debug              = false,
 --   }
 --
@@ -92,7 +94,19 @@ local ScenarioUtils = import('/lua/sim/ScenarioUtilities.lua')
      end
      return out
  end
- 
+
+local function escalationFactor(params, waveNo)
+    local pct   = math.max(0, params and params.escalationPercent or 0)
+    local every = math.floor(params and params.escalationFrequency or 0)
+    if pct <= 0 or every <= 0 then return 1 end
+
+    local wave = math.max(1, waveNo or 1)
+    local steps = math.floor((wave - 1) / every)
+    if steps <= 0 then return 1 end
+
+    return (1 + pct / 100) ^ steps
+end
+
 local function markerPos(mark)
     if not mark then return nil end
     local t = type(mark)
@@ -205,6 +219,10 @@ function Spawner:Log(msg) LOG(('[US:%s] %s'):format(self.tag, msg)) end
      return want
  end
  
+function Spawner:GetEscalationFactor(waveNo)
+    return escalationFactor(self.params, waveNo)
+end
+
 function Spawner:GetNextSpawnPos()
     local list = self.spawnPositions or {}
     local n = table.getn(list)
@@ -218,17 +236,21 @@ function Spawner:GetNextSpawnPos()
     return list[idx]
 end
 
- function Spawner:BuildWantedForWave(waveNo)
-     local wanted = {}
-     for _, entry in ipairs(self.composition) do
-         if not waveNo or (self.params.mode == 3 and waveNo >= entry.waveStart) or (self.params.mode ~= 3) then
-             local count = self:GetEntryCount(entry)
-             if count > 0 then
-                 wanted[entry.blueprint] = (wanted[entry.blueprint] or 0) + count
-             end
-         end
-     end
-     return wanted
+function Spawner:BuildWantedForWave(waveNo)
+    local wanted = {}
+    local factor = self:GetEscalationFactor(waveNo or 1)
+    for _, entry in ipairs(self.composition) do
+        if not waveNo or (self.params.mode == 3 and waveNo >= entry.waveStart) or (self.params.mode ~= 3) then
+            local count = self:GetEntryCount(entry)
+            if factor ~= 1 then
+                count = math.max(0, math.floor(count * factor))
+            end
+            if count > 0 then
+                wanted[entry.blueprint] = (wanted[entry.blueprint] or 0) + count
+            end
+        end
+    end
+    return wanted
 end
 
 function Spawner:CreatePlatoon(label, units)
@@ -414,7 +436,7 @@ end
 function Spawner:RunMode1()
     while not self.stopped do
         self.wave = (self.wave or 0) + 1
-        local platoon, units, unitCount, wanted = self:SpawnWave(self.wave, self.baseWanted)
+        local platoon, units, unitCount, wanted = self:SpawnWave(self.wave, self:BuildWantedForWave(self.wave))
         local keepRunning = self:InvokeBooleanCallbacks('OnWaveNumber', true, self.wave, platoon, unitCount, wanted)
         if keepRunning ~= false then
             keepRunning = self:InvokeBooleanCallbacks('OnWaveCreated', keepRunning, self.wave, platoon, unitCount, wanted)
@@ -430,7 +452,7 @@ end
 function Spawner:RunMode2()
     while not self.stopped do
         self.wave = (self.wave or 0) + 1
-        local platoon, units, unitCount, wanted = self:SpawnWave(self.wave, self.baseWanted)
+        local platoon, units, unitCount, wanted = self:SpawnWave(self.wave, self:BuildWantedForWave(self.wave))
         local keepRunning = self:InvokeBooleanCallbacks('OnWaveNumber', true, self.wave, platoon, unitCount, wanted)
         if keepRunning ~= false then
             keepRunning = self:InvokeBooleanCallbacks('OnWaveCreated', keepRunning, self.wave, platoon, unitCount, wanted)
@@ -491,7 +513,7 @@ function Spawner:RunMode4()
     for _ = 1, batchCount do
         if self.stopped then break end
         self.wave = (self.wave or 0) + 1
-        local platoon, units, unitCount, wanted = self:SpawnWave(self.wave, self.baseWanted)
+        local platoon, units, unitCount, wanted = self:SpawnWave(self.wave, self:BuildWantedForWave(self.wave))
         local keepRunning = self:InvokeBooleanCallbacks('OnWaveNumber', true, self.wave, platoon, unitCount, wanted)
         if keepRunning ~= false then
             keepRunning = self:InvokeBooleanCallbacks('OnWaveCreated', keepRunning, self.wave, platoon, unitCount, wanted)
@@ -560,6 +582,8 @@ end
         onWaveNumber       = p.onWaveNumber,
         onSpawnerComplete  = p.onSpawnerComplete,
         onMode2ThresholdMet = p.onMode2ThresholdMet,
+        escalationPercent  = p.escalationPercent or 0,
+        escalationFrequency= p.escalationFrequency or 0,
     }
 end
  
@@ -579,7 +603,7 @@ end
     o.stopped     = false
     o.wave        = 0
     o.composition = o.params.composition
-    o.baseWanted  = o:BuildWantedForWave(nil)
+    o.baseWanted  = o:BuildWantedForWave(1)
     o.callbacks   = {}
     o:RegisterInitialCallbacks()
     o:Start()

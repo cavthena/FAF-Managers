@@ -53,6 +53,8 @@ Public API
             -- Leases revoked for stalls trigger `reason == 'stall'` before being removed
         baseHandle:GetGrantedUnits(leaseId)
         baseHandle:PushEngineerBuildTask(bpId, positionOrMarker, facing)
+        baseHandle:AssignEngineerUnit(unitOrPlatoon)
+            -- Accepts a single unit or platoon; valid types are T1/T2/T3/SCU/ACU engineers
         baseHandle:UpdateEngineerTasks(preferencesTable)
             -- Accepts Start.tasks fields (weights/exp) to tweak severity or experimental config at runtime
         baseHandle:GetStructureSnapshot()
@@ -74,6 +76,12 @@ local EngBp = {
     [2] = { T1='ual0105', T2='ual0208', T3='ual0309', SCU='ual0301' },
     [3] = { T1='url0105', T2='url0208', T3='url0309', SCU='url0301' },
     [4] = { T1='xsl0105', T2='xsl0208', T3='xsl0309', SCU='xsl0301' },
+}
+local ACUBp = {
+    [1] = 'uel0001',
+    [2] = 'ual0001',
+    [3] = 'url0001',
+    [4] = 'xsl0001',
 }
 
 local function clampDifficulty(d)
@@ -270,6 +278,60 @@ function M:_OnEngineerGone(u)
         self.engTask[id] = nil
         self:Dbg(('Engineer lost: id=%d tier=%s'):format(id, tostring(tier)))
     end
+end
+
+local function _TierForEngineer(u, faction)
+    local bp = unitBpId(u)
+    if not bp then return nil end
+    local map = EngBp[faction] or EngBp[1]
+    if bp == map.T1 then return 'T1' end
+    if bp == map.T2 then return 'T2' end
+    if bp == map.T3 then return 'T3' end
+    if bp == map.SCU then return 'SCU' end
+    if bp == (ACUBp[faction] or ACUBp[1]) then return 'SCU' end -- treat ACU as SCU tier for tasking
+    return nil
+end
+
+function M:_AbsorbEngineerUnit(u)
+    if not (u and not u.Dead and self.brain and u:GetAIBrain() == self.brain) then return false end
+    if u.be_tag and u.be_tag ~= self.tag then return false end
+    local tier = _TierForEngineer(u, self.faction)
+    if not tier then return false end
+
+    self.engTask = self.engTask or {}
+
+    -- already ours? ensure bookkeeping is present
+    if u.be_tag == self.tag then
+        local id = u:GetEntityId()
+        self.tracked[tier] = self.tracked[tier] or {}
+        if not self.tracked[tier][id] then
+            self.tracked[tier][id] = u
+            self.engTask[id] = self.engTask[id] or 'IDLE'
+        end
+        return true
+    end
+
+    self:_TagAndTrack(u, tier)
+    return true
+end
+
+function M:AssignEngineerUnits(units)
+    if not units then return 0 end
+    local assigned = 0
+    if units.GetPlatoonUnits then
+        units = units:GetPlatoonUnits() or {}
+    elseif units.GetAIBrain then
+        units = {units}
+    end
+    if type(units) ~= 'table' then
+        return 0
+    end
+    for _, u in ipairs(units) do
+        if self:_AbsorbEngineerUnit(u) then
+            assigned = assigned + 1
+        end
+    end
+    return assigned
 end
 
 function M:_TagAndTrack(u, tier)
@@ -2357,6 +2419,20 @@ function Base:AddBuildGroup(groupName)
 
     if self.engineers and self.engineers.AddBuildGroup then
         return self.engineers:AddBuildGroup(groupName)
+    end
+    return 0
+end
+
+function Base:AssignEngineerUnit(unitOrPlatoon)
+    if self.engineers and self.engineers.AssignEngineerUnits then
+        return self.engineers:AssignEngineerUnits(unitOrPlatoon)
+    end
+    return 0
+end
+
+function Base:AssignEngineerPlatoon(platoon)
+    if self.engineers and self.engineers.AssignEngineerUnits then
+        return self.engineers:AssignEngineerUnits(platoon)
     end
     return 0
 end
