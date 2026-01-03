@@ -341,6 +341,17 @@ local function isComplete(u)
     return true
 end
 
+local function _WasHandedOff(u, tag)
+    if not (u and u._ub_handoff) then return false end
+    return u._ub_handoff[tag] == true
+end
+
+local function _MarkHandedOff(u, tag)
+    if not u then return end
+    u._ub_handoff = u._ub_handoff or {}
+    u._ub_handoff[tag] = true
+end
+
 -- Sweep nearby units that belong to this builder (or are candidates for it) to the rally.
 local function _RallySweep(self)
     local rpos = getRallyPos(self.params) or self.basePos
@@ -533,18 +544,51 @@ function Builder:_AllFactoriesIdle()
     return any and allIdle
 end
 
-function Builder:_HandOffPlatoon(units, label)
-    local platoon = self.brain:MakePlatoon(label or (self.tag .. '_Attack'), '')
-    local assign = {}
+function Builder:_CollectHandoffUnits(units)
+    local assign, seen = {}, {}
+    self.handedOff = self.handedOff or {}
+
+    local function add(u)
+        if not (u and not u.Dead and isComplete(u) and u:GetAIBrain() == self.brain) then
+            return
+        end
+        if u.ub_tag ~= self.tag then
+            return
+        end
+        local id = u:GetEntityId()
+        if self.handedOff[id] or _WasHandedOff(u, self.tag) or seen[id] then
+            return
+        end
+        seen[id] = true
+        table.insert(assign, u)
+    end
+
     for _, u in ipairs(units or {}) do
-        if u and not u.Dead then
-            table.insert(assign, u)
+        add(u)
+    end
+
+    if self.brain and self.brain.GetListOfUnits then
+        for _, u in ipairs(self.brain:GetListOfUnits(categories.MOBILE, false) or {}) do
+            add(u)
         end
     end
+
+    return assign
+end
+
+function Builder:_HandOffPlatoon(units, label)
+    local platoon = self.brain:MakePlatoon(label or (self.tag .. '_Attack'), '')
+    local assign = self:_CollectHandoffUnits(units)
 
     if table.getn(assign) > 0 then
         IssueClearCommands(assign)
         self.brain:AssignUnitsToPlatoon(platoon, assign, 'Attack', 'GrowthFormation')
+    end
+
+    for _, u in ipairs(assign) do
+        local id = u:GetEntityId()
+        self.handedOff[id] = true
+        _MarkHandedOff(u, self.tag)
     end
 
     if self.params.attackFn then
@@ -1536,6 +1580,9 @@ function Start(params)
     assert(o.base, 'UnitBuilder requires a baseHandle or baseTag to request factories')
 
     o.basePos = ScenarioUtils.MarkerToPosition(o.params.baseMarker) or o.base.basePos
+    o.handedOff = {}
+    o.stopped = false
+    if not o.basePos then error('Invalid baseMarker: '.. tostring(params.baseMarker)) end
     o.stopped = false
     if not o.basePos then error('Invalid baseMarker: '.. tostring(params.baseMarker)) end
     o.baseWanted, o.bpOrder = flattenCounts(params.composition, params.difficulty or 2)

@@ -916,6 +916,7 @@ end
 function M:_InitTasking()
     self.tasks = _NormalizeTasks(self.params)
     self.engTask = {}
+    self.activeBuilds = {}
     self.expState = { active=false, lastDoneAt=0, startedAt=0, bp=nil, pos=nil }
     self.buildQueue = {}
 end
@@ -945,7 +946,81 @@ function M:_EnumerateEngineers()
     return list
 end
 
+function M:_IsBuildLocked(id, u)
+    if not (self.activeBuilds and id) then return false end
+    local rec = self.activeBuilds[id]
+    if not rec then return false end
+
+    local target = rec.target
+    if target and (target.Dead or isComplete(target)) then
+        self.activeBuilds[id] = nil
+        return false
+    end
+
+    if _safeIs(u, 'Building') then
+        return true
+    end
+
+    if target and (not target.Dead) then
+        return true
+    end
+
+    local cq = _safeCQ(u)
+    if table.getn(cq) > 0 then
+        return true
+    end
+
+    local now = GetGameTimeSeconds and GetGameTimeSeconds() or 0
+    if (now - (rec.startedAt or now)) < 10 then
+        return true
+    end
+
+    self.activeBuilds[id] = nil
+    return false
+end
+
+function M:_WatchBuild(u, id, rec)
+    while not self.stopped and self.activeBuilds and self.activeBuilds[id] == rec do
+        if not (u and not u.Dead) then
+            break
+        end
+
+        if (not rec.target) or rec.target.Dead then
+            rec.target = u.UnitBeingBuilt or (u.GetFocusUnit and u:GetFocusUnit())
+        end
+
+        local target = rec.target
+        if target and isComplete(target) then
+            break
+        end
+
+        local cq = _safeCQ(u)
+        if _safeIs(u, 'Building') or (target and (not target.Dead)) or table.getn(cq) > 0 then
+            WaitSeconds(1)
+        else
+            local now = GetGameTimeSeconds and GetGameTimeSeconds() or 0
+            local elapsed = now - (rec.startedAt or now)
+            if elapsed < 10 then
+                WaitSeconds(1)
+            else
+                break
+            end
+        end
+    end
+
+    if self.activeBuilds and self.activeBuilds[id] == rec then
+        self.activeBuilds[id] = nil
+        if not self.stopped then
+            self:_AssignEngineer(id, u, 'IDLE')
+        end
+    end
+end
+
 function M:_AssignEngineer(id, u, task)
+    if task ~= 'BUILD' and self:_IsBuildLocked(id, u) then
+        return
+    end
+
     local prev = self.engTask[id]
     if prev ~= task then
         self.engTask[id] = task
@@ -1337,7 +1412,15 @@ end
 
 function M:_TickBuild(u, id, now, assignment)
     if not u or u.Dead then return end
-    if _safeIs(u, 'Building') then return end
+    self.activeBuilds = self.activeBuilds or {}
+    if _safeIs(u, 'Building') then
+        if not self.activeBuilds[id] then
+            local rec = { startedAt = now }
+            self.activeBuilds[id] = rec
+            self.brain:ForkThread(function() self:_WatchBuild(u, id, rec) end)
+        end
+        return
+    end
 
     local task = assignment and assignment.task
     if assignment and assignment.primary and assignment.key then
@@ -1370,17 +1453,9 @@ function M:_TickBuild(u, id, now, assignment)
         return
     end
 
-    self.brain:ForkThread(function()
-        local waited = 0
-        local timeout = 1200
-        while not (u.Dead) and waited < timeout do
-            WaitSeconds(1)
-            waited = waited + 1
-            if not _safeIs(u, 'Building') then
-                break
-            end
-        end
-    end)
+    local rec = { bp = bp, pos = pos, facing = face, key = assignment and assignment.key, startedAt = now }
+    self.activeBuilds[id] = rec
+    self.brain:ForkThread(function() self:_WatchBuild(u, id, rec) end)
 end
 
 function M:_TickExp(u, id, now)
