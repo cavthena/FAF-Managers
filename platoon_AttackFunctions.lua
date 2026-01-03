@@ -209,10 +209,10 @@ local LandStructure     = categories.STRUCTURE - categories.NAVAL
 local SubmersibleCat    = categories.SUBMERSIBLE
 
 local RaidCategories = {
-    ECO = categories.MASSEXTRACTION + categories.MASSPRODUCTION + categories.ENERGYPRODUCTION + categories.HYDROCARBON + categories.MASSSTORAGE + categories.ENERGYSTORAGE,
-    BLD = categories.FACTORY + categories.ENGINEER + (categories.STRUCTURE * categories.ENGINEERSTATION),
-    INT = categories.RADAR + categories.SONAR,
-    DEF = categories.DEFENSE + categories.ANTIMISSILE + categories.SHIELD,
+    ECO = (categories.MASSEXTRACTION + categories.MASSPRODUCTION + categories.ENERGYPRODUCTION + categories.HYDROCARBON + categories.MASSSTORAGE + categories.ENERGYSTORAGE) - categories.COMMAND,
+    BLD = (categories.FACTORY + categories.ENGINEER + (categories.STRUCTURE * categories.ENGINEERSTATION)) - categories.COMMAND,
+    INT = (categories.RADAR + categories.SONAR) - categories.COMMAND,
+    DEF = (categories.DEFENSE + categories.ANTIMISSILE + categories.SHIELD) - categories.COMMAND,
 }
 
 local LayerMapping = {
@@ -242,9 +242,26 @@ local function SafeWait(seconds)
     end
 end
 
+local function SafeGetBrain(platoon)
+    if not platoon then
+        return nil
+    end
+
+    if platoon.BeenDestroyed and platoon:BeenDestroyed() then
+        return nil
+    end
+
+    local ok, brain = pcall(platoon.GetBrain, platoon)
+    if not ok then
+        return nil
+    end
+
+    return brain
+end
+
 local function PlatoonAlive(platoon)
     if not platoon then return false end
-    local brain = platoon:GetBrain()
+    local brain = SafeGetBrain(platoon)
     if not brain then return false end
     if not brain:PlatoonExists(platoon) then return false end
     local units = platoon:GetPlatoonUnits()
@@ -1109,6 +1126,28 @@ local function PathThreatScore(brain, layer, path)
     return maxThreat
 end
 
+local function MergePathSegments(segments)
+    local merged = {}
+    if not segments then
+        return merged
+    end
+
+    for _, segment in ipairs(segments) do
+        if segment then
+            for _, waypoint in ipairs(segment) do
+                if waypoint then
+                    local last = merged[table_getn(merged)]
+                    if not (last and DistanceSq(last, waypoint) < 1) then
+                        table_insert(merged, CopyVector(waypoint))
+                    end
+                end
+            end
+        end
+    end
+
+    return merged
+end
+
 local function TryAlternatePath(platoon, layer, startPos, destination, baseSeparation, baseThreat, opts)
     if not (opts and opts.RandomizeRoute) then
         return nil
@@ -1277,28 +1316,6 @@ local function ShortenPathForBombard(path, targetPos, range)
 
     path[table_getn(path)] = adjusted
     return path
-end
-
-local function MergePathSegments(segments)
-    local merged = {}
-    if not segments then
-        return merged
-    end
-
-    for _, segment in ipairs(segments) do
-        if segment then
-            for _, waypoint in ipairs(segment) do
-                if waypoint then
-                    local last = merged[table_getn(merged)]
-                    if not (last and DistanceSq(last, waypoint) < 1) then
-                        table_insert(merged, CopyVector(waypoint))
-                    end
-                end
-            end
-        end
-    end
-
-    return merged
 end
 
 local function RequestTransports(brain, platoon, destination)

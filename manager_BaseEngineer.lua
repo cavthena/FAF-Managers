@@ -980,6 +980,109 @@ function M:_StructKey(bp, pos)
     return string.format('%s@%.1f,%.1f,%.1f', bp, pos[1], pos[2] or 0, pos[3])
 end
 
+local function _TaskPosition(task)
+    if not task then return nil end
+    local pos = task.pos or task.position
+    if type(pos) == 'string' then
+        pos = ScenarioUtils.MarkerToPosition(pos)
+    end
+    return pos
+end
+
+function M:_HasQueuedBuildForKey(key)
+    if not key then return false end
+    for _, task in ipairs(self.buildQueue or {}) do
+        local bp = task.bp or task.blueprint or task.bpId
+        local pos = _TaskPosition(task)
+        if self:_StructKey(bp, pos) == key then
+            return true
+        end
+    end
+    return false
+end
+
+function M:_ConsumeBuildTaskByKey(key)
+    if not key then return nil end
+    for idx, task in ipairs(self.buildQueue or {}) do
+        local bp = task.bp or task.blueprint or task.bpId
+        local pos = _TaskPosition(task)
+        if self:_StructKey(bp, pos) == key then
+            return table.remove(self.buildQueue, idx)
+        end
+    end
+    return nil
+end
+
+local function _Distance2DSq(a, b)
+    if not (a and b and a[1] and a[3] and b[1] and b[3]) then return math.huge end
+    local dx = a[1] - b[1]
+    local dz = a[3] - b[3]
+    return dx*dx + dz*dz
+end
+
+function M:_BuildTasks()
+    local tasks = {}
+    local seen = {}
+    for _, task in ipairs(self.buildQueue or {}) do
+        local bp = task.bp or task.blueprint or task.bpId
+        local pos = _TaskPosition(task)
+        local key = self:_StructKey(bp, pos)
+        if bp and pos and key and (not seen[key]) then
+            table.insert(tasks, { task = task, key = key })
+            seen[key] = true
+        end
+    end
+    return tasks
+end
+
+function M:_PlanBuildAssignments(builders, tasks)
+    local plan = {}
+    tasks = tasks or self:_BuildTasks()
+    if table.getn(tasks) == 0 or table.getn(builders or {}) == 0 then
+        return plan
+    end
+
+    local unclaimed = {}
+    for _, entry in ipairs(tasks) do
+        table.insert(unclaimed, entry)
+    end
+
+    local function pickNearest(unit, pool)
+        if not (unit and unit.GetPosition) then return nil end
+        local uPos = unit:GetPosition()
+        local bestIdx, bestDist
+        for idx, entry in ipairs(pool) do
+            local pos = _TaskPosition(entry.task)
+            local dist = _Distance2DSq(uPos, pos)
+            if not bestDist or dist < bestDist then
+                bestDist = dist
+                bestIdx = idx
+            end
+        end
+        return bestIdx
+    end
+
+    local available = table.getn(unclaimed)
+    for _, rec in ipairs(builders) do
+        local pool = (available > 0) and unclaimed or tasks
+        local pickIdx = pickNearest(rec.u, pool)
+        if pickIdx then
+            local entry = pool[pickIdx]
+            plan[rec.id] = {
+                task    = entry.task,
+                key     = entry.key,
+                primary = (available > 0),
+            }
+            if available > 0 then
+                table.remove(unclaimed, pickIdx)
+                available = available - 1
+            end
+        end
+    end
+
+    return plan
+end
+
 function M:_EnsureStructState()
     self.struct = self.struct or { slots = {} }
     self.structKeys = self.structKeys or {}
@@ -1090,10 +1193,13 @@ function M:_SyncStructureDemand()
 
         if not present then
             -- Missing/destroyed -> build chain root
-            self:PushBuildTask(slot.bpRoot, slot.pos, slot.facing or 0)
-            if self.params.debug then
-                self:Dbg(('Rebuild queued: want=%s (root=%s) at (%.1f,%.1f,%.1f)')
-                    :format(slot.bpTarget, slot.bpRoot, slot.pos[1], slot.pos[2], slot.pos[3]))
+            local key = self:_StructKey(slot.bpRoot, slot.pos)
+            if not self:_HasQueuedBuildForKey(key) then
+                self:PushBuildTask(slot.bpRoot, slot.pos, slot.facing or 0)
+                if self.params.debug then
+                    self:Dbg(('Rebuild queued: want=%s (root=%s) at (%.1f,%.1f,%.1f)')
+                        :format(slot.bpTarget, slot.bpRoot, slot.pos[1], slot.pos[2], slot.pos[3]))
+                end
             end
         else
             local cur = _bpIdFromUnit(present)
@@ -1229,11 +1335,18 @@ function M:_TickAssist(u, id, now, targets, distrib)
     end
 end
 
-function M:_TickBuild(u, id, now)
+function M:_TickBuild(u, id, now, assignment)
     if not u or u.Dead then return end
     if _safeIs(u, 'Building') then return end
 
-    local task = table.remove(self.buildQueue, 1)
+    local task = assignment and assignment.task
+    if assignment and assignment.primary and assignment.key then
+        self:_ConsumeBuildTaskByKey(assignment.key)
+    end
+
+    if not task then
+        task = table.remove(self.buildQueue, 1)
+    end
     if not task then
         self:_AssignEngineer(id, u, 'IDLE')
         return
@@ -1249,7 +1362,10 @@ function M:_TickBuild(u, id, now)
 
     local landed = _TryIssueBuildMobile(u, bp, pos, face)
     if not landed then
-        table.insert(self.buildQueue, 1, {bp=bp, pos=pos, facing=face})
+        local shouldRequeue = (not assignment) or assignment.primary
+        if shouldRequeue then
+            table.insert(self.buildQueue, 1, {bp=bp, pos=pos, facing=face})
+        end
         self:_AssignEngineer(id, u, 'IDLE')
         return
     end
@@ -1356,7 +1472,8 @@ function M:TaskLoop()
         local all = self:_EnumerateEngineers()
         local assistTargets = self:_FindAssistTargets() or {}
         local assistCount = table.getn(assistTargets)
-        local buildDemand = table.getn(self.buildQueue or {})
+        local buildTasks = self:_BuildTasks()
+        local buildDemand = table.getn(buildTasks)
 
         local function computeExpDemand(ts)
             local ex = self.expState or {}
@@ -1452,6 +1569,16 @@ function M:TaskLoop()
 
         local totalEng = table.getn(all)
         local desired = { BUILD = 0, ASSIST = 0, EXP = 0 }
+        local taskCaps = { BUILD = buildDemand, ASSIST = assistCount, EXP = expDemand }
+        local eligibleExp = 0
+        if expDemand > 0 then
+            for _, rec in ipairs(all) do
+                if rec.tier == 'T3' or rec.tier == 'SCU' then
+                    eligibleExp = eligibleExp + 1
+                end
+            end
+            taskCaps.EXP = math.min(expDemand, eligibleExp)
+        end
 
         if severitySum > 0 and totalEng > 0 then
             local remaining = totalEng
@@ -1485,31 +1612,61 @@ function M:TaskLoop()
         if buildDemand <= 0 then desired.BUILD = 0 end
         if assistCount <= 0 then desired.ASSIST = 0 end
 
-        if expDemand > 0 then
-            local eligibleExp = 0
-            for _, rec in ipairs(all) do
-                if rec.tier == 'T3' or rec.tier == 'SCU' then
-                    eligibleExp = eligibleExp + 1
-                end
-            end
-            if eligibleExp > 0 then
-                desired.EXP = math.max(1, math.min(desired.EXP, expDemand, eligibleExp))
-            else
-                desired.EXP = 0
-            end
-        else
+        if taskCaps.EXP <= 0 then
             desired.EXP = 0
+        elseif eligibleExp > 0 then
+            desired.EXP = math.max(1, math.min(desired.EXP, taskCaps.EXP, eligibleExp))
         end
 
-        local allocatedAfterDemand = desired.BUILD + desired.ASSIST + desired.EXP
-        if allocatedAfterDemand > totalEng then
-            local excess = allocatedAfterDemand - totalEng
+        if taskCaps.BUILD > 0 then
+            desired.BUILD = math.min(desired.BUILD, taskCaps.BUILD)
+        end
+        if taskCaps.ASSIST > 0 then
+            desired.ASSIST = math.min(desired.ASSIST, taskCaps.ASSIST)
+        end
+
+        local allocatedAfterCap = desired.BUILD + desired.ASSIST + desired.EXP
+        if allocatedAfterCap > totalEng then
+            local excess = allocatedAfterCap - totalEng
             for idx = table.getn(severityList), 1, -1 do
                 if excess <= 0 then break end
                 local task = severityList[idx].task
                 local take = math.min(excess, desired[task])
                 desired[task] = desired[task] - take
                 excess = excess - take
+            end
+            allocatedAfterCap = desired.BUILD + desired.ASSIST + desired.EXP
+        end
+
+        local leftoverAfterCap = totalEng - allocatedAfterCap
+        if leftoverAfterCap > 0 then
+            local function fillCoverage()
+                local updated = false
+                for _, entry in ipairs(severityList) do
+                    local cap = taskCaps[entry.task] or 0
+                    if (entry.score or 0) > 0 and cap > 0 and desired[entry.task] < cap and leftoverAfterCap > 0 then
+                        desired[entry.task] = desired[entry.task] + 1
+                        leftoverAfterCap = leftoverAfterCap - 1
+                        updated = true
+                        if leftoverAfterCap <= 0 then break end
+                    end
+                end
+                return updated
+            end
+
+            while leftoverAfterCap > 0 and fillCoverage() do end
+
+            local idx = 1
+            while leftoverAfterCap > 0 and idx <= table.getn(severityList) do
+                local entry = severityList[idx]
+                if (entry.score or 0) > 0 then
+                    desired[entry.task] = desired[entry.task] + 1
+                    leftoverAfterCap = leftoverAfterCap - 1
+                else
+                    break
+                end
+                idx = idx + 1
+                if idx > table.getn(severityList) then idx = 1 end
             end
         end
 
@@ -1545,12 +1702,24 @@ function M:TaskLoop()
         end
 
         recount()
+
+        local buildAssignments = {}
+        if buildDemand > 0 then
+            local builders = {}
+            for _, rec in ipairs(all) do
+                if (self.engTask[rec.id] or 'IDLE') == 'BUILD' then
+                    table.insert(builders, rec)
+                end
+            end
+            buildAssignments = self:_PlanBuildAssignments(builders, buildTasks)
+        end
+
         local distrib = {}
         for _, rec in ipairs(all) do
             local id, u = rec.id, rec.u
             local t = self.engTask[id] or 'IDLE'
             if t == 'BUILD' then
-                self:_TickBuild(u, id, now)
+                self:_TickBuild(u, id, now, buildAssignments[id])
             elseif t == 'ASSIST' then
                 self:_TickAssist(u, id, now, assistTargets, distrib)
             elseif t == 'EXP' then
