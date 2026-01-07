@@ -1035,76 +1035,24 @@ function Builder:MonitorLoop()
 
             WaitSeconds(1)
         else
-            -- Before handoff, require ALL expected units are assembled at the rally point
-            local rpos    = getRallyPos(self.params) or self.basePos
-            local radius  = 18
-            local timeout = 30
-            local waited  = 0
-            local ready   = false
-
-            while not self.stopped do
-                -- recompute completed units from tracking set (not relying on platoon handle)
-                aliveList = {}
-                for id, u in pairs(self.stagingSet) do
-                    if isComplete(u) and u.ub_tag == self.tag then
-                        table.insert(aliveList, u)
-                    end
-                end
-                haveTbl = countCompleteByBp(aliveList, self.tag)
-
-                -- if composition regressed (death), reconcile deficit (no reset)
-                if not cmpCounts(self.wanted, haveTbl) then
-                    self:Dbg('HandoffWait: composition dropped below wanted; reconciling deficit (no reset)')
-                    self:SanitizeInProd(haveTbl)
-                    self:QueueNeededBuilds(haveTbl)
-                end
-
-                -- count completed units at rally
-                local at = 0
-                for _, u in ipairs(aliveList) do
-                    local pos = u:GetPosition()
-                    if dist2d(pos, rpos) <= radius then
-                        at = at + 1
-                    end
-                end
-                self:Dbg(('HandoffWait: complete-at-rally=%d/%d (radius=%.1f) waited=%.1fs')
-                    :format(at, wantTotal, radius, waited))
-
-                if at >= wantTotal then
-                    WaitTicks(10)
-                    local haveFinal
-                    if self.stagingPlatoon and self.brain:PlatoonExists(self.stagingPlatoon) then
-                        haveFinal = countCompleteByBp(self.stagingPlatoon:GetPlatoonUnits() or {}, self.tag)
-                    else
-                        haveFinal = countCompleteByBp(aliveList or {}, self.tag)
-                    end
-
-                    local deficitTbl = computeDeficit(self.wanted, haveFinal)
-                    local missing = deficitTotal(deficitTbl)
-
-                    if missing == 0 then
-                        ready = true
-                        break
-                    end
-
-                    self:Warn(('FinalCheck: deficit %d before handoff -> queue replacements and keep waiting'):format(missing))
-                    self:SanitizeInProd(haveFinal)
-                    self:QueueNeededBuilds(haveFinal)
-                end
-
-                WaitSeconds(0.5)
-                waited = waited + 0.5
-                if timeout > 0 and waited >= timeout then
-                    self:Warn(('HandoffWait: TIMEOUT after %.1fs (at %d/%d); proceeding anyway'):format(waited, at, wantTotal))
-                    ready = true
-                    break
+            -- =============== HANDOFF ===============
+            -- Immediately hand off once all units are complete; do not wait for rally assembly.
+            -- Rebuild aliveList from the current staging set to avoid stale references.
+            aliveList = {}
+            for id, u in pairs(self.stagingSet) do
+                if isComplete(u) and u.ub_tag == self.tag then
+                    table.insert(aliveList, u)
                 end
             end
+            haveTbl = countCompleteByBp(aliveList, self.tag)
 
-            if not ready then
+            -- If the composition regressed between checks, reconcile deficit before continuing.
+            if not cmpCounts(self.wanted, haveTbl) then
+                self:Dbg('Handoff: composition dropped below wanted; reconciling deficit before handoff')
+                self:SanitizeInProd(haveTbl)
+                self:QueueNeededBuilds(haveTbl)
                 WaitSeconds(0.5)
             else
-                -- =============== HANDOFF ===============
                 _ClearQueuesRestoreRally(self)
 
                 -- Build the attack platoon strictly from our tagged aliveList

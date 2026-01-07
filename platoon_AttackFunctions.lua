@@ -1493,6 +1493,24 @@ local function AttackTargetArea(platoon, target, opts)
         if not WaitForPlayableIngress(platoon, area, PlayableIngressTimeout * 2) then
             return 'fail'
         end
+
+        -- Once inside the playable area, clear any lingering commands and re-path entirely
+        -- from the current position to avoid re-exiting the map (common on northern ingress).
+        local ingressPos = GetPlatoonPosition(platoon)
+        if ingressPos then
+            local reroute = FindSafePath(platoon, layer, target.position, ingressPos, opts)
+            if not reroute then
+                reroute = BuildPathSegment(layer, ingressPos, target.position)
+            end
+
+            if reroute then
+                if bombardRange then
+                    reroute = ShortenPathForBombard(reroute, target.position, bombardRange)
+                end
+                RegisterRoute(platoon, layer, reroute)
+                MoveAlongPath(platoon, reroute, opts.Formation)
+            end
+        end
     end
     
     local arrived = false
