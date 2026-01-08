@@ -653,10 +653,11 @@ function Builder:EarlyHandoff(aliveList)
         self:WaitForMode2Gate(attackPlatoon)
     end
 
-    WaitSeconds(math.max(0, self.params.waveCooldown or 0))
+        WaitSeconds(math.max(0, self.params.waveCooldown or 0))
     self:RunCleanup()
 
     if not self.stopped then
+        self:_EndWaveThreads()
         self:BeginWaveLoop()
     end
 end
@@ -844,6 +845,19 @@ function Builder:BeginWaveLoop()
     self.monitorThread = self.brain:ForkThread(function() self:MonitorLoop() end)
     -- NEW: periodic rally keeper (every 10s)
     self.rallyKeeperThread = self.brain:ForkThread(function() self:RallyKeeperLoop() end)
+end
+
+function Builder:_EndWaveThreads()
+    if self.collectThread then
+        KillThread(self.collectThread)
+        self.collectThread = nil
+    end
+    if self.rallyKeeperThread then
+        KillThread(self.rallyKeeperThread)
+        self.rallyKeeperThread = nil
+    end
+    self.stagingPlatoon = nil
+    self.stagingSet = {}
 end
 
 function Builder:OnLeaseGranted(factories, leaseId)
@@ -1111,6 +1125,7 @@ function Builder:MonitorLoop()
                 WaitSeconds(math.max(0, self.params.waveCooldown or 0))
                 self:RunCleanup()
                 if not self.stopped then
+                    self:_EndWaveThreads()
                     self:BeginWaveLoop()
                 end
                 return
