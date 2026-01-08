@@ -1066,7 +1066,8 @@ function Builder:MonitorLoop()
             -- Rebuild aliveList from the current staging set to avoid stale references.
             self:Dbg(('RequestComplete: have=%d want=%d wave=%s')
                 :format(haveTotal, wantTotal, tostring(self.wave or 1)))
-            WaitSeconds(2)
+            -- Give the base a short buffer, then request composition units from the master platoon.
+            WaitSeconds(5)
             if self.stagingPlatoon then
                 self:_CollectFromMaster(self.stagingPlatoon, haveTbl)
             end
@@ -1314,26 +1315,48 @@ function Builder:_GetMasterPlatoon()
 end
 
 function Builder:_CollectFromMaster(platoon, haveTbl)
-    local mp = self:_GetMasterPlatoon()
-    if not (mp and mp.GetPlatoonUnits) then return 0 end
+    local base = self.base
     local taken = 0
-    local passes = 0
-    local maxPasses = 2
-    local pulled = {}
     local needList = {}
+    local needTbl = {}
     local totalNeed = 0
     for bp, want in pairs(self.wanted or {}) do
         local have = haveTbl[bp] or 0
         if have < want then
             local need = want - have
             totalNeed = totalNeed + need
+            needTbl[bp] = need
             table.insert(needList, string.format('%s:%d', bp, need))
         end
     end
-    if totalNeed > 0 then
+    if totalNeed == 0 then return 0 end
+
+    if base and base.RequestMasterUnits then
         self:Dbg(('CollectFromMaster: builder=%s requesting units (need=%s)')
             :format(self.tag, table.concat(needList, ', ')))
+        local provided = base:RequestMasterUnits(needTbl, platoon, self.tag) or {}
+        for _, u in ipairs(provided) do
+            local bp = unitBpId(u)
+            if bp then
+                haveTbl[bp] = (haveTbl[bp] or 0) + 1
+                local q = self.inProd[bp] or 0
+                if q > 0 then self.inProd[bp] = q - 1 end
+            end
+            if self.stagingSet then
+                self.stagingSet[u:GetEntityId()] = u
+            end
+        end
+        return table.getn(provided)
     end
+
+    local mp = self:_GetMasterPlatoon()
+    if not (mp and mp.GetPlatoonUnits) then return 0 end
+    local passes = 0
+    local maxPasses = 2
+    local pulled = {}
+
+    self:Dbg(('CollectFromMaster: builder=%s requesting units (need=%s)')
+        :format(self.tag, table.concat(needList, ', ')))
 
     while passes < maxPasses do
         local list = mp:GetPlatoonUnits() or {}

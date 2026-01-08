@@ -2674,6 +2674,66 @@ function Base:GetMasterPlatoon()
     return self.masterPlatoon
 end
 
+function Base:RequestMasterUnits(requested, targetPlatoon, tag)
+    local mp = self:GetMasterPlatoon()
+    if not (mp and mp.GetPlatoonUnits and self.brain) then return {} end
+    if not (targetPlatoon and self.brain.PlatoonExists and self.brain:PlatoonExists(targetPlatoon)) then
+        return {}
+    end
+
+    local need = {}
+    local totalNeed = 0
+    for bp, count in pairs(requested or {}) do
+        if count and count > 0 then
+            local key = string.lower(bp)
+            need[key] = (need[key] or 0) + count
+            totalNeed = totalNeed + count
+        end
+    end
+    if totalNeed == 0 then return {} end
+
+    self:Dbg(('MasterPlatoon: request for %d units (%s)'):format(
+        totalNeed, table.concat((function()
+            local list = {}
+            for bp, count in pairs(need) do
+                table.insert(list, string.format('%s:%d', bp, count))
+            end
+            return list
+        end)(), ', ')
+    ))
+
+    local provided = {}
+    for _, u in ipairs(mp:GetPlatoonUnits() or {}) do
+        if u and not u.Dead and isComplete(u) and u:GetAIBrain() == self.brain then
+            if not u.ub_tag then
+                local bp = _bpIdFromUnit(u)
+                local want = bp and need[bp]
+                if want and want > 0 then
+                    if tag then
+                        u.ub_tag = tag
+                    end
+                    self.brain:AssignUnitsToPlatoon(targetPlatoon, {u}, 'Attack', 'GrowthFormation')
+                    need[bp] = want - 1
+                    table.insert(provided, u)
+                    totalNeed = totalNeed - 1
+                    if totalNeed <= 0 then
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    if table.getn(provided) > 0 then
+        self:Dbg(('MasterPlatoon: provided %d units to %s'):format(
+            table.getn(provided),
+            (targetPlatoon.GetPlatoonLabel and targetPlatoon:GetPlatoonLabel()) or 'platoon'
+        ))
+    end
+
+    return provided
+end
+
 function Base:RequestFactories(params)
     if not self.factoryControl then return nil end
     if params and not params.markerPos and not params.markerName then
