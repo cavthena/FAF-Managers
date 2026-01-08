@@ -210,7 +210,6 @@ Spawner.__index = Spawner
 
 function Spawner:Log(msg) LOG(('[US:%s] %s'):format(self.tag, msg)) end
  function Spawner:Warn(msg) WARN(('[US:%s] %s'):format(self.tag, msg)) end
- function Spawner:Dbg(msg) if self.params.debug then self:Log(msg) end end
  
  function Spawner:GetEntryCount(entry)
      local d = math.max(1, math.min(3, self.params.difficulty or 2))
@@ -335,10 +334,6 @@ function Spawner:HandOffToAttack(platoon)
     end
  
      local function _AttackWrapper(p, fn)
-         self:Dbg(('AttackWrapper: label=%s units=%d fnType=%s')
-             :format((p.GetPlatoonLabel and p:GetPlatoonLabel()) or '?',
-                     table.getn(p:GetPlatoonUnits() or {}),
-                     type(fn)))
         if type(fn) == 'function' then
             return fn(p, self.params.attackData)
         elseif type(fn) == 'string' then
@@ -385,7 +380,6 @@ function Spawner:SpawnWave(waveNo, wanted)
     self:HandOffToAttack(platoon)
 
     local unitCount = resolveUnitCount(spawned)
-    self:Dbg(('SpawnWave: spawned %d units as %s'):format(unitCount, label))
     return platoon, spawned, unitCount, wanted
 end
  
@@ -399,14 +393,12 @@ end
      while not self.stopped do
         if not platoon or not self.brain:PlatoonExists(platoon) then
             local alive = countComplete((platoon and platoon.GetPlatoonUnits and platoon:GetPlatoonUnits()) or {})
-            self:Dbg('Mode2Gate: platoon gone; gate passed')
             self:InvokeBooleanCallbacks('OnMode2ThresholdMet', true, platoon, alive, wantTotal, thr)
             return
         end
          local alive = countComplete(platoon:GetPlatoonUnits() or {})
          local lost = math.max(0, wantTotal - alive)
          local frac = (wantTotal > 0) and (lost / wantTotal) or 1
-         self:Dbg(('Mode2Gate: alive=%d lost=%d frac=%.2f thr=%.2f'):format(alive, lost, frac, thr))
         if frac >= thr then
             self:InvokeBooleanCallbacks('OnMode2ThresholdMet', true, platoon, alive, wantTotal, thr)
             return
@@ -481,7 +473,6 @@ function Spawner:RunMode3()
          self.wave = wave
         local wanted = self:BuildWantedForWave(wave)
         if tableIsEmpty(wanted) then
-            self:Dbg(('Mode3: wave %d has no units to spawn'):format(wave))
         end
         local platoon, units, unitCount, usedWanted = self:SpawnWave(wave, wanted)
         local keepRunning = self:InvokeBooleanCallbacks('OnWaveNumber', true, wave, platoon, unitCount, usedWanted)
@@ -533,7 +524,6 @@ function Spawner:RunMode4()
 end
  
 function Spawner:MainLoop()
-    self:Dbg('MainLoop: start')
     local mode = self.params.mode or 1
     if mode == 2 then
         self:RunMode2()
@@ -544,7 +534,6 @@ function Spawner:MainLoop()
     else
         self:RunMode1()
     end
-    self:Dbg('MainLoop: end')
     self.mainThread = nil
 end
  

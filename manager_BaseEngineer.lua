@@ -291,7 +291,6 @@ function M:_OnEngineerGone(u)
     if tier and self.tracked[tier] then
         self.tracked[tier][id] = nil
         self.engTask[id] = nil
-        self:Dbg(('Engineer lost: id=%d tier=%s'):format(id, tostring(tier)))
     end
 end
 
@@ -387,10 +386,6 @@ function M:_CreateStructGroups()
         -- Skip if the group is already present in the world (e.g., spawned earlier)
         local existing = _TryGetUnitsFromGroup(gname)
         if table.getn(existing) > 0 then
-            if self.params.debug then
-                self:Dbg(('StructGroups: "%s" already present (%d units); skip create')
-                    :format(gname, table.getn(existing)))
-            end
         else
             -- Create the group for our brain's army
             local ok, units = pcall(function()
@@ -400,10 +395,6 @@ function M:_CreateStructGroups()
                 -- NEW: remember the actual unit instances we just created
                 self.structGroupUnits = self.structGroupUnits or {}
                 self.structGroupUnits[gname] = units or {}
-                if self.params.debug then
-                    local count = (units and table.getn(units)) or 0
-                    self:Dbg(('StructGroups: created "%s" (%d units)'):format(gname, count))
-                end
             else
                 self:Warn(('StructGroups: failed to create "%s"'):format(tostring(gname)))
             end
@@ -436,8 +427,6 @@ function M:_SpawnInitial()
     spawnMany(map.T3, 'T3',  self.desired.T3 or 0)
     spawnMany(map.SCU, 'SCU', self.desired.SCU or 0)
 
-    self:Dbg(('Initial spawn done: T1=%d T2=%d T3=%d SCU=%d')
-        :format(self.desired.T1 or 0, self.desired.T2 or 0, self.desired.T3 or 0, self.desired.SCU or 0))
 end
 
 -- ===================== Factory lease + build =====================
@@ -475,7 +464,6 @@ function M:OnLeaseGranted(factories, leaseId)
         end
         i = i + 1
     end
-    self:Dbg(('Lease granted: %d factories'):format(tgetn(factories)))
     self:QueueNeededBuilds()
 end
 
@@ -603,9 +591,6 @@ function M:QueueNeededBuilds()
                     local id = f:GetEntityId()
                     self.pending[id] = self.pending[id] or {}
                     self.pending[id][bp] = (self.pending[id][bp] or 0) + 1
-                    if self.params.debug then
-                        self:Log(('Queued %s at f=%d; pending for that bp now %d'):format(bp, id, self.pending[id][bp]))
-                    end
                 end
             end
 
@@ -635,7 +620,6 @@ function M:QueueNeededBuilds()
         if missing <= 0 and self.leaseId then
             self.alloc:ReturnLease(self.leaseId)
             self.leaseId = nil
-            self:Dbg('Headcount satisfied; lease returned')
         end
     end
 end
@@ -674,8 +658,7 @@ function M:_CollectorSweep()
                         self.tracked[tier] = self.tracked[tier] or {}
                         if not self.tracked[tier][id] then
                             self.tracked[tier][id] = u
-    self.engTask[id] = self.engTask[id] or 'IDLE'
-                            self:Dbg(('Collector verify ours: id=%d tier=%s'):format(id, tier))
+                            self.engTask[id] = self.engTask[id] or 'IDLE'
                         end
                     -- Case B: untagged AND we have a pending slot for this bp at any leased factory
                     elseif not u.be_tag then
@@ -698,9 +681,6 @@ function M:_CollectorSweep()
                                             self:_TagAndTrack(u, tier)
                                             ptab[bp] = pend - 1
                                             claimed = true
-                                            if self.params.debug then
-                                                self:Log(('Claimed roll-off bp=%s near f=%d; pending now %d'):format(bp, fid, ptab[bp]))
-                                            end
                                             break
                                         end
                                     end
@@ -712,22 +692,6 @@ function M:_CollectorSweep()
             end
         end
         k = k + 1
-    end
-end
-
--- DEBUG: periodic headcount summary
-function M:_DebugHeadcount()
-    if not self.params.debug then return end
-    self._dbgTick = (self._dbgTick or 0) + 1
-    if self._dbgTick >= 5 then -- roughly every 5 seconds (loop sleeps 1s)
-        self._dbgTick = 0
-        local a1 = self:_AliveCountTier('T1')
-        local a2 = self:_AliveCountTier('T2')
-        local a3 = self:_AliveCountTier('T3')
-        local as = self:_AliveCountTier('SCU')
-        self:Log(('Headcount T1:%d/%d T2:%d/%d T3:%d/%d SCU:%d/%d (missing=%d)')
-            :format(a1, self.desired.T1 or 0, a2, self.desired.T2 or 0, a3, self.desired.T3 or 0, as, self.desired.SCU or 0,
-                    _sum(self:_ComputeDeficit())))
     end
 end
 
@@ -1244,11 +1208,6 @@ function M:_InitStructTemplate()
     for _, gname in ipairs(self.params.structGroups or {}) do
         total = total + (self:_AbsorbStructGroup(gname) or 0)
     end
-
-    if self.params.debug then
-        self:Dbg(('StructTemplate: %d slots captured from %d group(s)')
-            :format(table.getn(self.struct.slots or {}), table.getn(self.params.structGroups or {})))
-    end
 end
 
 function M:AddBuildGroup(gname)
@@ -1267,10 +1226,7 @@ function M:AddBuildGroup(gname)
 
     local added = self:_AbsorbStructGroup(gname) or 0
     if added > 0 then
-        self:Dbg(('Struct group added to snapshot: "%s" (%d slots)'):format(gname, added))
         self:_SyncStructureDemand()
-    elseif self.params.debug then
-        self:Dbg(('Struct group "%s" added but no new slots captured'):format(tostring(gname)))
     end
     return added
 end
@@ -1286,10 +1242,6 @@ function M:_SyncStructureDemand()
             local key = self:_StructKey(slot.bpRoot, slot.pos)
             if not self:_HasQueuedBuildForKey(key) then
                 self:PushBuildTask(slot.bpRoot, slot.pos, slot.facing or 0)
-                if self.params.debug then
-                    self:Dbg(('Rebuild queued: want=%s (root=%s) at (%.1f,%.1f,%.1f)')
-                        :format(slot.bpTarget, slot.bpRoot, slot.pos[1], slot.pos[2], slot.pos[3]))
-                end
             end
         else
             local cur = _bpIdFromUnit(present)
@@ -1300,10 +1252,6 @@ function M:_SyncStructureDemand()
                         local nxt = _ChainNext(cur)
                         if nxt then
                             IssueUpgrade({present}, nxt)
-                            if self.params.debug then
-                                self:Dbg(('Upgrade issued: %s → %s at (%.1f,%.1f,%.1f)')
-                                    :format(cur or '?', nxt, slot.pos[1], slot.pos[2], slot.pos[3]))
-                            end
                         end
                     end
                 else
@@ -1523,7 +1471,6 @@ function M:_ExpWatcher()
                     local bid = _shortBpId(u)
                     if bid == string.lower(self.expState.bp) then
                         _ForkAttackUnit(self.brain, u, self.tasks.exp.attackFn, self.tasks.exp.attackData, self.tag)
-                        self:Dbg('EXP: build complete; handoff + start cooldown')
                         self.expState.active = false
                         self.expState.lastDoneAt = GetGameTimeSeconds and GetGameTimeSeconds() or 0
                         self.expState.bp, self.expState.pos, self.expState.builder = nil, nil, nil
@@ -1553,7 +1500,6 @@ function M:_ExpWatcher()
 end
 
 function M:TaskLoop()
-    self:Dbg('TaskLoop start')
     self:_InitTasking()
     self.brain:ForkThread(function() self:_ExpWatcher() end)
 
@@ -1635,7 +1581,6 @@ function M:TaskLoop()
                 if cur == 'IDLE' and (not filterFn or filterFn(rec)) then
                     self:_AssignEngineer(id, u, task)
                     moved = moved + 1
-                    if self.params.debug then self:Dbg(('Promote %s -> %s'):format(id, task)) end
                 end
             end
             if moved > 0 then recount() end
@@ -1828,11 +1773,9 @@ function M:TaskLoop()
 
         WaitSeconds(1)
     end
-    self:Dbg('TaskLoop end')
 end
 -- ===================== Threads =====================
 function M:MonitorLoop()
-    self:Dbg('MonitorLoop start')
     while not self.stopped do
         self:_SyncStructureDemand()
         local def = self:_ComputeDeficit()
@@ -1848,17 +1791,14 @@ function M:MonitorLoop()
         end
 
         self:_CollectorSweep()
-        self:_DebugHeadcount()
 
         if missing <= 0 and self.leaseId then
             self.alloc:ReturnLease(self.leaseId)
             self.leaseId = nil
-            self:Dbg('Monitor: satisfied -> lease returned')
         end
 
         WaitSeconds(1)
     end
-    self:Dbg('MonitorLoop end')
 end
 
 function M:Start()
@@ -2547,6 +2487,12 @@ function Base:Warn(msg)
     WARN(('[Base:%s] %s'):format(self.tag or '??', msg))
 end
 
+function Base:Dbg(msg)
+    if self.params and self.params.debug then
+        self:Log(msg)
+    end
+end
+
 local function ResolveEngineerCounts(tbl, difficulty)
     local d = ClampDifficulty(difficulty)
     local tiers = { 'T1', 'T2', 'T3', 'SCU' }
@@ -2705,6 +2651,8 @@ function Base:_MasterPlatoonLoop()
                 if not self.masterTracked[id] then
                     self.masterTracked[id] = u
                     self.brain:AssignUnitsToPlatoon(platoon, { u }, 'Attack', 'GrowthFormation')
+                    self:Dbg(('MasterPlatoon: added unit id=%d bp=%s to %s')
+                        :format(id, _bpIdFromUnit(u) or 'unknown', self.masterPlatoonName or 'master'))
                 end
             end
         end
