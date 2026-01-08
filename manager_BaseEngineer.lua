@@ -2654,34 +2654,46 @@ function Base:_MasterPlatoonLoop()
         if not platoon then return end
     end
 
-    for id, u in pairs(self.masterTracked or {}) do
+    self.masterTracked = self.masterTracked or {}
+    for id, u in pairs(self.masterTracked) do
         if not (u and not u.Dead and u:GetAIBrain() == self.brain) then
             self.masterTracked[id] = nil
         end
     end
 
+    for _, u in ipairs(platoon:GetPlatoonUnits() or {}) do
+        if u and not u.Dead and u:GetAIBrain() == self.brain then
+            self.masterTracked[u:GetEntityId()] = u
+        end
+    end
+
     local near = {}
+    local seen = {}
+    local function addAround(pos, radius)
+        if not pos then return end
+        local around = self.brain:GetUnitsAroundPoint(categories.MOBILE, pos, radius, 'Ally') or {}
+        local i = 1
+        while i <= table.getn(around) do
+            local u = around[i]
+            if u and not seen[u] then
+                seen[u] = true
+                table.insert(near, u)
+            end
+            i = i + 1
+        end
+    end
+
     if self.factoryControl and self.factoryControl.factoryState then
         for _, state in pairs(self.factoryControl.factoryState) do
             local f = state and state.unit
             if f and not f:IsDead() and f:GetAIBrain() == self.brain then
-                local around = self.brain:GetUnitsAroundPoint(categories.MOBILE, f:GetPosition(), 35, 'Ally') or {}
-                local i = 1
-                while i <= table.getn(around) do
-                    table.insert(near, around[i])
-                    i = i + 1
-                end
+                addAround(f:GetPosition(), 35)
             end
         end
     end
 
     if self.basePos then
-        local aroundB = self.brain:GetUnitsAroundPoint(categories.MOBILE, self.basePos, 35, 'Ally') or {}
-        local j = 1
-        while j <= table.getn(aroundB) do
-            table.insert(near, aroundB[j])
-            j = j + 1
-        end
+        addAround(self.basePos, 35)
     end
 
     local k = 1

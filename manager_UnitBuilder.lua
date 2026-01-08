@@ -610,6 +610,21 @@ function Builder:EarlyHandoff(aliveList)
     local flist = _LiveFactoriesList(self, false)
     _ClearQueuesRestoreRally(self)
 
+    -- Allow master platoon sweeps to settle before we assemble a handoff.
+    WaitSeconds(2)
+    local haveTbl = countCompleteByBp(aliveList or {}, self.tag)
+    if self.stagingPlatoon then
+        self:_CollectFromMaster(self.stagingPlatoon, haveTbl)
+    end
+    if self.stagingSet then
+        aliveList = {}
+        for _, u in pairs(self.stagingSet) do
+            if isComplete(u) and u.ub_tag == self.tag then
+                table.insert(aliveList, u)
+            end
+        end
+    end
+
     -- Always create a fresh attack platoon and only add units with our tag
     local assign = {}
     for _, u in ipairs(aliveList or {}) do
@@ -1042,6 +1057,10 @@ function Builder:MonitorLoop()
             -- =============== HANDOFF ===============
             -- Immediately hand off once all units are complete; do not wait for rally assembly.
             -- Rebuild aliveList from the current staging set to avoid stale references.
+            WaitSeconds(2)
+            if self.stagingPlatoon then
+                self:_CollectFromMaster(self.stagingPlatoon, haveTbl)
+            end
             aliveList = {}
             for id, u in pairs(self.stagingSet) do
                 if isComplete(u) and u.ub_tag == self.tag then
@@ -1317,24 +1336,52 @@ function Builder:_CollectFromMaster(platoon, haveTbl)
     local mp = self:_GetMasterPlatoon()
     if not (mp and mp.GetPlatoonUnits) then return 0 end
     local taken = 0
-    local list = mp:GetPlatoonUnits() or {}
-    for _, u in ipairs(list) do
-        if u and not u.Dead and isComplete(u) and u:GetAIBrain() == self.brain then
-            if not u.ub_tag then
-                local bp = unitBpId(u)
-                local want = self.wanted[bp]
-                local have = haveTbl[bp] or 0
-                if want and have < want then
-                    u.ub_tag = self.tag
-                    self.brain:AssignUnitsToPlatoon(platoon, {u}, 'Attack', 'GrowthFormation')
-                    haveTbl[bp] = have + 1
-                    local q = self.inProd[bp] or 0
-                    if q > 0 then self.inProd[bp] = q - 1 end
-                    taken = taken + 1
+    local passes = 0
+    local maxPasses = 2
+
+    while passes < maxPasses do
+        local list = mp:GetPlatoonUnits() or {}
+        local tookThisPass = 0
+        for _, u in ipairs(list) do
+            if u and not u.Dead and isComplete(u) and u:GetAIBrain() == self.brain then
+                if not u.ub_tag then
+                    local bp = unitBpId(u)
+                    local want = self.wanted[bp]
+                    local have = haveTbl[bp] or 0
+                    if want and have < want then
+                        u.ub_tag = self.tag
+                        self.brain:AssignUnitsToPlatoon(platoon, {u}, 'Attack', 'GrowthFormation')
+                        haveTbl[bp] = have + 1
+                        local q = self.inProd[bp] or 0
+                        if q > 0 then self.inProd[bp] = q - 1 end
+                        if self.stagingSet then
+                            self.stagingSet[u:GetEntityId()] = u
+                        end
+                        taken = taken + 1
+                        tookThisPass = tookThisPass + 1
+                    end
                 end
             end
         end
+
+        local stillNeed = false
+        for bp, want in pairs(self.wanted or {}) do
+            if (haveTbl[bp] or 0) < (want or 0) then
+                stillNeed = true
+                break
+            end
+        end
+
+        if tookThisPass == 0 or not stillNeed then
+            break
+        end
+
+        passes = passes + 1
+        if passes < maxPasses then
+            WaitSeconds(0.25)
+        end
     end
+
     if taken > 0 then
         self:Dbg(('CollectFromMaster: took %d units'):format(taken))
     end
