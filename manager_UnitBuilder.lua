@@ -32,6 +32,8 @@ Usage
         attackFn         = function(platoon) end,     -- optional; may also be a global function name
         attackData       = {},                        -- optional table copied to platoon.PlatoonData
         builderTag       = 'Forward_UB',              -- optional unique tag (defaults to auto-generated)
+        masterPlatoon    = nil,                       -- optional explicit master platoon (defaults to base:GetMasterPlatoon())
+        useMasterPlatoon = true,                      -- optional toggle (default true)
         mode             = 1,                         -- optional: 1=waves, 2=loss-gated, 3=sustain
         mode2LossThreshold = 0.5,                     -- optional [0..1] loss fraction before next wave in mode 2
         escalationPercent = 0,                       -- optional percent increase applied cumulatively per escalationFrequency
@@ -142,6 +144,8 @@ local function normalizeParams(p)
         radius           = p.radius,
         baseTag          = p.baseTag,
         baseHandle       = p.baseHandle,
+        masterPlatoon    = p.masterPlatoon,
+        useMasterPlatoon = (p.useMasterPlatoon ~= nil) and p.useMasterPlatoon or true,
         debug            = p.debug and true or false,
         mode             = p.mode or 1,
         mode2LossThreshold = (p.mode2LossThreshold ~= nil) and p.mode2LossThreshold or 0.5,
@@ -1293,6 +1297,50 @@ function Builder:WaitForMode2Gate(p)
     end
 end
 
+function Builder:_GetMasterPlatoon()
+    if self.params and self.params.useMasterPlatoon == false then
+        return nil
+    end
+    local mp = self.masterPlatoon
+    if mp and self.brain and self.brain.PlatoonExists and self.brain:PlatoonExists(mp) then
+        return mp
+    end
+    if self.base and self.base.GetMasterPlatoon then
+        mp = self.base:GetMasterPlatoon()
+        self.masterPlatoon = mp
+        return mp
+    end
+    return nil
+end
+
+function Builder:_CollectFromMaster(platoon, haveTbl)
+    local mp = self:_GetMasterPlatoon()
+    if not (mp and mp.GetPlatoonUnits) then return 0 end
+    local taken = 0
+    local list = mp:GetPlatoonUnits() or {}
+    for _, u in ipairs(list) do
+        if u and not u.Dead and isComplete(u) and u:GetAIBrain() == self.brain then
+            if not u.ub_tag then
+                local bp = unitBpId(u)
+                local want = self.wanted[bp]
+                local have = haveTbl[bp] or 0
+                if want and have < want then
+                    u.ub_tag = self.tag
+                    self.brain:AssignUnitsToPlatoon(platoon, {u}, 'Attack', 'GrowthFormation')
+                    haveTbl[bp] = have + 1
+                    local q = self.inProd[bp] or 0
+                    if q > 0 then self.inProd[bp] = q - 1 end
+                    taken = taken + 1
+                end
+            end
+        end
+    end
+    if taken > 0 then
+        self:Dbg(('CollectFromMaster: took %d units'):format(taken))
+    end
+    return taken
+end
+
 function Builder:CollectForPlatoon(platoon)
     -- Ensure a platoon exists; create one if missing (sustain mode safety)
     if (not platoon) or (not (self.brain and self.brain.PlatoonExists and self.brain:PlatoonExists(platoon))) then
@@ -1310,6 +1358,9 @@ function Builder:CollectForPlatoon(platoon)
             haveTbl[bp] = (haveTbl[bp] or 0) + 1
         end
     end
+
+    -- Prefer grabbing from the base master platoon when available
+    self:_CollectFromMaster(platoon, haveTbl)
 
     -- Build a search list near leased factories and the rally point
     local rpos = (self.params and (markerPos(self.params.rallyMarker) or markerPos(self.params.baseMarker))) or self.basePos
@@ -1526,6 +1577,10 @@ function Start(params)
         o.base = BaseManager.GetBase(o.params.baseTag or params.baseTag)
     end
     assert(o.base, 'UnitBuilder requires a baseHandle or baseTag to request factories')
+    o.masterPlatoon = o.params.masterPlatoon
+    if not o.masterPlatoon and o.base and o.base.GetMasterPlatoon and o.params.useMasterPlatoon ~= false then
+        o.masterPlatoon = o.base:GetMasterPlatoon()
+    end
 
     o.basePos = ScenarioUtils.MarkerToPosition(o.params.baseMarker) or o.base.basePos
     o.handedOff = {}

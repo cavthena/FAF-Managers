@@ -6,7 +6,8 @@
 Overview
     Spawns a base layout, keeps a dedicated engineer platoon alive, rebuilds/repairs
     structures, manages experimental projects, and exposes a factory allocator
-    that other systems (such as manager_UnitBuilder) can lease through.
+    that other systems (such as manager_UnitBuilder) can lease through. Also
+    maintains an untagged master platoon for freshly completed units.
 
 Usage
     local BaseManager = import('/maps/.../manager_BaseEngineer.lua')
@@ -28,6 +29,7 @@ Usage
         engineerFactoryPriority = 200,                       -- optional build request priority (0..200)
         engineerFactoryCount    = 1,                         -- optional factories to lease for engineers (0:any)
         factoryStallTimeout     = 30,                        -- optional seconds before idle leases are revoked (default 30)
+        masterInterval          = 1,                         -- optional seconds between master platoon sweeps
         tasks = {                                            -- optional engineer task preferences
             weights = { BUILD = 1.0, ASSIST = 1.0, EXP = 1.25 }, -- severity multipliers (higher == more coverage)
             exp     = { marker = 'Base_Marker', cooldown = 0, bp = nil, attackFn = nil, attackData = {} }, -- experimental build config
@@ -52,6 +54,7 @@ Public API
         baseHandle:ReturnLease(leaseId[, reason])
             -- Leases revoked for stalls trigger `reason == 'stall'` before being removed
         baseHandle:GetGrantedUnits(leaseId)
+        baseHandle:GetMasterPlatoon()
         baseHandle:PushEngineerBuildTask(bpId, positionOrMarker, facing)
         baseHandle:AssignEngineerUnit(unitOrPlatoon)
             -- Accepts a single unit or platoon; valid types are T1/T2/T3/SCU/ACU engineers
@@ -157,6 +160,18 @@ local function _TryGetUnitsFromGroup(name)
 end
 
 local function _EnsureEngineerPlatoon(brain, name)
+    if not (brain and name) then return nil end
+    local platoon = nil
+    if brain.GetPlatoonUniquelyNamed then
+        platoon = brain:GetPlatoonUniquelyNamed(name)
+        if platoon then
+            return platoon
+        end
+    end
+    return brain:MakePlatoon(name, '')
+end
+
+local function _EnsureMasterPlatoon(brain, name)
     if not (brain and name) then return nil end
     local platoon = nil
     if brain.GetPlatoonUniquelyNamed then
@@ -2612,8 +2627,91 @@ function Base:_SetupEngineerManager()
     end
 end
 
+function Base:_SetupMasterPlatoon()
+    self.masterPlatoonName = string.format('%s_Master', self.tag or 'Base')
+    self.masterPlatoon = _EnsureMasterPlatoon(self.brain, self.masterPlatoonName)
+    self.masterTracked = {}
+    self.masterInterval = self.params.masterInterval or 1.0
+    if self.masterThread then
+        KillThread(self.masterThread)
+        self.masterThread = nil
+    end
+    if self.brain and self.masterPlatoon then
+        self.masterThread = self.brain:ForkThread(function()
+            while self.masterThread do
+                self:_MasterPlatoonLoop()
+                WaitSeconds(self.masterInterval)
+            end
+        end)
+    end
+end
+
+function Base:_MasterPlatoonLoop()
+    local platoon = self.masterPlatoon
+    if not (platoon and self.brain and self.brain.PlatoonExists and self.brain:PlatoonExists(platoon)) then
+        self.masterPlatoon = _EnsureMasterPlatoon(self.brain, self.masterPlatoonName)
+        platoon = self.masterPlatoon
+        if not platoon then return end
+    end
+
+    for id, u in pairs(self.masterTracked or {}) do
+        if not (u and not u.Dead and u:GetAIBrain() == self.brain) then
+            self.masterTracked[id] = nil
+        end
+    end
+
+    local near = {}
+    if self.factoryControl and self.factoryControl.factoryState then
+        for _, state in pairs(self.factoryControl.factoryState) do
+            local f = state and state.unit
+            if f and not f:IsDead() and f:GetAIBrain() == self.brain then
+                local around = self.brain:GetUnitsAroundPoint(categories.MOBILE, f:GetPosition(), 35, 'Ally') or {}
+                local i = 1
+                while i <= table.getn(around) do
+                    table.insert(near, around[i])
+                    i = i + 1
+                end
+            end
+        end
+    end
+
+    if self.basePos then
+        local aroundB = self.brain:GetUnitsAroundPoint(categories.MOBILE, self.basePos, 35, 'Ally') or {}
+        local j = 1
+        while j <= table.getn(aroundB) do
+            table.insert(near, aroundB[j])
+            j = j + 1
+        end
+    end
+
+    local k = 1
+    while k <= table.getn(near) do
+        local u = near[k]
+        if u and not u.Dead and isComplete(u) and u:GetAIBrain() == self.brain then
+            if not u.ub_tag and not EntityCategoryContains(categories.ENGINEER + categories.COMMAND, u) then
+                local id = u:GetEntityId()
+                if not self.masterTracked[id] then
+                    self.masterTracked[id] = u
+                    self.brain:AssignUnitsToPlatoon(platoon, { u }, 'Attack', 'GrowthFormation')
+                end
+            end
+        end
+        k = k + 1
+    end
+end
+
 function Base:GetFactoryControl()
     return self.factoryControl
+end
+
+function Base:GetMasterPlatoon()
+    if not (self.brain and self.masterPlatoonName) then return nil end
+    local platoon = self.masterPlatoon
+    if platoon and self.brain.PlatoonExists and self.brain:PlatoonExists(platoon) then
+        return platoon
+    end
+    self.masterPlatoon = _EnsureMasterPlatoon(self.brain, self.masterPlatoonName)
+    return self.masterPlatoon
 end
 
 function Base:RequestFactories(params)
@@ -2703,6 +2801,13 @@ function Base:Stop()
         self.factoryControl:Shutdown()
         self.factoryControl = nil
     end
+    if self.masterThread then
+        KillThread(self.masterThread)
+        self.masterThread = nil
+    end
+    self.masterTracked = nil
+    self.masterPlatoon = nil
+    self.masterPlatoonName = nil
     if ScenarioInfo.BaseEngineerPlatoons and self.engineerPlatoonName then
         ScenarioInfo.BaseEngineerPlatoons[self.engineerPlatoonName] = nil
     end
@@ -2737,6 +2842,7 @@ local function NormalizeBaseParams(p)
         engineerFactoryPriority = p.engineerFactoryPriority,
         engineerFactoryCount    = p.engineerFactoryCount,
         factoryStallTimeout     = p.factoryStallTimeout,
+        masterInterval          = p.masterInterval,
     }
 end
 
@@ -2752,6 +2858,7 @@ local function BaseStart(params)
 
     base:_SetupFactoryControl()
     base:_SetupEngineerManager()
+    base:_SetupMasterPlatoon()
 
     ScenarioInfo.BaseManagers[base.tag] = base
     return base
