@@ -796,6 +796,7 @@ function Builder:_MakeLeaseParams()
         domain         = (self.params.domain or 'AUTO'):upper(),
         wantFactories  = math.max(0, self.params.wantFactories or 0),
         priority       = math.max(0, math.min(200, self.params.priority or 50)),
+        requesterTag   = self.tag,
         onGrant        = function(f, id) self:OnLeaseGranted(f, id) end,
         onUpdate       = function(f, id) self:OnLeaseUpdated(f, id) end,
         onRevoke       = function(list, id, reason) self:OnLeaseRevoked(list, id, reason) end,

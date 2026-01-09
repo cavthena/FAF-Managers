@@ -1998,6 +1998,12 @@ function FactoryControl.New(base)
     return self
 end
 
+function FactoryControl:_Dbg(msg)
+    if self.base and self.base.Dbg then
+        self.base:Dbg(msg)
+    end
+end
+
 function FactoryControl:_RefreshFactoryRoster()
     local brain = self.brain
     if not brain or not brain.GetListOfUnits then return end
@@ -2283,6 +2289,7 @@ function FactoryControl:RequestFactories(params)
         onUpdate    = params.onUpdate,
         onRevoke    = params.onRevoke,
         onComplete  = params.onComplete,
+        requesterTag= params.requesterTag,
         granted     = {},
         stallTimeout= params.stallTimeout,
         _idleSeconds= 0,
@@ -2317,12 +2324,22 @@ function FactoryControl:RequestFactories(params)
     table.insert(self.queue, id)
     self:SortQueue()
 
+    local requester = req.requesterTag or 'unknown'
+    self:_Dbg(('Factory lease request %d from %s (domain=%s want=%d radius=%s)'):format(
+        id,
+        requester,
+        tostring(req.domain),
+        req.want or 0,
+        tostring(req.radius)
+    ))
+
     return id
 end
 
 function FactoryControl:ReturnLease(leaseId, reason)
     local req = self.requests[leaseId]
     if not req then return end
+    local requester = req.requesterTag or 'unknown'
     local revoke = {}
     for entId, unit in pairs(req.granted) do
         local fs = self.factoryState[entId]
@@ -2331,6 +2348,11 @@ function FactoryControl:ReturnLease(leaseId, reason)
             fs.leaseId = nil
         end
         revoke[entId] = unit
+        self:_Dbg(('Factory %d returned from %s (reason=%s)'):format(
+            entId,
+            requester,
+            tostring(reason or 'complete')
+        ))
     end
     req.granted = {}
     if reason then
@@ -2484,6 +2506,7 @@ function FactoryControl:ServiceRequest(req)
     if need <= 0 then return end
 
     local grantedNow = {}
+    local remainingUnleased = table.getn(candidates)
     local j = 1
     while j <= table.getn(candidates) and need > 0 do
         local fac = candidates[j]
@@ -2494,6 +2517,12 @@ function FactoryControl:ServiceRequest(req)
             state.leaseId = req.id
             req.granted[entId] = fac
             table.insert(grantedNow, fac)
+            remainingUnleased = remainingUnleased - 1
+            self:_Dbg(('Factory %d leased to %s; %d unleased remaining'):format(
+                entId,
+                req.requesterTag or 'unknown',
+                math.max(0, remainingUnleased)
+            ))
             need = need - 1
         end
         j = j + 1
