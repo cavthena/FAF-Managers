@@ -2019,6 +2019,15 @@ function FactoryControl:_RefreshFactoryRoster()
     end
 end
 
+function FactoryControl:_FindLeaseOwner(entId)
+    for _, req in pairs(self.requests or {}) do
+        if req and req.granted and req.granted[entId] then
+            return req
+        end
+    end
+    return nil
+end
+
 function FactoryControl:_FactoryMatchesDomain(unit, domain)
     if not unit or unit:IsDead() then return false end
     if domain == 'LAND' then
@@ -2427,7 +2436,11 @@ function FactoryControl:ServiceRequest(req)
                 state = { unit = fac, leased = false, leaseId = nil }
                 self.factoryState[entId] = state
             end
-            if not state.leased then
+            local owner = self:_FindLeaseOwner(entId)
+            if owner then
+                state.leased = true
+                state.leaseId = owner.id
+            elseif not state.leased then
                 table.insert(candidates, fac)
             end
         end
