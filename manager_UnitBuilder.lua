@@ -618,6 +618,19 @@ function Builder:_HandOffPlatoon(units, label)
     return platoon
 end
 
+function Builder:_CleanupAfterHandoff()
+    -- Clear per-request state so the next wave starts cleanly.
+    self.handedOff = {}
+    self.stagingSet = {}
+    self.stagingPlatoon = nil
+    self.stagingName = nil
+    self.attackName = nil
+    self.inProd = {}
+    self.rrIndex = 1
+    self._haveSum = 0
+    self._idleAllCounter = 0
+end
+
 function Builder:EarlyHandoff(aliveList)
     local flist = _LiveFactoriesList(self, false)
     _ClearQueuesRestoreRally(self)
@@ -646,6 +659,7 @@ function Builder:EarlyHandoff(aliveList)
     end
 
     local attackPlatoon = self:_HandOffPlatoon(assign, self.attackName or (self.tag..'_Attack'))
+    self:_CleanupAfterHandoff()
     if not attackPlatoon then
         self:Warn('EarlyHandoff: no platoon created for handoff')
     end
@@ -955,7 +969,9 @@ function Builder:SpawnDirectAndSend(waveNo)
             end
         end
     end
-    return self:_HandOffPlatoon(spawned, string.format('%s_Attack_%d', self.tag, waveNo or 1))
+    local platoon = self:_HandOffPlatoon(spawned, string.format('%s_Attack_%d', self.tag, waveNo or 1))
+    self:_CleanupAfterHandoff()
+    return platoon
 end
 
 function Builder:CollectorLoop()
@@ -1096,6 +1112,7 @@ function Builder:MonitorLoop()
                 end
 
                 attackPlatoon = self:_HandOffPlatoon(assign, self.attackName)
+                self:_CleanupAfterHandoff()
 
                 if self.leaseId then
                     self.base:ReturnLease(self.leaseId)
