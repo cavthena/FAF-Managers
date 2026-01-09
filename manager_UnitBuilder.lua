@@ -306,7 +306,7 @@ local function setFactoryRally(factory, pos)
 end
 
 -- Clear queues on a list of factories and immediately restore this builder's rally
-local function _ClearQueuesRestoreRally(self)
+local function _ClearQueuesRestoreRally(self, stopBuild)
     if not self then return end
     local flist = {}
     for _, f in pairs(self.leased or {}) do
@@ -315,6 +315,9 @@ local function _ClearQueuesRestoreRally(self)
     if table.getn(flist) == 0 then return end
     local rpos = getRallyPos(self.params) or self.basePos
     IssueClearFactoryCommands(flist)
+    if stopBuild then
+        IssueStop(flist)
+    end
     if rpos then
         for _, f in ipairs(flist) do
             setFactoryRally(f, rpos)
@@ -632,8 +635,7 @@ function Builder:_CleanupAfterHandoff()
 end
 
 function Builder:EarlyHandoff(aliveList)
-    local flist = _LiveFactoriesList(self, false)
-    _ClearQueuesRestoreRally(self)
+    _ClearQueuesRestoreRally(self, true)
 
     -- Allow master platoon sweeps to settle before we assemble a handoff.
     WaitSeconds(2)
@@ -668,6 +670,8 @@ function Builder:EarlyHandoff(aliveList)
         self.base:ReturnLease(self.leaseId)
         self.leaseId = nil
     end
+    self._cleanupDue = true
+    self:RunCleanup()
 
     local mode = self.params.mode or 1
     if mode == 3 then
