@@ -560,6 +560,15 @@ function Builder:_AllFactoriesIdle()
     return any and allIdle
 end
 
+function Builder:_WaitingForFactories()
+    local want = math.max(0, (self.params and self.params.wantFactories) or 0)
+    if want <= 0 then
+        return false
+    end
+    local have = table.getn(_LiveFactoriesList(self, false))
+    return have < want
+end
+
 function Builder:_CollectHandoffUnits(units)
     local assign, seen = {}, {}
     self.handedOff = self.handedOff or {}
@@ -1064,7 +1073,7 @@ function Builder:MonitorLoop()
                 self._haveSum = haveTotal
                 self._idleAllCounter = 0
             else
-                if allIdle then
+                if allIdle and not self:_WaitingForFactories() then
                     self._idleAllCounter = (self._idleAllCounter or 0) + 1
                     -- Early handoff after 10 consecutive idle seconds
                     if self._idleAllCounter >= 10 then

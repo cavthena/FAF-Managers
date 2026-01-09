@@ -2436,8 +2436,27 @@ function FactoryControl:ServiceRequest(req)
                 state = { unit = fac, leased = false, leaseId = nil }
                 self.factoryState[entId] = state
             end
-            local owner = self:_FindLeaseOwner(entId)
+
+            local owner = nil
+            if state.leaseId then
+                owner = self.requests[state.leaseId]
+                if not owner then
+                    state.leased = false
+                    state.leaseId = nil
+                end
+            end
+            if not owner then
+                owner = self:_FindLeaseOwner(entId)
+                if owner then
+                    state.leased = true
+                    state.leaseId = owner.id
+                end
+            end
+
             if owner then
+                if owner == req then
+                    req.granted[entId] = fac
+                end
                 state.leased = true
                 state.leaseId = owner.id
             elseif not state.leased then
