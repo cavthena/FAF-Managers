@@ -643,6 +643,15 @@ function Builder:_CleanupAfterHandoff()
     self._idleAllCounter = 0
 end
 
+function Builder:_ReleaseLease()
+    if self.leaseId then
+        self.base:ReturnLease(self.leaseId)
+    end
+    self.leaseId = nil
+    self.leased = {}
+    self.inProd = {}
+end
+
 function Builder:EarlyHandoff(aliveList)
     _ClearQueuesRestoreRally(self, true)
 
@@ -676,8 +685,7 @@ function Builder:EarlyHandoff(aliveList)
     end
 
     if self.leaseId then
-        self.base:ReturnLease(self.leaseId)
-        self.leaseId = nil
+        self:_ReleaseLease()
     end
     self._cleanupDue = true
     self:RunCleanup()
@@ -885,6 +893,10 @@ function Builder:_EndWaveThreads()
     if self.collectThread then
         KillThread(self.collectThread)
         self.collectThread = nil
+    end
+    if self.monitorThread then
+        KillThread(self.monitorThread)
+        self.monitorThread = nil
     end
     if self.rallyKeeperThread then
         KillThread(self.rallyKeeperThread)
@@ -1129,8 +1141,7 @@ function Builder:MonitorLoop()
                 self:_CleanupAfterHandoff()
 
                 if self.leaseId then
-                    self.base:ReturnLease(self.leaseId)
-                    self.leaseId = nil
+                    self:_ReleaseLease()
                 end
 
                 local mode = self.params.mode or 1
@@ -1559,8 +1570,7 @@ function Builder:Mode3Loop(p)
             end
             _CallPlatoonCallbacks(self.platoonCallbacks, p, 'OnHandoff', self.tag)
             if self.leaseId then
-                self.base:ReturnLease(self.leaseId)
-                self.leaseId = nil
+                self:_ReleaseLease()
             end
         else
             -- Top up missing units
@@ -1580,16 +1590,14 @@ function Builder:Mode3Loop(p)
                     -- ensure we're not accidentally building while held
                     if self.leaseId then
                         _ClearQueuesRestoreRally(self)
-                        self.base:ReturnLease(self.leaseId)
-                        self.leaseId = nil
+                        self:_ReleaseLease()
                     end
                 end
             else
                 -- no deficit; release any lease we hold
                 if self.leaseId then
                     _ClearQueuesRestoreRally(self)
-                    self.base:ReturnLease(self.leaseId)
-                    self.leaseId = nil
+                    self:_ReleaseLease()
                 end
             end
             WaitSeconds(1)
@@ -1650,8 +1658,7 @@ function Builder:Stop()
 
     _ClearQueuesRestoreRally(self)
     if self.leaseId then
-        self.base:ReturnLease(self.leaseId)
-        self.leaseId = nil
+        self:_ReleaseLease()
     end
 
     if handoffCount > 0 then
