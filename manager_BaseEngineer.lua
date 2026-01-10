@@ -453,6 +453,7 @@ end
 
 function M:OnLeaseGranted(factories, leaseId)
     if self.stopped then return end
+    if leaseId ~= self.leaseId then return end
     self.leased = {}
     self.pending = {}
     local i = 1
@@ -469,6 +470,7 @@ end
 
 function M:OnLeaseUpdated(factories, leaseId)
     if self.stopped then return end
+    if leaseId ~= self.leaseId then return end
     self.leased = self.leased or {}
     self.pending = self.pending or {}
     local i = 1

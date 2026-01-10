@@ -813,6 +813,9 @@ function Builder:_MakeLeaseParams()
 end
 
 function Builder:RequestLease()
+    if self.leaseId then
+        return self.leaseId
+    end
     self.leaseId = self.base:RequestFactories(self:_MakeLeaseParams())
     return self.leaseId
 end
@@ -1178,8 +1181,12 @@ function Builder:QueueNeededBuilds(currentCounts)
         if f and not f.Dead then table.insert(flist, f) end
     end
     if table.getn(flist) == 0 then
-        self:Warn('QueueNeededBuilds: no live factories — requesting lease; sleeping 15s before retry')
-        self:RequestLease()
+        if not self.leaseId then
+            self:Warn('QueueNeededBuilds: no live factories — requesting lease; sleeping 15s before retry')
+            self:RequestLease()
+        else
+            self:Dbg('QueueNeededBuilds: no live factories; lease pending, sleeping 15s before retry')
+        end
         WaitSeconds(15)
         return
     end
