@@ -532,7 +532,6 @@ function Builder:EnsureFactoryQuota()
     if have < want then
         if not self.leaseId then
             self:RequestLease()
-        else
         end
     end
 end
@@ -567,6 +566,38 @@ function Builder:_WaitingForFactories()
     end
     local have = table.getn(_LiveFactoriesList(self, false))
     return have < want
+end
+
+function Builder:_WaitForLeaseGrant(maxWait, interval)
+    local waited = 0
+    local step = interval or 0.5
+    while not self.stopped do
+        if table.getn(_LiveFactoriesList(self, false)) > 0 then
+            return true
+        end
+        if maxWait and waited >= maxWait then
+            return false
+        end
+        WaitSeconds(step)
+        waited = waited + step
+    end
+    return false
+end
+
+function Builder:_WaitForLeaseGrant(maxWait, interval)
+    local waited = 0
+    local step = interval or 0.5
+    while not self.stopped do
+        if table.getn(_LiveFactoriesList(self, false)) > 0 then
+            return true
+        end
+        if maxWait and waited >= maxWait then
+            return false
+        end
+        WaitSeconds(step)
+        waited = waited + step
+    end
+    return false
 end
 
 function Builder:_CollectHandoffUnits(units)
@@ -644,12 +675,13 @@ function Builder:_CleanupAfterHandoff()
 end
 
 function Builder:_ReleaseLease()
-    if self.leaseId then
-        self.base:ReturnLease(self.leaseId)
-    end
+    local leaseId = self.leaseId
     self.leaseId = nil
     self.leased = {}
     self.inProd = {}
+    if leaseId then
+        self.base:ReturnLease(leaseId)
+    end
 end
 
 function Builder:EarlyHandoff(aliveList)
@@ -877,7 +909,7 @@ function Builder:BeginWaveLoop()
     -- Request factories
     self:RequestLease()
     if not self.leaseId then
-        self:Warn('Factory lease request failed; will retry in 15s')
+        self:Warn('Factory lease request failed; will retry shortly')
         self.brain:ForkThread(function()
             WaitSeconds(15)
             if not self.stopped then self:BeginWaveLoop() end
@@ -1048,8 +1080,12 @@ function Builder:CollectorLoop()
                 end
             end
         end
-        local __sleep = (facCount == 0) and 15 or 1
-        WaitSeconds(__sleep)
+        if facCount == 0 then
+            self:_WaitForLeaseGrant(3, 0.5)
+            WaitSeconds(0.5)
+        else
+            WaitSeconds(1)
+        end
     end
 end
 
@@ -1182,12 +1218,12 @@ function Builder:QueueNeededBuilds(currentCounts)
     end
     if table.getn(flist) == 0 then
         if not self.leaseId then
-            self:Warn('QueueNeededBuilds: no live factories — requesting lease; sleeping 15s before retry')
+            self:Warn('QueueNeededBuilds: no live factories — requesting lease; waiting for grant')
             self:RequestLease()
         else
-            self:Dbg('QueueNeededBuilds: no live factories; lease pending, sleeping 15s before retry')
+            self:Dbg('QueueNeededBuilds: no live factories; lease pending, waiting for grant')
         end
-        WaitSeconds(15)
+        self:_WaitForLeaseGrant(3, 0.5)
         return
     end
 

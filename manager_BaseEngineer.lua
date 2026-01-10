@@ -451,6 +451,16 @@ function M:RequestLease()
     return self.leaseId
 end
 
+function M:_ReleaseLeaseLocal(reason)
+    local leaseId = self.leaseId
+    self.leaseId = nil
+    self.leased = {}
+    self.pending = {}
+    if leaseId then
+        self.alloc:ReturnLease(leaseId, reason)
+    end
+end
+
 function M:OnLeaseGranted(factories, leaseId)
     if self.stopped then return end
     if leaseId ~= self.leaseId then return end
@@ -620,8 +630,7 @@ function M:QueueNeededBuilds()
         local missing = 0
         for _, n in pairs(d) do missing = missing + (n or 0) end
         if missing <= 0 and self.leaseId then
-            self.alloc:ReturnLease(self.leaseId)
-            self.leaseId = nil
+            self:_ReleaseLeaseLocal()
         end
     end
 end
@@ -1795,8 +1804,7 @@ function M:MonitorLoop()
         self:_CollectorSweep()
 
         if missing <= 0 and self.leaseId then
-            self.alloc:ReturnLease(self.leaseId)
-            self.leaseId = nil
+            self:_ReleaseLeaseLocal()
         end
 
         WaitSeconds(1)
@@ -1815,8 +1823,7 @@ function M:Stop()
     if self.stopped then return end
     self.stopped = true
     if self.leaseId then
-        self.alloc:ReturnLease(self.leaseId)
-        self.leaseId = nil
+        self:_ReleaseLeaseLocal()
     end
     if self.monitorThread then
         KillThread(self.monitorThread)
