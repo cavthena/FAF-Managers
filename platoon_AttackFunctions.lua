@@ -115,7 +115,8 @@ WaveAttack specifics
             When true, the platoon halts at its longest weapon range and
             attacks from distance instead of pushing into direct fire.
         RandomizeRoute (boolean, default = true)
-            May choose alternate paths to avoid other platoons and vary routes.
+            Has a 25% chance to choose a wide flanking route instead of the
+            shortest path.
 
 RaidAttack specifics
         Category (string, default = 'ECO')
@@ -123,7 +124,8 @@ RaidAttack specifics
             Areas are 25 units wide.  The priority chain is always
             Requested > ECO > BLD > INT > DEF.
         RandomizeRoute (boolean, default = true)
-            May choose alternate paths to avoid other platoons and vary routes.
+            Has a 25% chance to choose a wide flanking route instead of the
+            shortest path.
 
 ScoutAttack specifics
         Designed for AIR platoons.  Each unit receives a move target.  Upon
@@ -197,8 +199,8 @@ local HuntOrbitRadius         = 32
 local DefaultPatrolDistance   = 80
 local DefaultInterceptDistance = 120
 local RouteClearanceOffset    = 6
-local RouteConflictDistanceSq = 900     -- ~30 units
-local RouteRandomChance       = 0.35
+local RouteFlankChance        = 0.25
+local RouteAlternateAttempts  = 3
 local RouteAlternateAttempts  = 3
 local RouteDetourMin          = 48
 local RouteDetourMax          = 192
@@ -231,8 +233,6 @@ local FormationOptions = {
     GrowthFormation = true,
     NoFormation     = true,
 }
-
-local RouteReservations = {}
 
 local function SafeWait(seconds)
     if seconds and seconds > 0 then
@@ -1045,45 +1045,6 @@ local function AppendDestination(path, destination)
     return path
 end
 
-local function CleanupRouteReservations()
-    for platoon, data in pairs(RouteReservations) do
-        if not (platoon and PlatoonAlive(platoon) and data and data.path and data.layer) then
-            RouteReservations[platoon] = nil
-        end
-    end
-end
-
-local function RegisterRoute(platoon, layer, path)
-    if not (platoon and path and table_getn(path) > 0) then
-        return
-    end
-    CleanupRouteReservations()
-    RouteReservations[platoon] = { layer = layer, path = path }
-end
-
-local function RouteSeparationScore(path, layer, ignorePlatoon)
-    CleanupRouteReservations()
-    if not path then
-        return -math_huge
-    end
-
-    local best = math_huge
-    for platoon, data in pairs(RouteReservations) do
-        if platoon ~= ignorePlatoon and data and data.path and data.layer == layer then
-            for _, waypoint in ipairs(path) do
-                for _, other in ipairs(data.path) do
-                    local distSq = DistanceSq(waypoint, other)
-                    if distSq < best then
-                        best = distSq
-                    end
-                end
-            end
-        end
-    end
-
-    return best
-end
-
 local function BuildPathSegment(layer, startPos, destination)
     local ok, path = pcall(NavUtils.PathTo, layer, startPos, destination)
     if ok and path then
@@ -1148,21 +1109,17 @@ local function MergePathSegments(segments)
     return merged
 end
 
-local function TryAlternatePath(platoon, layer, startPos, destination, baseSeparation, baseThreat, opts)
+local function TryAlternatePath(platoon, layer, startPos, destination, opts)
     if not (opts and opts.RandomizeRoute) then
         return nil
     end
-    if baseSeparation and baseSeparation > RouteConflictDistanceSq then
-        return nil
-    end
-    if math_random() >= RouteRandomChance then
+    if math_random() >= RouteFlankChance then
         return nil
     end
 
     local brain = platoon:GetBrain()
     local bestPath = nil
-    local bestSeparation = baseSeparation or -math_huge
-    local bestThreat = baseThreat or math_huge
+    local bestThreat = math_huge
 
     for _ = 1, RouteAlternateAttempts do
         local detour = RandomDetourPoint(layer, startPos, destination)
@@ -1171,14 +1128,9 @@ local function TryAlternatePath(platoon, layer, startPos, destination, baseSepar
             local second = BuildPathSegment(layer, detour, destination)
             if first and second then
                 local candidate = MergePathSegments({ first, second })
-                local separation = RouteSeparationScore(candidate, layer, platoon)
                 local threat = opts.AvoidDef and PathThreatScore(brain, layer, candidate) or 0
-                local better = separation > bestSeparation + 0.1
-                if opts.AvoidDef and threat > bestThreat + 0.01 then
-                    better = false
-                end
+                local better = not bestPath or (opts.AvoidDef and threat < bestThreat - 0.01)
                 if better then
-                    bestSeparation = separation
                     bestThreat = threat
                     bestPath = candidate
                 end
@@ -1186,10 +1138,7 @@ local function TryAlternatePath(platoon, layer, startPos, destination, baseSepar
         end
     end
 
-    if bestPath and bestSeparation > (baseSeparation or -math_huge) then
-        return bestPath
-    end
-    return nil
+    return bestPath
 end
 
 local function OffsetCorner(prev, corner, next, layer)
@@ -1257,9 +1206,7 @@ local function FindSafePath(platoon, layer, destination, startOverride, opts)
         return nil
     end
 
-    local separation = RouteSeparationScore(path, layer, platoon)
-    local threat = opts.AvoidDef and PathThreatScore(platoon:GetBrain(), layer, path) or 0
-    local alternate = TryAlternatePath(platoon, layer, startPos, destination, separation, threat, opts)
+    local alternate = TryAlternatePath(platoon, layer, startPos, destination, opts)
     if alternate then
         path = alternate
     end
@@ -1486,7 +1433,6 @@ local function AttackTargetArea(platoon, target, opts)
         path = ShortenPathForBombard(path, target.position, bombardRange)
     end
 
-    RegisterRoute(platoon, layer, path)
     MoveAlongPath(platoon, path, opts.Formation)
 
     if startedOutside then
@@ -1507,7 +1453,6 @@ local function AttackTargetArea(platoon, target, opts)
                 if bombardRange then
                     reroute = ShortenPathForBombard(reroute, target.position, bombardRange)
                 end
-                RegisterRoute(platoon, layer, reroute)
                 MoveAlongPath(platoon, reroute, opts.Formation)
             end
         end
@@ -2068,7 +2013,6 @@ local function TrackHuntTarget(platoon, targetInfo, opts, layer)
                     SafeWait(RecheckDelay)
                     skipIteration = true
                 else
-                    RegisterRoute(platoon, layer, path)
                     MoveAlongPath(platoon, path, opts.Formation, true)
                     lastCommandPos = CopyVector(unitPos)
                 end
@@ -2273,7 +2217,6 @@ function DefensePatrol(platoon, data)
             if targetPos then
                 local path = FindSafePath(platoon, layer, targetPos, nil, opts)
                 if path then
-                    RegisterRoute(platoon, layer, path)
                     MoveAlongPath(platoon, path, opts.Formation, true)
                 else
                     local units = platoon:GetPlatoonUnits() or {}
