@@ -206,6 +206,16 @@ local RouteAlternateAttempts  = 3
 local RouteAlternateAttempts  = 3
 local RouteDetourMin          = 48
 local RouteDetourMax          = 192
+local CorridorNearDistance     = 180
+local CorridorDesiredClearance = 14
+local CorridorProbeMax         = 40
+local CorridorProbeStep        = 2
+local CorridorMaxShiftPerPass  = 6
+local CorridorPasses           = 2
+local CorridorDirections       = 8
+local CorridorSimplifyAngle    = 6
+
+local ClampPathToPlayableArea
 
 local StructureCategory = categories.STRUCTURE - categories.WALL
 local NavalStructure    = categories.STRUCTURE * categories.NAVAL
@@ -1295,6 +1305,157 @@ local function ApplyPathClearance(path, layer)
     return widened
 end
 
+local function Normalize2D(dx, dz)
+    local len = math_sqrt(dx * dx + dz * dz)
+    if len < 0.001 then
+        return 0, 0
+    end
+    return dx / len, dz / len
+end
+
+local function GetClearanceEstimate(layer, pos)
+    if not pos then
+        return CorridorProbeMax + 1, nil
+    end
+
+    local directions = {
+        { 0, 1 },
+        { 1, 1 },
+        { 1, 0 },
+        { 1, -1 },
+        { 0, -1 },
+        { -1, -1 },
+        { -1, 0 },
+        { -1, 1 },
+    }
+    if CorridorDirections and CorridorDirections <= 4 then
+        directions = {
+            { 0, 1 },
+            { 1, 0 },
+            { 0, -1 },
+            { -1, 0 },
+        }
+    end
+
+    local x = pos[1]
+    local z = pos[3]
+    local minDistance = CorridorProbeMax + 1
+    local minDirX = nil
+    local minDirZ = nil
+
+    for _, direction in ipairs(directions) do
+        local dirX, dirZ = Normalize2D(direction[1], direction[2])
+        local blocked = nil
+        for distance = CorridorProbeStep, CorridorProbeMax, CorridorProbeStep do
+            local testX = x + dirX * distance
+            local testZ = z + dirZ * distance
+            local testPos = { testX, AmphibiousSurfaceHeight(layer, testX, testZ), testZ }
+            if not CanPathBetween(layer, pos, testPos) then
+                blocked = distance
+                break
+            end
+        end
+
+        local clearance = blocked or (CorridorProbeMax + 1)
+        if clearance < minDistance then
+            minDistance = clearance
+            minDirX = dirX
+            minDirZ = dirZ
+        end
+    end
+
+    if minDirX then
+        local pushX, pushZ = Normalize2D(-minDirX, -minDirZ)
+        return minDistance, { pushX, 0, pushZ }
+    end
+
+    return minDistance, nil
+end
+
+local function ApplyCorridorCentering(path, layer, startPos, destination, opts)
+    path = ApplyPathClearance(path, layer)
+    if not (path and table_getn(path) >= 3) then
+        return path
+    end
+
+    local cumulative = {}
+    local total = 0
+    local prev = startPos
+    for i = 1, table_getn(path) do
+        local point = path[i]
+        if prev and point then
+            total = total + Distance(prev, point)
+        end
+        cumulative[i] = total
+        prev = point
+    end
+
+    for _ = 1, CorridorPasses do
+        for i = 2, table_getn(path) - 1 do
+            if cumulative[i] <= CorridorNearDistance then
+                local prevPoint = path[i - 1]
+                local current = path[i]
+                local nextPoint = path[i + 1]
+                if prevPoint and current and nextPoint then
+                    local clearance, pushDir = GetClearanceEstimate(layer, current)
+                    if pushDir and clearance < CorridorDesiredClearance then
+                        local pushAmount = math_min(CorridorMaxShiftPerPass, CorridorDesiredClearance - clearance)
+                        local attemptAmounts = { pushAmount, pushAmount * 0.5, pushAmount * 0.25 }
+                        local accepted = false
+
+                        for _, amount in ipairs(attemptAmounts) do
+                            local newX = current[1] + pushDir[1] * amount
+                            local newZ = current[3] + pushDir[3] * amount
+                            local candidate = { newX, AmphibiousSurfaceHeight(layer, newX, newZ), newZ }
+
+                            if ClampPathToPlayableArea then
+                                local clamped = ClampPathToPlayableArea({ candidate }, 0)
+                                if clamped and clamped[1] then
+                                    candidate = clamped[1]
+                                end
+                            end
+
+                            if CanPathBetween(layer, prevPoint, candidate) and CanPathBetween(layer, candidate, nextPoint) then
+                                path[i] = candidate
+                                accepted = true
+                                break
+                            end
+                        end
+
+                        if not accepted then
+                            path[i] = current
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if CorridorSimplifyAngle and CorridorSimplifyAngle > 0 and table_getn(path) >= 3 then
+        local simplified = { path[1] }
+        local cosThreshold = math_cos(CorridorSimplifyAngle * math_pi / 180)
+        for i = 2, table_getn(path) - 1 do
+            local a = simplified[table_getn(simplified)]
+            local b = path[i]
+            local c = path[i + 1]
+            if a and b and c then
+                local abX, abZ = Normalize2D(b[1] - a[1], b[3] - a[3])
+                local bcX, bcZ = Normalize2D(c[1] - b[1], c[3] - b[3])
+                local dot = abX * bcX + abZ * bcZ
+                if dot >= cosThreshold and CanPathBetween(layer, a, c) then
+                    -- skip b
+                else
+                    table_insert(simplified, b)
+                end
+            end
+        end
+        table_insert(simplified, path[table_getn(path)])
+        path = simplified
+    end
+
+    return path
+end
+
 local function FindSafePath(platoon, layer, destination, startOverride, opts)
     opts = opts or {}
 
@@ -1311,7 +1472,11 @@ local function FindSafePath(platoon, layer, destination, startOverride, opts)
         path = alternate
     end
 
-    return ApplyPathClearance(path, layer)
+    if opts.CorridorCentering == false then
+        return ApplyPathClearance(path, layer)
+    end
+
+    return ApplyCorridorCentering(path, layer, startPos, destination, opts)
 end
 
 local function MaxWeaponRange(platoon)
@@ -1379,7 +1544,7 @@ local function RequestTransports(brain, platoon, destination)
     return false
 end
 
-local function ClampPathToPlayableArea(path, buffer)
+ClampPathToPlayableArea = function(path, buffer)
     local area = GetPlayableArea()
     if not (area and path and table_getn(path) > 0) then
         return path
