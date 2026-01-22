@@ -1053,6 +1053,56 @@ local function BuildPathSegment(layer, startPos, destination)
     return nil
 end
 
+local function PathLength(path)
+    if not (path and table_getn(path) >= 2) then
+        return 0
+    end
+    local total = 0
+    for i = 2, table_getn(path) do
+        local a = path[i - 1]
+        local b = path[i]
+        if a and b then
+            total = total + Distance(a, b)
+        end
+    end
+    return total
+end
+
+local function HeadingDegrees(a, b)
+    if not (a and b) then
+        return 0
+    end
+    local dx = b[1] - a[1]
+    local dz = b[3] - a[3]
+    if dx == 0 and dz == 0 then
+        return 0
+    end
+    return math_atan2(dz, dx) * 180 / math_pi
+end
+
+local function AngleDifferenceDegrees(a, b)
+    local diff = math_abs(NormalizeDegrees(a) - NormalizeDegrees(b))
+    if diff > 180 then
+        diff = 360 - diff
+    end
+    return diff
+end
+
+local function FinalApproachHeading(path, startPos, destination)
+    if not destination then
+        return nil
+    end
+    local prev = startPos
+    if path and table_getn(path) >= 2 then
+        prev = path[table_getn(path) - 1]
+        destination = path[table_getn(path)] or destination
+    end
+    if not prev then
+        return nil
+    end
+    return HeadingDegrees(prev, destination)
+end
+
 local function RandomDetourPoint(layer, startPos, destination)
     local dx = destination[1] - startPos[1]
     local dz = destination[3] - startPos[3]
@@ -1118,21 +1168,69 @@ local function TryAlternatePath(platoon, layer, startPos, destination, opts)
     end
 
     local brain = platoon:GetBrain()
+    local baseline = BuildPathSegment(layer, startPos, destination)
+    if not baseline then
+        return nil
+    end
+
+    local baselineLength = PathLength(baseline)
+    local baselineHeading = FinalApproachHeading(baseline, startPos, destination)
+    if baselineLength <= 0 or not baselineHeading then
+        return nil
+    end
+
+    local baseAngle = math_atan2(startPos[3] - destination[3], startPos[1] - destination[1])
     local bestPath = nil
     local bestThreat = math_huge
+    local bestAngleDiff = 0
+    local bestLengthRatio = 0
 
     for _ = 1, RouteAlternateAttempts do
-        local detour = RandomDetourPoint(layer, startPos, destination)
-        if detour and CanPathBetween(layer, startPos, detour) and CanPathBetween(layer, detour, destination) then
-            local first = BuildPathSegment(layer, startPos, detour)
-            local second = BuildPathSegment(layer, detour, destination)
+        local offsetDeg = 90 + math_random() * 50
+        local offsetRad = offsetDeg * math_pi / 180
+        if math_random() < 0.5 then
+            offsetRad = -offsetRad
+        end
+
+        local radius = 80 + math_random() * 120
+        local angle = baseAngle + offsetRad
+        local x = destination[1] + math_cos(angle) * radius
+        local z = destination[3] + math_sin(angle) * radius
+
+        local size = ScenarioInfo and (ScenarioInfo.size or ScenarioInfo.MapSize) or { 512, 512 }
+        x = math_min(math_max(x, 0), size[1])
+        z = math_min(math_max(z, 0), size[2])
+
+        local approach = { x, AmphibiousSurfaceHeight(layer, x, z), z }
+        if approach and CanPathBetween(layer, startPos, approach) and CanPathBetween(layer, approach, destination) then
+            local first = BuildPathSegment(layer, startPos, approach)
+            local second = BuildPathSegment(layer, approach, destination)
             if first and second then
                 local candidate = MergePathSegments({ first, second })
-                local threat = opts.AvoidDef and PathThreatScore(brain, layer, candidate) or 0
-                local better = not bestPath or (opts.AvoidDef and threat < bestThreat - 0.01)
-                if better then
-                    bestThreat = threat
-                    bestPath = candidate
+                local candidateHeading = FinalApproachHeading(candidate, startPos, destination)
+                local angleDiff = candidateHeading and AngleDifferenceDegrees(candidateHeading, baselineHeading) or 0
+                if angleDiff >= 60 then
+                    local candidateLength = PathLength(candidate)
+                    local lengthRatio = candidateLength / baselineLength
+                    local threat = opts.AvoidDef and PathThreatScore(brain, layer, candidate) or 0
+                    local better = false
+                    if not bestPath then
+                        better = true
+                    elseif angleDiff > bestAngleDiff + 0.5 then
+                        better = true
+                    elseif math_abs(angleDiff - bestAngleDiff) <= 0.5 then
+                        if (lengthRatio >= 1.10 and bestLengthRatio < 1.10) or lengthRatio > bestLengthRatio + 0.01 then
+                            better = true
+                        elseif math_abs(lengthRatio - bestLengthRatio) <= 0.01 and opts.AvoidDef and threat < bestThreat - 0.01 then
+                            better = true
+                        end
+                    end
+                    if better then
+                        bestPath = candidate
+                        bestAngleDiff = angleDiff
+                        bestLengthRatio = lengthRatio
+                        bestThreat = threat
+                    end
                 end
             end
         end
