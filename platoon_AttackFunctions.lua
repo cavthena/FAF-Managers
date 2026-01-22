@@ -177,6 +177,8 @@ local math_huge     = math.huge or 1e9
 local math_mod      = math.mod or math.fmod
 
 local RecheckDelay            = 60
+local TravelStuckSeconds      = 12
+local TravelProgressEpsilonSq = 25
 local WaveAreaRadius          = 50
 local RaidAreaRadius          = 25
 local AreaClearRadius         = 35
@@ -1160,7 +1162,7 @@ local function MergePathSegments(segments)
 end
 
 local function TryAlternatePath(platoon, layer, startPos, destination, opts)
-    if not (opts and opts.RandomizeRoute) then
+    if not (opts and opts.RandomizeRoute) or opts._repathing then
         return nil
     end
     if math_random() >= RouteFlankChance then
@@ -1559,7 +1561,9 @@ local function AttackTargetArea(platoon, target, opts)
     local arrived = false
     local epsilon = 5
     local units = platoon:GetPlatoonUnits() or {}
-    local elapsed = 0
+    local stuckSeconds = 0
+    local lastPos = GetPlatoonPosition(platoon)
+    local lastDistSq = lastPos and DistanceSq(lastPos, target.position) or nil
     while PlatoonAlive(platoon) do
         local pos = GetPlatoonPosition(platoon)
         if not pos then break end
@@ -1572,8 +1576,20 @@ local function AttackTargetArea(platoon, target, opts)
             break
         end
         SafeWait(1)
-        elapsed = elapsed + 1
-        if elapsed >= RecheckDelay then
+        local updatedPos = GetPlatoonPosition(platoon)
+        if not updatedPos then break end
+        local distSq = DistanceSq(updatedPos, target.position)
+        local movedSq = lastPos and DistanceSq(updatedPos, lastPos) or 0
+        if lastDistSq and (lastDistSq - distSq) > TravelProgressEpsilonSq then
+            stuckSeconds = 0
+        elseif movedSq > TravelProgressEpsilonSq then
+            stuckSeconds = 0
+        else
+            stuckSeconds = stuckSeconds + 1
+        end
+        lastDistSq = distSq
+        lastPos = CopyVector(updatedPos)
+        if stuckSeconds >= TravelStuckSeconds then
             return 'repath'
         end
     end
@@ -1709,17 +1725,14 @@ local function AttackLoop(platoon, resolver, opts)
             local result = AttackTargetArea(platoon, currentTarget, opts)
             if result == 'success' then
                 currentTarget = nil
+                opts._repathing = nil
                 SafeWait(1)
             elseif result == 'repath' then
-                local newTarget = resolver(brain, platoon, opts, layer)
-                if newTarget then
-                    currentTarget = newTarget
-                else
-                    currentTarget = nil
-                    WaitForTargets(brain, RecheckDelay)
-                end
+                opts._repathing = true
+                SafeWait(1)
             else
                 currentTarget = nil
+                opts._repathing = nil
                 SafeWait(RecheckDelay)
             end
         end
