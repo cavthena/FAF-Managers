@@ -2421,6 +2421,10 @@ function FactoryControl:Tick()
         if (not unit) or unit:IsDead() or unit:GetAIBrain() ~= brain then
             if state.leased and state.leaseId then
                 local req = self.requests[state.leaseId]
+                -- Keep req.granted in sync immediately
+                if req and req.granted then
+                    req.granted[entId] = nil
+                end
                 if req and req.onRevoke then
                     pcall(req.onRevoke, { [entId] = unit }, state.leaseId, 'lost')
                 end
@@ -2485,9 +2489,16 @@ function FactoryControl:ServiceRequest(req)
             end
 
             if owner then
+                -- IMPORTANT: keep allocator state consistent.
+                -- If a factory is marked as owned by `owner`, ensure `owner.granted` also contains it.
+                owner.granted = owner.granted or {}
+                owner.granted[entId] = fac
+
+                -- Also ensure the currently serviced request sees its own grants (redundant but harmless)
                 if owner == req then
                     req.granted[entId] = fac
                 end
+
                 state.leased = true
                 state.leaseId = owner.id
             elseif not state.leased then
