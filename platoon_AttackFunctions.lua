@@ -1571,7 +1571,8 @@ local function MoveAlongPath(platoon, path, formation, aggressiveFinal)
     -- Make sure we never issue move orders outside the playable area
     path = ClampPathToPlayableArea(path, PlayableIngressBuffer)
 
-    if formation ~= 'NoFormation' then
+    local useFormation = formation and formation ~= 'NoFormation'
+    if useFormation then
         platoon:SetPlatoonFormationOverride(formation)
     else
         platoon:SetPlatoonFormationOverride('NoFormation')
@@ -1579,13 +1580,34 @@ local function MoveAlongPath(platoon, path, formation, aggressiveFinal)
 
     IssueClearCommands(units)
 
+    local minPointSpacingSq = 20 * 20
+    local formRefreshDist = 90
+    local lastIssued = nil
+    local distSinceForm = 0
     local count = table_getn(path)
     for index, waypoint in ipairs(path) do
-        local isFinal = aggressiveFinal and (index == count)
-        if isFinal then
-            IssueAggressiveMove(units, waypoint)
-        else
-            IssueMove(units, waypoint)
+        if not (lastIssued and DistanceSq(lastIssued, waypoint) < minPointSpacingSq) then
+            if lastIssued then
+                distSinceForm = distSinceForm + Distance(lastIssued, waypoint)
+            end
+
+            local isFinal = index == count
+            if useFormation then
+                if isFinal or distSinceForm >= formRefreshDist then
+                    IssueFormMove(units, waypoint, formation, 0)
+                    distSinceForm = 0
+                else
+                    IssueMove(units, waypoint)
+                end
+            else
+                if aggressiveFinal and isFinal then
+                    IssueAggressiveMove(units, waypoint)
+                else
+                    IssueMove(units, waypoint)
+                end
+            end
+
+            lastIssued = waypoint
         end
     end
 end
