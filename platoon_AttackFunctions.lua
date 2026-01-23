@@ -1584,10 +1584,8 @@ local function MoveAlongPath(platoon, path, formation, aggressiveFinal)
         local isFinal = aggressiveFinal and (index == count)
         if isFinal then
             IssueAggressiveMove(units, waypoint)
-        elseif formation == 'NoFormation' then
-            IssueMove(units, waypoint)
         else
-            IssueFormMove(units, waypoint, formation, 0)
+            IssueMove(units, waypoint)
         end
     end
 end
