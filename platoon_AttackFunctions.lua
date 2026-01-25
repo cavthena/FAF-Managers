@@ -1581,24 +1581,13 @@ local function MoveAlongPath(platoon, path, formation, aggressiveFinal)
     IssueClearCommands(units)
 
     local minPointSpacingSq = 20 * 20
-    local formRefreshDist = 90
     local lastIssued = nil
-    local distSinceForm = 0
     local count = table_getn(path)
     for index, waypoint in ipairs(path) do
         if not (lastIssued and DistanceSq(lastIssued, waypoint) < minPointSpacingSq) then
-            if lastIssued then
-                distSinceForm = distSinceForm + Distance(lastIssued, waypoint)
-            end
-
             local isFinal = index == count
             if useFormation then
-                if isFinal or distSinceForm >= formRefreshDist then
-                    IssueFormMove(units, waypoint, formation, 0)
-                    distSinceForm = 0
-                else
-                    IssueMove(units, waypoint)
-                end
+                IssueFormMove(units, waypoint, formation, 0)
             else
                 if aggressiveFinal and isFinal then
                     IssueAggressiveMove(units, waypoint)
