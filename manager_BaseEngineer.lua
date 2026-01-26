@@ -62,6 +62,8 @@ Public API
             -- Accepts Start.tasks fields (weights/exp) to tweak severity or experimental config at runtime
         baseHandle:GetStructureSnapshot()
         baseHandle:AddBuildGroup(structGroupName)
+        baseHandle:RemoveBuildGroup(structGroupName)
+        baseHandle:ReplaceBuildGroup(oldGroupName, newGroupName)
         baseHandle:GetEngineerHandle()
         baseHandle:Stop()
 
@@ -1045,6 +1047,11 @@ function M:_StructKey(bp, pos)
     return string.format('%s@%.1f,%.1f,%.1f', bp, pos[1], pos[2] or 0, pos[3])
 end
 
+function M:_StructPosKey(pos)
+    if not (pos and pos[1] and pos[3]) then return nil end
+    return string.format('%.1f,%.1f,%.1f', pos[1], pos[2] or 0, pos[3])
+end
+
 local function _TaskPosition(task)
     if not task then return nil end
     local pos = task.pos or task.position
@@ -1211,6 +1218,95 @@ function M:_AbsorbStructGroup(gname)
     return slotsAdded
 end
 
+function M:_CollectStructGroupSlots(gname)
+    if not gname then return {} end
+    local slots, isLive = self:_GetGroupUnitsOrSpec(gname)
+    local collected = {}
+
+    local function addSlot(bpTarget, pos, facing)
+        if not (bpTarget and pos and pos[1] and pos[3]) then return end
+        local target = string.lower(bpTarget)
+        local key = self:_StructKey(target, pos)
+        local posKey = self:_StructPosKey(pos)
+        if key then
+            table.insert(collected, {
+                bpTarget = target,
+                bpRoot   = _ChainRoot(target) or target,
+                pos      = pos,
+                facing   = facing or 0,
+                key      = key,
+                posKey   = posKey,
+            })
+        end
+    end
+
+    if isLive then
+        for i = 1, table.getn(slots) do
+            local u = slots[i]
+            if _unitIsStructure(u) then
+                addSlot(_bpIdFromUnit(u), _posOf(u), _headingOf(u))
+            end
+        end
+    else
+        for _, spec in pairs(slots or {}) do
+            addSlot(_SpecBlueprintId(spec), _SpecPosition(spec), _SpecFacing(spec))
+        end
+    end
+
+    return collected
+end
+
+function M:_CollectStructSlotsForGroups(groups)
+    local slots = {}
+    local keySet = {}
+    local posSet = {}
+
+    for _, gname in ipairs(groups or {}) do
+        for _, slot in ipairs(self:_CollectStructGroupSlots(gname)) do
+            if slot.key and not keySet[slot.key] then
+                table.insert(slots, {
+                    bpTarget = slot.bpTarget,
+                    bpRoot   = slot.bpRoot,
+                    pos      = slot.pos,
+                    facing   = slot.facing,
+                })
+                keySet[slot.key] = true
+            end
+            if slot.posKey then
+                posSet[slot.posKey] = true
+            end
+        end
+    end
+
+    return slots, keySet, posSet
+end
+
+function M:_GetLiveEngineers()
+    local engineers = {}
+    for _, tier in pairs(self.tracked or {}) do
+        for _, unit in pairs(tier or {}) do
+            if unit and (not unit.Dead) and unit.GetAIBrain and unit:GetAIBrain() == self.brain then
+                table.insert(engineers, unit)
+            end
+        end
+    end
+    return engineers
+end
+
+function M:_IssueReclaimTargets(targets)
+    if table.getn(targets or {}) == 0 then return 0 end
+    local engineers = self:_GetLiveEngineers()
+    if table.getn(engineers) == 0 then return 0 end
+    local issued = 0
+    for _, target in ipairs(targets) do
+        if target and not target.Dead then
+            IssueReclaim(engineers, target)
+            issued = issued + 1
+        end
+    end
+    return issued
+end
+
 function M:_InitStructTemplate()
     self.struct = { slots = {} }
     self.structKeys = {}
@@ -1240,6 +1336,100 @@ function M:AddBuildGroup(gname)
         self:_SyncStructureDemand()
     end
     return added
+end
+
+function M:RemoveBuildGroup(gname)
+    if not gname then return 0 end
+    self.params.structGroups = self.params.structGroups or {}
+
+    local updated = {}
+    local removed = false
+    for _, name in ipairs(self.params.structGroups) do
+        if name ~= gname then
+            table.insert(updated, name)
+        else
+            removed = true
+        end
+    end
+    if not removed then return 0 end
+
+    local removedSlots = self:_CollectStructGroupSlots(gname)
+    self.params.structGroups = updated
+
+    local newSlots, newKeySet, newPosSet = self:_CollectStructSlotsForGroups(updated)
+
+    local reclaimTargets = {}
+    local removedCount = 0
+    for _, slot in ipairs(removedSlots) do
+        if slot.key and not newKeySet[slot.key] then
+            self:_ConsumeBuildTaskByKey(slot.key)
+            removedCount = removedCount + 1
+        end
+        if slot.posKey and not newPosSet[slot.posKey] then
+            local present = _FindStructureForSlot(self.brain, slot)
+            if present then
+                table.insert(reclaimTargets, present)
+            end
+        end
+    end
+
+    self.struct = { slots = newSlots }
+    self.structKeys = newKeySet
+
+    self:_IssueReclaimTargets(reclaimTargets)
+    self:_SyncStructureDemand()
+    return removedCount
+end
+
+function M:ReplaceBuildGroup(oldGroup, newGroup)
+    if not (oldGroup and newGroup) then return 0 end
+    self.params.structGroups = self.params.structGroups or {}
+
+    local updated = {}
+    local removed = false
+    local seenNew = false
+    for _, name in ipairs(self.params.structGroups) do
+        if name == oldGroup then
+            removed = true
+        else
+            if name == newGroup then
+                seenNew = true
+            end
+            table.insert(updated, name)
+        end
+    end
+    if not seenNew then
+        table.insert(updated, newGroup)
+    end
+    if not removed and seenNew then
+        return 0
+    end
+
+    local removedSlots = self:_CollectStructGroupSlots(oldGroup)
+    self.params.structGroups = updated
+
+    local newSlots, newKeySet, newPosSet = self:_CollectStructSlotsForGroups(updated)
+    local reclaimTargets = {}
+    local removedCount = 0
+    for _, slot in ipairs(removedSlots) do
+        if slot.key and not newKeySet[slot.key] then
+            self:_ConsumeBuildTaskByKey(slot.key)
+            removedCount = removedCount + 1
+        end
+        if slot.posKey and not newPosSet[slot.posKey] then
+            local present = _FindStructureForSlot(self.brain, slot)
+            if present then
+                table.insert(reclaimTargets, present)
+            end
+        end
+    end
+
+    self.struct = { slots = newSlots }
+    self.structKeys = newKeySet
+
+    self:_IssueReclaimTargets(reclaimTargets)
+    self:_SyncStructureDemand()
+    return removedCount
 end
 
 function M:_SyncStructureDemand()
@@ -2862,6 +3052,57 @@ function Base:AddBuildGroup(groupName)
 
     if self.engineers and self.engineers.AddBuildGroup then
         return self.engineers:AddBuildGroup(groupName)
+    end
+    return 0
+end
+
+function Base:RemoveBuildGroup(groupName)
+    if not groupName then return 0 end
+    if self.engineers and self.engineers.RemoveBuildGroup then
+        return self.engineers:RemoveBuildGroup(groupName)
+    end
+    self.params.structGroups = self.params.structGroups or {}
+    local updated = {}
+    local removed = false
+    for _, name in ipairs(self.params.structGroups) do
+        if name ~= groupName then
+            table.insert(updated, name)
+        else
+            removed = true
+        end
+    end
+    if removed then
+        self.params.structGroups = updated
+        return 1
+    end
+    return 0
+end
+
+function Base:ReplaceBuildGroup(oldGroup, newGroup)
+    if not (oldGroup and newGroup) then return 0 end
+    if self.engineers and self.engineers.ReplaceBuildGroup then
+        return self.engineers:ReplaceBuildGroup(oldGroup, newGroup)
+    end
+    self.params.structGroups = self.params.structGroups or {}
+    local updated = {}
+    local removed = false
+    local seenNew = false
+    for _, name in ipairs(self.params.structGroups) do
+        if name == oldGroup then
+            removed = true
+        else
+            if name == newGroup then
+                seenNew = true
+            end
+            table.insert(updated, name)
+        end
+    end
+    if not seenNew then
+        table.insert(updated, newGroup)
+    end
+    if removed or not seenNew then
+        self.params.structGroups = updated
+        return 1
     end
     return 0
 end

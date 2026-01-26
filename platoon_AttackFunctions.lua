@@ -71,6 +71,40 @@ Overview
         AttackFns.DefensePatrol(platoon, data)
     end
 
+    -- Area patrol ------------------------------------------------------------
+    function PatrolChain(platoon)
+        local data = {
+            Chain      = 'Patrol_Chain_1',
+            Continuous = false,
+            Formation  = 'GrowthFormation',
+        }
+        AttackFns.AreaPatrol(platoon, data)
+    end
+
+    -- Firebase ----------------------------------------------------------------
+    function BuildFirebases(platoon)
+        local data = {
+            Locations = {
+                { marker = 'Firebase_A', group = 'Firebase_A_Structs' },
+                { marker = 'Firebase_B', group = 'Firebase_B_Structs' },
+            },
+            WaitMarker  = 'Firebase_Wait',
+            SafeRadius  = 40,
+            Formation   = 'GrowthFormation',
+        }
+        AttackFns.Firebase(platoon, data)
+    end
+
+    -- Support base ------------------------------------------------------------
+    function ReinforceBase(platoon)
+        local data = {
+            BaseTags   = { 'UEF_Main', 'UEF_Forward' },
+            WaitMarker = 'Engineer_Wait',
+            Formation  = 'GrowthFormation',
+        }
+        AttackFns.Supportbase(platoon, data)
+    end
+
 Universal parameters
     All attack functions accept the arguments listed below through their
     `attackData` table.  Missing fields fall back to the stated defaults.
@@ -134,6 +168,26 @@ ScoutAttack specifics
         map positions with a 25% chance of being the hottest or coolest area on
         the threat map.
 
+AreaPatrol specifics
+        Patrols along a marker chain specified by `Chain`/`ChainName`. When
+        `Continuous` is true the platoon loops from the first marker to the
+        last and back to the first. When false, the patrol bounces back and
+        forth from the last marker to the first.
+
+Firebase specifics
+        Engineer-only behavior that visits a list of location markers and
+        associated structure groups. If the location is safe (no enemy units
+        within `SafeRadius`), the platoon builds any missing structures from
+        the group before proceeding to the next location. Locations with all
+        structures already built are skipped. If no locations are available,
+        the platoon waits at `WaitMarker`.
+
+Supportbase specifics
+        Engineer-only behavior that assigns the platoon to the first base tag
+        without factories and without engineers, using
+        `manager_BaseEngineer.AssignEngineerUnit`. If every base has factories
+        and engineers, the platoon waits at `WaitMarker`.
+
 HuntAttack specifics
         Accepts `Blueprint`, `Blueprints`, `TargetBP`, or `TargetBlueprints`
         containing a single id or list of blueprint ids to pursue.  Category
@@ -158,6 +212,44 @@ DefensePatrol specifics
 local ScenarioFramework = import('/lua/ScenarioFramework.lua')
 local ScenarioUtils     = import('/lua/sim/ScenarioUtilities.lua')
 local NavUtils          = import('/lua/sim/NavUtils.lua')
+
+local function ResolveBaseManagerModule()
+    local ok, info = pcall(debug.getinfo, 1, 'S')
+    if ok and info and info.source then
+        local src = info.source
+        if type(src) == 'string' and string.sub(src, 1, 1) == '@' then
+            local dir = string.match(src, '^@(.*/)[^/]*$')
+            if dir then
+                local path = dir .. 'manager_BaseEngineer.lua'
+                local okImport, mod = pcall(import, path)
+                if okImport and mod then
+                    return mod
+                end
+            end
+        end
+    end
+
+    if ScenarioInfo and ScenarioInfo.MapPath then
+        local mp = ScenarioInfo.MapPath
+        if type(mp) == 'string' then
+            local dir = string.match(mp, '^(.-)/[^/]*$') or mp
+            if dir then
+                if string.sub(dir, 1, 1) ~= '/' then
+                    dir = '/' .. dir
+                end
+                local path = dir .. '/manager_BaseEngineer.lua'
+                local okImport, mod = pcall(import, path)
+                if okImport and mod then
+                    return mod
+                end
+            end
+        end
+    end
+
+    return import('/maps/faf_coop_U01.v0001/manager_BaseEngineer.lua')
+end
+
+local BaseManager = ResolveBaseManagerModule()
 local GetTerrainHeight  = GetTerrainHeight
 local GetSurfaceHeight  = GetSurfaceHeight
 local table_getn    = table.getn
@@ -214,6 +306,8 @@ local CorridorMaxShiftPerPass  = 6
 local CorridorPasses           = 2
 local CorridorDirections       = 8
 local CorridorSimplifyAngle    = 6
+local FirebaseSafeRadius       = 40
+local FirebaseStructureRadius  = 4
 
 local ClampPathToPlayableArea
 
@@ -2035,6 +2129,74 @@ local function NormalizeCategoryList(value)
     return list
 end
 
+local function SpecPosition(spec)
+    if not spec then return nil end
+    if spec.GetPosition then
+        return spec:GetPosition()
+    end
+    return spec.Position or spec.position or spec.Pos or spec.pos
+end
+
+local function SpecFacing(spec)
+    if not spec then return 0 end
+    if spec.GetOrientation then
+        local o = spec:GetOrientation() or {}
+        return o[1] or 0
+    end
+    local o = spec.Orientation or spec.orientation or {}
+    return o[1] or 0
+end
+
+local function SpecBlueprintId(spec)
+    if not spec then return nil end
+    if spec.BlueprintID then
+        return string.lower(spec.BlueprintID)
+    end
+    if spec.GetBlueprint then
+        local bp = spec:GetBlueprint()
+        if bp and bp.BlueprintId then
+            return string.lower(bp.BlueprintId)
+        end
+    end
+    local id = spec.type or spec.bp or spec.bpId or spec.BlueprintId or spec.blueprintId or spec.UnitId
+    if type(id) == 'string' then
+        return string.lower(id)
+    end
+    return nil
+end
+
+local function ArmyNameFromBrain(brain)
+    if not brain then return nil end
+    local idx = brain.GetArmyIndex and brain:GetArmyIndex()
+    if not idx then return nil end
+    if ArmyBrains and ArmyBrains[idx] and ArmyBrains[idx].Name then
+        return ArmyBrains[idx].Name
+    end
+    return ('ARMY_' .. tostring(idx))
+end
+
+local function GetGroupSpecs(brain, groupName)
+    if not groupName then return {} end
+    local armyName = ArmyNameFromBrain(brain)
+    if armyName and ScenarioUtils.AssembleArmyGroup then
+        local ok, spec = pcall(function() return ScenarioUtils.AssembleArmyGroup(armyName, groupName) end)
+        if ok and type(spec) == 'table' and next(spec) then
+            return spec
+        end
+    end
+
+    if ScenarioInfo and ScenarioInfo.Groups and ScenarioInfo.Groups[groupName] and ScenarioInfo.Groups[groupName].Units then
+        return ScenarioInfo.Groups[groupName].Units
+    end
+
+    local ok, units = pcall(function() return ScenarioUtils.GetUnitGroup(groupName) end)
+    if ok and type(units) == 'table' then
+        return units
+    end
+
+    return {}
+end
+
 local function UnitBlueprintId(unit)
     if not unit then return nil end
     if unit.BlueprintID then
@@ -2106,6 +2268,173 @@ local function ResolveMarkerPosition(marker)
         end
     end
     return nil
+end
+
+local function ResolveChainPositions(chainName)
+    if not chainName then
+        return {}
+    end
+    local ok, chain = pcall(ScenarioUtils.ChainToPositions, chainName)
+    if not ok or type(chain) ~= 'table' then
+        return {}
+    end
+    local points = {}
+    for _, pos in ipairs(chain) do
+        if pos and pos[1] and pos[3] then
+            table_insert(points, { pos[1], pos[2] or GetSurfaceHeight(pos[1], pos[3]), pos[3] })
+        end
+    end
+    return points
+end
+
+local function NormalizePatrolPoints(points, layer)
+    local out = {}
+    for _, pos in ipairs(points or {}) do
+        if pos and pos[1] and pos[3] then
+            local y = AmphibiousSurfaceHeight(layer, pos[1], pos[3])
+            table_insert(out, { pos[1], y, pos[3] })
+        end
+    end
+    return out
+end
+
+local function BuildPingPongRoute(points)
+    local out = {}
+    local count = table_getn(points)
+    for i = 1, count do
+        table_insert(out, points[i])
+    end
+    for i = count - 1, 2, -1 do
+        table_insert(out, points[i])
+    end
+    return out
+end
+
+local function FirebaseLocationsFromData(data)
+    local locations = {}
+    if not data then
+        return locations
+    end
+
+    if type(data.Locations) == 'table' then
+        for _, entry in ipairs(data.Locations) do
+            if type(entry) == 'table' then
+                local marker = entry.marker or entry.Marker or entry.location or entry.Location or entry[1]
+                local group = entry.group or entry.Group or entry.structGroup or entry.StructGroup or entry[2]
+                if marker or group then
+                    table_insert(locations, { marker = marker, group = group })
+                end
+            end
+        end
+    elseif type(data.Markers) == 'table' then
+        local groups = data.Groups or data.StructureGroups or data.GroupNames
+        for i, marker in ipairs(data.Markers) do
+            table_insert(locations, { marker = marker, group = groups and groups[i] or nil })
+        end
+    end
+
+    return locations
+end
+
+local function FirebaseLocationSafe(brain, pos, safeRadius, opts)
+    local enemies = BrainEnemies(brain, opts and opts.TargetArmy)
+    local units = AreaUnits(brain, enemies, pos, safeRadius, categories.ALLUNITS, opts and opts.IntelOnly)
+    return table_getn(units) == 0
+end
+
+local function FirebaseMissingStructures(brain, groupName, radius)
+    local missing = {}
+    local specs = GetGroupSpecs(brain, groupName)
+    for _, spec in pairs(specs or {}) do
+        local bp = SpecBlueprintId(spec)
+        local pos = SpecPosition(spec)
+        local facing = SpecFacing(spec)
+        if bp and pos and pos[1] and pos[3] then
+            local found = false
+            local units = brain:GetUnitsAroundPoint(categories.STRUCTURE, pos, radius or FirebaseStructureRadius, 'Ally') or {}
+            for _, unit in ipairs(units) do
+                if unit and not unit.Dead and UnitBlueprintId(unit) == bp then
+                    found = true
+                    break
+                end
+            end
+            if not found then
+                table_insert(missing, { bp = bp, pos = pos, facing = facing })
+            end
+        end
+    end
+    return missing
+end
+
+local function IssueFirebaseBuilds(platoon, builds)
+    local units = platoon:GetPlatoonUnits() or {}
+    if table_getn(units) == 0 then
+        return
+    end
+    IssueClearCommands(units)
+    for _, spec in ipairs(builds or {}) do
+        if spec.bp and spec.pos then
+            IssueBuildMobile(units, spec.pos, spec.bp, spec.facing or 0)
+        end
+    end
+end
+
+local function FirebaseBuildsComplete(brain, builds, radius)
+    for _, spec in ipairs(builds or {}) do
+        local pos = spec.pos
+        local bp = spec.bp
+        if pos and bp then
+            local found = false
+            local units = brain:GetUnitsAroundPoint(categories.STRUCTURE, pos, radius or FirebaseStructureRadius, 'Ally') or {}
+            for _, unit in ipairs(units) do
+                if unit and not unit.Dead and UnitBlueprintId(unit) == bp then
+                    found = true
+                    break
+                end
+            end
+            if not found then
+                return false
+            end
+        end
+    end
+    return true
+end
+
+local function CountFactories(base)
+    if not base or not base.GetFactoryControl then
+        return 0
+    end
+    local control = base:GetFactoryControl()
+    if not (control and control.factoryState) then
+        return 0
+    end
+    local count = 0
+    for _, state in pairs(control.factoryState) do
+        local unit = state and state.unit
+        if unit and not unit.Dead then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+local function CountEngineers(base)
+    if not base or not base.GetEngineerHandle then
+        return 0
+    end
+    local handle = base:GetEngineerHandle()
+    if not (handle and handle.tracked) then
+        return 0
+    end
+    local count = 0
+    for _, set in pairs(handle.tracked) do
+        for _, unit in pairs(set or {}) do
+            if unit and not unit.Dead then
+                count = count + 1
+            end
+        end
+    end
+    return count
 end
 
 local function IdleAtMarker(platoon, markerPos, layer, formation)
@@ -2418,6 +2747,157 @@ function ScoutAttack(platoon, data)
     end
 end
 
+function AreaPatrol(platoon, data)
+    local opts = CopyOptions(data)
+    local layer = DetermineLayer(platoon, opts.Amphibious)
+    if not layer then return end
+
+    local chainName = data and (data.Chain or data.ChainName or data.PatrolChain or data.MarkerChain)
+    local points = ResolveChainPositions(chainName)
+
+    if data and type(data.Markers) == 'table' then
+        for _, marker in ipairs(data.Markers) do
+            local pos = ResolveMarkerPosition(marker)
+            if pos then
+                table_insert(points, pos)
+            end
+        end
+    end
+
+    points = NormalizePatrolPoints(points, layer)
+    if table_getn(points) < 2 then
+        return
+    end
+
+    local continuous = true
+    if data and data.Continuous ~= nil then
+        continuous = data.Continuous and true or false
+    end
+
+    local route = points
+    if not continuous then
+        route = BuildPingPongRoute(points)
+    end
+
+    IssuePatrolRoute(platoon, route, opts.Formation)
+
+    while PlatoonAlive(platoon) do
+        SafeWait(RecheckDelay)
+    end
+end
+
+function Firebase(platoon, data)
+    local opts = CopyOptions(data)
+    local brain = platoon:GetBrain()
+    if not brain then return end
+    local layer = DetermineLayer(platoon, opts.Amphibious)
+    local locations = FirebaseLocationsFromData(data)
+    local waitPos = ResolveMarkerPosition(data and (data.WaitMarker or data.Marker or data.IdleMarker))
+    local safeRadius = (data and (data.SafeRadius or data.SafeRange or data.Radius)) or FirebaseSafeRadius
+    local structureRadius = (data and (data.StructureRadius or data.BuildRadius)) or FirebaseStructureRadius
+
+    while PlatoonAlive(platoon) do
+        local acted = false
+        for _, loc in ipairs(locations) do
+            local pos = ResolveMarkerPosition(loc.marker) or loc.position
+            if pos and FirebaseLocationSafe(brain, pos, safeRadius, opts) then
+                local missing = FirebaseMissingStructures(brain, loc.group, structureRadius)
+                if table_getn(missing) > 0 then
+                    acted = true
+                    local path = FindSafePath(platoon, layer, pos, nil, opts)
+                    if path then
+                        MoveAlongPath(platoon, path, opts.Formation, true)
+                    else
+                        local units = platoon:GetPlatoonUnits() or {}
+                        if table_getn(units) > 0 then
+                            IssueMove(units, pos)
+                        end
+                    end
+
+                    IssueFirebaseBuilds(platoon, missing)
+
+                    while PlatoonAlive(platoon) do
+                        if FirebaseBuildsComplete(brain, missing, structureRadius) then
+                            break
+                        end
+                        SafeWait(5)
+                    end
+                end
+            end
+        end
+
+        if not acted then
+            if waitPos then
+                IdleAtMarker(platoon, waitPos, layer, opts.Formation)
+            end
+            SafeWait(RecheckDelay)
+        end
+    end
+end
+
+function Supportbase(platoon, data)
+    local opts = CopyOptions(data)
+    local brain = platoon:GetBrain()
+    if not brain then return end
+    local layer = DetermineLayer(platoon, opts.Amphibious)
+    local waitPos = ResolveMarkerPosition(data and (data.WaitMarker or data.Marker or data.IdleMarker))
+
+    local tags = {}
+    local rawTags = data and (data.BaseTags or data.BaseTag or data.Tags or data.Tag)
+    if type(rawTags) == 'table' then
+        tags = rawTags
+    elseif rawTags then
+        tags = { rawTags }
+    end
+
+    while PlatoonAlive(platoon) do
+        local targetBase = nil
+        for _, tag in ipairs(tags) do
+            local base = BaseManager and BaseManager.GetBase and BaseManager.GetBase(tag)
+            if base then
+                local factories = CountFactories(base)
+                local engineers = CountEngineers(base)
+                if factories == 0 and engineers == 0 then
+                    targetBase = base
+                    break
+                end
+            end
+        end
+
+        if targetBase then
+            local basePos = targetBase.basePos
+            if not basePos and targetBase.params and targetBase.params.baseMarker then
+                basePos = ResolveMarkerPosition(targetBase.params.baseMarker)
+            end
+
+            if basePos then
+                local path = FindSafePath(platoon, layer, basePos, nil, opts)
+                if path then
+                    MoveAlongPath(platoon, path, opts.Formation, true)
+                else
+                    local units = platoon:GetPlatoonUnits() or {}
+                    if table_getn(units) > 0 then
+                        IssueMove(units, basePos)
+                    end
+                end
+            end
+
+            if targetBase.AssignEngineerUnit then
+                targetBase:AssignEngineerUnit(platoon)
+            end
+            if brain and brain.PlatoonExists and brain:PlatoonExists(platoon) then
+                brain:DisbandPlatoon(platoon)
+            end
+            return
+        end
+
+        if waitPos then
+            IdleAtMarker(platoon, waitPos, layer, opts.Formation)
+        end
+        SafeWait(RecheckDelay)
+    end
+end
+
 function HuntAttack(platoon, data)
     local opts = CopyOptions(data)
     opts.Vulnerable = opts.Vulnerable and true or false
@@ -2540,6 +3020,9 @@ return {
     WaveAttack = WaveAttack,
     RaidAttack = RaidAttack,
     ScoutAttack = ScoutAttack,
+    AreaPatrol = AreaPatrol,
+    Firebase = Firebase,
+    Supportbase = Supportbase,
     HuntAttack = HuntAttack,
     DefensePatrol = DefensePatrol,
 }
