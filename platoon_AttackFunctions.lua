@@ -1770,16 +1770,20 @@ local function AttackTargetArea(platoon, target, opts)
     end
 
     local path = FindSafePath(platoon, layer, target.position, nil, opts)
+    local ingress = nil
     if startedOutside then
-        local ingress = NearestPlayablePointOnPath(startPos, path, area)
+        ingress = NearestPlayablePointOnPath(startPos, path, area)
         if ingress then
-            local ingressSegment = { CopyVector(ingress) }
-            local interiorPath = FindSafePath(platoon, layer, target.position, ingress, opts)
-            path = MergePathSegments({ ingressSegment, interiorPath })
+            -- Only move to the playable ingress first; we will re-path once inside
+            -- to avoid brief detours back outside the map edge.
+            path = { CopyVector(ingress) }
         end
     end
 
     local canPath = CanPathTo(platoon, layer, target.position)
+    if not canPath and ingress then
+        canPath = CanPathBetween(layer, ingress, target.position)
+    end
     if not canPath then
         if opts.Transport then
             if not TransportAndMove(platoon, target.position, opts) then

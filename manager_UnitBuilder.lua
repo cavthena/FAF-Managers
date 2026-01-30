@@ -278,7 +278,11 @@ local function scaledWanted(baseWanted, factor)
     for bp, cnt in pairs(baseWanted or {}) do
         local use = cnt or 0
         if factor ~= 1 then
-            use = math.max(0, math.floor(use * factor))
+            local scaled = math.max(0, math.floor(use * factor))
+            if factor > 1 and use > 0 and scaled == use then
+                scaled = use + 1
+            end
+            use = scaled
         end
         out[bp] = use
     end
