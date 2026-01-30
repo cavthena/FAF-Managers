@@ -95,8 +95,16 @@ local ScenarioUtils = import('/lua/sim/ScenarioUtilities.lua')
      return out
  end
 
+local function normalizeEscalationPercent(raw)
+    local pct = tonumber(raw) or 0
+    if pct > 0 and pct < 1 then
+        pct = pct * 100
+    end
+    return pct
+end
+
 local function escalationFactor(params, waveNo)
-    local pct   = math.max(0, params and params.escalationPercent or 0)
+    local pct   = math.max(0, normalizeEscalationPercent(params and params.escalationPercent))
     local every = math.floor(params and params.escalationFrequency or 0)
     if pct <= 0 or every <= 0 then return 1 end
 
