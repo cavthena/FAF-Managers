@@ -1695,30 +1695,6 @@ local function MoveAlongPath(platoon, path, formation, aggressiveFinal)
     end
 end
 
-local function WaitForPlayableIngress(platoon, area, timeout)
-    area = area or GetPlayableArea()
-    if not area then
-        return true
-    end
-
-    local elapsed = 0
-    while PlatoonAlive(platoon) do
-        SafeWait(1)
-        elapsed = elapsed + 1
-
-        local pos = GetPlatoonPosition(platoon)
-        if pos and PositionInPlayableArea(pos, area) then
-            return true
-        end
-
-        if timeout and elapsed >= timeout then
-            break
-        end
-    end
-
-    return false
-end
-
 local function TransportAndMove(platoon, destination, opts)
     local brain = platoon:GetBrain()
     if not brain then return false end
@@ -1774,9 +1750,22 @@ local function AttackTargetArea(platoon, target, opts)
     if startedOutside then
         ingress = NearestPlayablePointOnPath(startPos, path, area)
         if ingress then
-            -- Only move to the playable ingress first; we will re-path once inside
-            -- to avoid brief detours back outside the map edge.
-            path = { CopyVector(ingress) }
+            if not (path and table_getn(path) > 0) then
+                path = FindSafePath(platoon, layer, target.position, ingress, opts)
+            end
+
+            if not (path and table_getn(path) > 0) then
+                path = BuildPathSegment(layer, ingress, target.position)
+            end
+
+            if path and table_getn(path) > 0 then
+                local first = path[1]
+                if not (first and DistanceSq(first, ingress) < 1) then
+                    table_insert(path, 1, CopyVector(ingress))
+                end
+            else
+                path = { CopyVector(ingress) }
+            end
         end
     end
 
@@ -1806,29 +1795,6 @@ local function AttackTargetArea(platoon, target, opts)
     end
 
     MoveAlongPath(platoon, path, opts.Formation)
-
-    if startedOutside then
-        if not WaitForPlayableIngress(platoon, area, PlayableIngressTimeout * 2) then
-            return 'fail'
-        end
-
-        -- Once inside the playable area, clear any lingering commands and re-path entirely
-        -- from the current position to avoid re-exiting the map (common on northern ingress).
-        local ingressPos = GetPlatoonPosition(platoon)
-        if ingressPos then
-            local reroute = FindSafePath(platoon, layer, target.position, ingressPos, opts)
-            if not reroute then
-                reroute = BuildPathSegment(layer, ingressPos, target.position)
-            end
-
-            if reroute then
-                if bombardRange then
-                    reroute = ShortenPathForBombard(reroute, target.position, bombardRange)
-                end
-                MoveAlongPath(platoon, reroute, opts.Formation)
-            end
-        end
-    end
     
     local arrived = false
     local epsilon = 5
