@@ -595,32 +595,31 @@ local function NearestPlayablePointOnPath(startPos, path, area)
         return SurfacePoint(startPos)
     end
 
-    if not (path and table_getn(path) > 0) then
-        return ClampToPlayableArea(startPos, area, PlayableIngressBuffer)
-    end
+    local entryPoint = ClampToPlayableArea(startPos, area, PlayableIngressBuffer)
 
-    local previous = startPos
-    for index, waypoint in ipairs(path) do
-        if PositionInPlayableArea(waypoint, area) then
-            -- Remove any waypoints that are still outside the playable area so we
-            -- don't order the platoon to leave the map again after ingress.
-            for _ = 1, index - 1 do
+    if path and table_getn(path) > 0 then
+        -- Remove any waypoints that are still outside the playable area so we
+        -- don't order the platoon to leave the map again after ingress.
+        local firstInside = nil
+        for index, waypoint in ipairs(path) do
+            if PositionInPlayableArea(waypoint, area) then
+                firstInside = index
+                break
+            end
+        end
+
+        if firstInside then
+            for _ = 1, firstInside - 1 do
                 table_remove(path, 1)
             end
-            return SegmentPlayableIngress(previous, waypoint, area) or SurfacePoint(waypoint)
+        else
+            for i = table_getn(path), 1, -1 do
+                path[i] = nil
+            end
         end
-        previous = waypoint
     end
 
-    -- If no point on the path is inside, fall back to clamping the final
-    -- waypoint and clear the path so that we only order the platoon to move to
-    -- the entry point. The full path will be recalculated once the platoon is
-    -- inside the playable area.
-    local last = path[table_getn(path)]
-    for i = table_getn(path), 1, -1 do
-        path[i] = nil
-    end
-    return ClampToPlayableArea(last, area, PlayableIngressBuffer)
+    return entryPoint
 end
 
 local function BrainEnemies(brain, targetArmy)
@@ -1745,15 +1744,12 @@ local function AttackTargetArea(platoon, target, opts)
         end
     end
 
-    local path = FindSafePath(platoon, layer, target.position, nil, opts)
+    local path = nil
     local ingress = nil
     if startedOutside then
-        ingress = NearestPlayablePointOnPath(startPos, path, area)
+        ingress = NearestPlayablePointOnPath(startPos, nil, area)
         if ingress then
-            if not (path and table_getn(path) > 0) then
-                path = FindSafePath(platoon, layer, target.position, ingress, opts)
-            end
-
+            path = FindSafePath(platoon, layer, target.position, ingress, opts)
             if not (path and table_getn(path) > 0) then
                 path = BuildPathSegment(layer, ingress, target.position)
             end
@@ -1767,6 +1763,8 @@ local function AttackTargetArea(platoon, target, opts)
                 path = { CopyVector(ingress) }
             end
         end
+    else
+        path = FindSafePath(platoon, layer, target.position, nil, opts)
     end
 
     local canPath = CanPathTo(platoon, layer, target.position)
