@@ -263,22 +263,31 @@ end
 
 local function normalizeEscalationPercent(raw)
     local pct = tonumber(raw) or 0
-    if pct > 0 and pct < 1 then
-        pct = pct * 100
+    if pct <= 0 then
+        return 0
+    end
+    if pct > 1 then
+        pct = pct / 100
     end
     return pct
 end
 
-local function escalationFactor(params, waveNo)
-    local pct   = math.max(0, normalizeEscalationPercent(params and params.escalationPercent))
+local function getEscalationInfo(params, waveNo)
+    local inc   = normalizeEscalationPercent(params and params.escalationPercent)
     local every = math.floor(params and params.escalationFrequency or 0)
-    if pct <= 0 or every <= 0 then return 1 end
+    if inc <= 0 or every <= 0 then
+        return 1, 0
+    end
 
     local wave = math.max(1, waveNo or 1)
     local steps = math.floor((wave - 1) / every)
-    if steps <= 0 then return 1 end
+    local factor = 1 + (inc * steps)
+    return factor, steps
+end
 
-    return (1 + pct / 100) ^ steps
+local function escalationFactor(params, waveNo)
+    local factor = getEscalationInfo(params, waveNo)
+    return factor
 end
 
 local function scaledWanted(baseWanted, factor)
@@ -286,8 +295,10 @@ local function scaledWanted(baseWanted, factor)
     for bp, cnt in pairs(baseWanted or {}) do
         local use = cnt or 0
         if factor ~= 1 then
-            local scaled = math.max(0, math.floor(use * factor))
-            if factor > 1 and use > 0 and scaled == use then
+            local scaled = math.max(0, math.floor((use * factor) + 1e-6))
+            if factor >= 1 and scaled < use then
+                scaled = use
+            elseif factor > 1 and use > 0 and scaled == use then
                 scaled = use + 1
             end
             use = scaled
@@ -866,6 +877,23 @@ end
 
 function Builder:GetEscalationFactor(waveNo)
     return escalationFactor(self.params, waveNo)
+end
+
+function Builder:DebugEscalation()
+    if not (self.params and self.params.debug) or self._debugEscalationDone then
+        return
+    end
+    self._debugEscalationDone = true
+
+    for wave = 1, 16 do
+        local factor, steps = getEscalationInfo(self.params, wave)
+        local total = 0
+        local wanted = scaledWanted(self.baseWanted or {}, factor)
+        for _, cnt in pairs(wanted) do
+            total = total + (cnt or 0)
+        end
+        self:Log(string.format('EscalationDebug wave=%d steps=%d factor=%.2f totalWanted=%d', wave, steps, factor, total))
+    end
 end
 
 function Builder:GetWantedForWave(waveNo)
@@ -1750,6 +1778,7 @@ function Start(params)
     o.baseWanted, o.bpOrder = flattenCounts(params.composition, params.difficulty or 2)
     o.wanted = o:GetWantedForWave(1)
     o.platoonCallbacks = _NormalizeCallbacks(o.params.platoonCallbacks, 'OnHandoff', o.tag)
+    o:DebugEscalation()
     o:Start()
     return o
 end
