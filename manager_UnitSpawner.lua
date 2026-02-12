@@ -6,8 +6,7 @@
 --   • Hands the platoon to your attack function immediately (ForkAIThread)
 --   • Four modes:
 --       1) Wave: spawn → handoff → wait waveCooldown → next wave
---       2) Loss-gated: spawn → handoff → wait until the platoon has lost >= mode2LossThreshold → next wave,
---          and if (and only if) the current platoon has been wiped out, apply waveCooldown before spawning again.
+--       2) Loss-gated: spawn → handoff → wait until the platoon has lost >= mode2LossThreshold, then apply waveCooldown before spawning again.
 --       3) Limited waves: spawn → handoff → wait a shrinking waveCooldown → next wave, until mode3WaveCount is reached.
 --          Composition entries can specify the wave they join via a 4th field (wave start, 1-indexed).
 --       4) Batched window: spawn a fixed number of platoons (mode4PlatoonCount) evenly spaced over waveCooldown, then stop.
@@ -25,7 +24,7 @@
 --     },
 --     difficulty         = ScenarioInfo.Options.Difficulty or 2,  -- 1..3
 --     attackFn           = 'Platoon_BasicAttack',                 -- function or global function name
---     waveCooldown       = 15,                                    -- seconds; in mode 2 it is applied only after a wipe
+--     waveCooldown       = 15,                                    -- seconds; in mode 2 it starts once threshold is met
 --     mode               = 1,                                     -- 1: cooldown, 2: gate by losses, 3: finite waves, 4: batched waves
 --     mode2LossThreshold = 0.50,                                  -- fraction lost to trigger next wave
 --     mode3WaveCount     = 5,                                     -- number of waves for mode 3
@@ -453,13 +452,6 @@ end
      end
  end
  
- local function PlatoonIsDead(brain, platoon)
-     if not platoon then return true end
-     if not brain:PlatoonExists(platoon) then return true end
-     local units = platoon:GetPlatoonUnits() or {}
-     return countComplete(units) == 0
- end
- 
  function Spawner:GetMode3Cooldown(waveIndex, totalWaves)
      local base = math.max(0, self.params.waveCooldown or 0)
      local intervals = math.max(0, totalWaves - 1)
@@ -501,9 +493,7 @@ function Spawner:RunMode2()
         if self.stopped then break end
         self:WaitForLossGate(platoon, unitCount)
         if self.stopped then break end
-        if PlatoonIsDead(self.brain, platoon) then
-            WaitSeconds(math.max(0, self.params.waveCooldown or 0))
-        end
+        WaitSeconds(math.max(0, self.params.waveCooldown or 0))
     end
 end
 

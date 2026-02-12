@@ -306,6 +306,8 @@ local CorridorMaxShiftPerPass  = 6
 local CorridorPasses           = 2
 local CorridorDirections       = 8
 local CorridorSimplifyAngle    = 6
+local SegmentDirectMinDistance = 10
+local SegmentDirectMaxRatio    = 1.2
 local FirebaseSafeRadius       = 40
 local FirebaseStructureRadius  = 4
 
@@ -1173,6 +1175,29 @@ local function PathLength(path)
     return total
 end
 
+local function IsDirectPathSegment(layer, a, b)
+    if not (a and b) then
+        return false
+    end
+
+    local straight = Distance(a, b)
+    if straight <= SegmentDirectMinDistance then
+        return CanPathBetween(layer, a, b)
+    end
+
+    local path = BuildPathSegment(layer, a, b)
+    if not path then
+        return false
+    end
+
+    local navLength = PathLength(path)
+    if navLength <= 0 then
+        return false
+    end
+
+    return (navLength / straight) <= SegmentDirectMaxRatio
+end
+
 local function HeadingDegrees(a, b)
     if not (a and b) then
         return 0
@@ -1372,7 +1397,7 @@ local function OffsetCorner(prev, corner, next, layer)
         corner[3] - offsetZ,
     }
 
-    if CanPathBetween(layer, prev, adjusted) and CanPathBetween(layer, adjusted, next) then
+    if IsDirectPathSegment(layer, prev, adjusted) and IsDirectPathSegment(layer, adjusted, next) then
         return adjusted
     end
 
@@ -1443,7 +1468,7 @@ local function GetClearanceEstimate(layer, pos)
             local testX = x + dirX * distance
             local testZ = z + dirZ * distance
             local testPos = { testX, AmphibiousSurfaceHeight(layer, testX, testZ), testZ }
-            if not CanPathBetween(layer, pos, testPos) then
+            if not IsDirectPathSegment(layer, pos, testPos) then
                 blocked = distance
                 break
             end
@@ -1508,7 +1533,7 @@ local function ApplyCorridorCentering(path, layer, startPos, destination, opts)
                                 end
                             end
 
-                            if CanPathBetween(layer, prevPoint, candidate) and CanPathBetween(layer, candidate, nextPoint) then
+                            if IsDirectPathSegment(layer, prevPoint, candidate) and IsDirectPathSegment(layer, candidate, nextPoint) then
                                 path[i] = candidate
                                 accepted = true
                                 break
@@ -1535,7 +1560,7 @@ local function ApplyCorridorCentering(path, layer, startPos, destination, opts)
                 local abX, abZ = Normalize2D(b[1] - a[1], b[3] - a[3])
                 local bcX, bcZ = Normalize2D(c[1] - b[1], c[3] - b[3])
                 local dot = abX * bcX + abZ * bcZ
-                if dot >= cosThreshold and CanPathBetween(layer, a, c) then
+                if dot >= cosThreshold and IsDirectPathSegment(layer, a, c) then
                     -- skip b
                 else
                     table_insert(simplified, b)

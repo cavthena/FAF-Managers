@@ -918,6 +918,10 @@ function Builder:Start()
             end)
         else
             self.brain:ForkThread(function()
+                if (self.params.mode or 1) == 2 then
+                    self:WaitForMode2Gate(p)
+                end
+                if self.stopped then return end
                 WaitSeconds(math.max(0, self.params.waveCooldown or 0))
                 self:RunCleanup()
                 if not self.stopped then
