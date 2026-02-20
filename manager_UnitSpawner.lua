@@ -1,5 +1,6 @@
--- Created by Ruanuku/Cavthena
--- AI Unit Spawner (direct spawn, wave, loss-gated & wave-count modes)
+--================================================================================
+-- Unit Spawner Manager -- Created by Cavthena
+--================================================================================
 --
 -- What it does
 --   • Spawns a platoon at a given marker using a composition { {bp, {e,n,h}, [label], [waveStart]}, ... }
@@ -180,8 +181,8 @@ end
 local function resolveCallback(cb)
     if type(cb) == 'function' then
         return cb
-    elseif type(cb) == 'string' then
-        local ref = _G and _G[cb]
+    elseif type(cb) == 'string' and cb ~= '' then
+        local ref = _G and rawget(_G, cb)
         if type(ref) == 'function' then
             return ref
         end
@@ -381,8 +382,8 @@ function Spawner:HandOffToAttack(platoon)
      local function _AttackWrapper(p, fn)
         if type(fn) == 'function' then
             return fn(p, self.params.attackData)
-        elseif type(fn) == 'string' then
-            local ref = _G and _G[fn]
+        elseif type(fn) == 'string' and fn ~= '' then
+            local ref = _G and rawget(_G, fn)
             if type(ref) == 'function' then
                 return ref(p, self.params.attackData)
             else

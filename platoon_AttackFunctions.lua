@@ -1,6 +1,6 @@
 --[[
 ================================================================================
-Platoon Attack Functions (Lua 5.0, FAF safe)
+Platoon Attack Functions -- Created by Cavthena
 ================================================================================
 
 Overview
@@ -162,11 +162,10 @@ RaidAttack specifics
             shortest path.
 
 ScoutAttack specifics
-        Designed for AIR platoons.  Each unit receives a move target.  Upon
-        arriving, the unit either selects a new destination or has a 10% chance
-        to orbit the location for up to two minutes.  Destinations are random
-        map positions with a 25% chance of being the hottest or coolest area on
-        the threat map.
+        Designed for AIR platoons.  Each unit continuously receives move
+        targets and immediately selects a new destination after arriving.
+        Destinations are random map positions with a 25% chance of being the
+        hottest or coolest area on the threat map.
 
 AreaPatrol specifics
         Patrols along a marker chain specified by `Chain`/`ChainName`. When
@@ -269,15 +268,14 @@ local math_huge     = math.huge or 1e9
 local math_mod      = math.mod or math.fmod
 
 local RecheckDelay            = 60
+local ScoutRecheckDelay       = 1
 local TravelStuckSeconds      = 12
 local TravelProgressEpsilonSq = 25
 local WaveAreaRadius          = 50
 local RaidAreaRadius          = 25
 local AreaClearRadius         = 35
 local TransportStagingOffset  = 28
-local OrbitChance             = 0.10
 local HotColdChance           = 0.25
-local MaxScoutOrbitTime       = 120
 local FloodFillCell           = 32
 local FloodFillMaxRadius      = 512
 local ThreatSampleRing        = 48
@@ -2049,19 +2047,6 @@ local function AssignScoutOrder(unit, destination)
     IssueMove({ unit }, destination)
 end
 
-local function OrbitUnit(unit, center)
-    if not unit or unit.Dead then return end
-    local points = 6
-    local radius = 30
-    for i = 1, points do
-        local angle = (i / points) * 6.28318
-        local x = center[1] + math_cos(angle) * radius
-        local z = center[3] + math_sin(angle) * radius
-        local y = GetSurfaceHeight(x, z)
-        IssueMove({ unit }, { x, y, z })
-    end
-end
-
 local function OrbitWaypoints(center, count, radius)
     local list = {}
     if not center then
@@ -2473,7 +2458,10 @@ local function IssuePatrolRoute(platoon, points, formation)
     IssueClearCommands(units)
     platoon:SetPlatoonFormationOverride(formation or 'GrowthFormation')
 
-    for _, point in ipairs(points) do
+    IssueMove(units, points[1])
+
+    for i = 2, table_getn(points) do
+        local point = points[i]
         IssuePatrol(units, point)
     end
 
@@ -2699,41 +2687,28 @@ function ScoutAttack(platoon, data)
 
     local state = {}
     for _, unit in ipairs(units) do
-        state[unit.EntityId] = { destination = SelectScoutDestination(brain, opts), orbiting = false, orbitTime = 0 }
+        state[unit.EntityId] = { destination = SelectScoutDestination(brain, opts) }
         AssignScoutOrder(unit, state[unit.EntityId].destination)
     end
 
     while PlatoonAlive(platoon) do
-        SafeWait(RecheckDelay)
+        SafeWait(ScoutRecheckDelay)
         units = platoon:GetPlatoonUnits() or {}
         if table_getn(units) == 0 then break end
         for _, unit in ipairs(units) do
             if unit and not unit.Dead then
                 local info = state[unit.EntityId]
                 if not info then
-                    info = { destination = SelectScoutDestination(brain, opts), orbiting = false, orbitTime = 0 }
+                    info = { destination = SelectScoutDestination(brain, opts) }
                     state[unit.EntityId] = info
                     AssignScoutOrder(unit, info.destination)
                 end
-                if info.orbiting then
-                    info.orbitTime = info.orbitTime - RecheckDelay
-                    if info.orbitTime <= 0 then
-                        info.orbiting = false
-                        info.destination = SelectScoutDestination(brain, opts)
-                        AssignScoutOrder(unit, info.destination)
-                    end
-                end
+
                 local pos = unit:GetPosition()
                 local dest = info.destination
-                if dest and pos and DistanceSq(pos, dest) < 400 then
-                    if not info.orbiting and math_random() < OrbitChance then
-                        info.orbiting = true
-                        info.orbitTime = math_random(10, MaxScoutOrbitTime)
-                        OrbitUnit(unit, dest)
-                    elseif not info.orbiting then
-                        info.destination = SelectScoutDestination(brain, opts)
-                        AssignScoutOrder(unit, info.destination)
-                    end
+                if (not dest) or (dest and pos and DistanceSq(pos, dest) < 400) then
+                    info.destination = SelectScoutDestination(brain, opts)
+                    AssignScoutOrder(unit, info.destination)
                 end
             end
         end
