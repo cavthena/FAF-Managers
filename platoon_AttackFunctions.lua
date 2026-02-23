@@ -148,18 +148,18 @@ WaveAttack specifics
         Bombard (boolean, default = false)
             When true, the platoon halts at its longest weapon range and
             attacks from distance instead of pushing into direct fire.
-        RandomizeRoute (boolean, default = true)
-            Has a 25% chance to choose a wide flanking route instead of the
-            shortest path.
+        RandomizeRoute (boolean, default = false)
+            Chooses from multiple distinct valid corridors (including flank
+            routes) instead of always taking the shortest route.
 
 RaidAttack specifics
         Category (string, default = 'ECO')
             Requested structure category: 'ECO', 'BLD', 'INT', 'DEF', or 'SMT'.
             Areas are 25 units wide.  The priority chain is always
             Requested > ECO > BLD > INT > DEF.
-        RandomizeRoute (boolean, default = true)
-            Has a 25% chance to choose a wide flanking route instead of the
-            shortest path.
+        RandomizeRoute (boolean, default = false)
+            Chooses from multiple distinct valid corridors (including flank
+            routes) instead of always taking the shortest route.
 
 ScoutAttack specifics
         Designed for AIR platoons.  Each unit continuously receives move
@@ -291,11 +291,12 @@ local HuntOrbitRadius         = 32
 local DefaultPatrolDistance   = 80
 local DefaultInterceptDistance = 120
 local RouteClearanceOffset    = 6
-local RouteFlankChance        = 0.25
-local RouteAlternateAttempts  = 3
-local RouteAlternateAttempts  = 3
-local RouteDetourMin          = 48
-local RouteDetourMax          = 192
+local RouteAlternateAttempts   = 18
+local RouteMinHeadingSeparation = 30
+local RouteMinPathSeparation    = 80
+local RouteMinPathSeparationRatio = 0.25
+local RouteMaxLengthRatio       = 2.6
+local RouteMinFlankSideRatio    = 0.2
 local CorridorNearDistance     = 180
 local CorridorDesiredClearance = 14
 local CorridorProbeMax         = 40
@@ -1208,6 +1209,14 @@ local function HeadingDegrees(a, b)
     return math_atan2(dz, dx) * 180 / math_pi
 end
 
+local function NormalizeDegrees(deg)
+    deg = math_mod(deg, 360)
+    if deg < 0 then
+        deg = deg + 360
+    end
+    return deg
+end
+
 local function AngleDifferenceDegrees(a, b)
     local diff = math_abs(NormalizeDegrees(a) - NormalizeDegrees(b))
     if diff > 180 then
@@ -1229,29 +1238,6 @@ local function FinalApproachHeading(path, startPos, destination)
         return nil
     end
     return HeadingDegrees(prev, destination)
-end
-
-local function RandomDetourPoint(layer, startPos, destination)
-    local dx = destination[1] - startPos[1]
-    local dz = destination[3] - startPos[3]
-    local baseAngle = math_atan2(dz, dx)
-    local offset = (0.35 + math_random() * 0.45) * math_pi
-    if math_random() < 0.5 then
-        offset = -offset
-    end
-
-    local distance = Distance(startPos, destination)
-    local detourDist = math_min(math_max(distance * 0.4, RouteDetourMin), RouteDetourMax)
-    local angle = baseAngle + offset
-
-    local x = startPos[1] + math_cos(angle) * detourDist
-    local z = startPos[3] + math_sin(angle) * detourDist
-
-    local size = ScenarioInfo and (ScenarioInfo.size or ScenarioInfo.MapSize) or { 512, 512 }
-    x = math_min(math_max(x, 0), size[1])
-    z = math_min(math_max(z, 0), size[2])
-
-    return { x, AmphibiousSurfaceHeight(layer, x, z), z }
 end
 
 local function PathThreatScore(brain, layer, path)
@@ -1287,11 +1273,123 @@ local function MergePathSegments(segments)
     return merged
 end
 
-local function TryAlternatePath(platoon, layer, startPos, destination, opts)
-    if not (opts and opts.RandomizeRoute) or opts._repathing then
+local function PathMaxSeparation(pathA, pathB)
+    if not (pathA and pathB) then
+        return 0
+    end
+
+    local maxSeparation = 0
+    for _, pointA in ipairs(pathA) do
+        local nearest = math_huge
+        for _, pointB in ipairs(pathB) do
+            local d = Distance(pointA, pointB)
+            if d < nearest then
+                nearest = d
+            end
+        end
+        if nearest > maxSeparation then
+            maxSeparation = nearest
+        end
+    end
+
+    return maxSeparation
+end
+
+local function BuildRouteAnchor(layer, startPos, destination)
+    local dx = destination[1] - startPos[1]
+    local dz = destination[3] - startPos[3]
+    local length = math_sqrt(dx * dx + dz * dz)
+    if length < 0.001 then
         return nil
     end
-    if math_random() >= RouteFlankChance then
+    local forwardX = dx / length
+    local forwardZ = dz / length
+    local sideX = -forwardZ
+    local sideZ = forwardX
+
+    local progress = 0.3 + math_random() * 1.0
+    local sideSign = (math_random() < 0.5) and -1 or 1
+    local lateral = (0.35 + math_random() * 0.95) * length
+
+    local x = startPos[1] + forwardX * (length * progress) + sideX * lateral * sideSign
+    local z = startPos[3] + forwardZ * (length * progress) + sideZ * lateral * sideSign
+
+    local size = ScenarioInfo and (ScenarioInfo.size or ScenarioInfo.MapSize) or { 512, 512 }
+    x = math_min(math_max(x, 0), size[1])
+    z = math_min(math_max(z, 0), size[2])
+
+    return { x, AmphibiousSurfaceHeight(layer, x, z), z }
+end
+
+local function BuildDestinationFlankAnchor(layer, startPos, destination)
+    local dx = startPos[1] - destination[1]
+    local dz = startPos[3] - destination[3]
+    local length = math_sqrt(dx * dx + dz * dz)
+    if length < 0.001 then
+        return nil
+    end
+
+    local backAngle = math_atan2(dz, dx)
+    local sideOffset = (70 + math_random() * 95) * math_pi / 180
+    if math_random() < 0.5 then
+        sideOffset = -sideOffset
+    end
+
+    local radius = length * (0.4 + math_random() * 0.8)
+    local angle = backAngle + sideOffset
+    local x = destination[1] + math_cos(angle) * radius
+    local z = destination[3] + math_sin(angle) * radius
+
+    local size = ScenarioInfo and (ScenarioInfo.size or ScenarioInfo.MapSize) or { 512, 512 }
+    x = math_min(math_max(x, 0), size[1])
+    z = math_min(math_max(z, 0), size[2])
+
+    return { x, AmphibiousSurfaceHeight(layer, x, z), z }
+end
+
+local function SignedSideRatio(startPos, destination, point)
+    if not (startPos and destination and point) then
+        return 0
+    end
+
+    local vx = destination[1] - startPos[1]
+    local vz = destination[3] - startPos[3]
+    local length = math_sqrt(vx * vx + vz * vz)
+    if length < 0.001 then
+        return 0
+    end
+
+    local px = point[1] - startPos[1]
+    local pz = point[3] - startPos[3]
+    local cross = (vx * pz) - (vz * px)
+    return cross / (length * length)
+end
+
+local function IsRouteDistinct(candidate, existingRoutes, baselineLength)
+    local candidateLength = PathLength(candidate)
+    if candidateLength <= 0 then
+        return false
+    end
+    if baselineLength > 0 and (candidateLength / baselineLength) > RouteMaxLengthRatio then
+        return false
+    end
+
+    local minSeparation = math_max(RouteMinPathSeparation, baselineLength * RouteMinPathSeparationRatio)
+    local candidateHeading = FinalApproachHeading(candidate)
+    for _, route in ipairs(existingRoutes) do
+        local routeHeading = FinalApproachHeading(route)
+        local headingDiff = (candidateHeading and routeHeading) and AngleDifferenceDegrees(candidateHeading, routeHeading) or 0
+        local pathGap = math_max(PathMaxSeparation(candidate, route), PathMaxSeparation(route, candidate))
+        if headingDiff < RouteMinHeadingSeparation and pathGap < minSeparation then
+            return false
+        end
+    end
+
+    return true
+end
+
+local function TryAlternatePath(platoon, layer, startPos, destination, opts)
+    if not (opts and opts.RandomizeRoute) or opts._repathing then
         return nil
     end
 
@@ -1302,69 +1400,71 @@ local function TryAlternatePath(platoon, layer, startPos, destination, opts)
     end
 
     local baselineLength = PathLength(baseline)
-    local baselineHeading = FinalApproachHeading(baseline, startPos, destination)
-    if baselineLength <= 0 or not baselineHeading then
+    if baselineLength <= 0 then
         return nil
     end
 
-    local baseAngle = math_atan2(startPos[3] - destination[3], startPos[1] - destination[1])
-    local bestPath = nil
-    local bestThreat = math_huge
-    local bestAngleDiff = 0
-    local bestLengthRatio = 0
+    local baselineHeading = FinalApproachHeading(baseline, startPos, destination)
+    local routes = { baseline }
+    local candidates = {}
 
     for _ = 1, RouteAlternateAttempts do
-        local offsetDeg = 90 + math_random() * 50
-        local offsetRad = offsetDeg * math_pi / 180
+        local anchor
         if math_random() < 0.5 then
-            offsetRad = -offsetRad
+            anchor = BuildRouteAnchor(layer, startPos, destination)
+        else
+            anchor = BuildDestinationFlankAnchor(layer, startPos, destination)
         end
 
-        local radius = 80 + math_random() * 120
-        local angle = baseAngle + offsetRad
-        local x = destination[1] + math_cos(angle) * radius
-        local z = destination[3] + math_sin(angle) * radius
-
-        local size = ScenarioInfo and (ScenarioInfo.size or ScenarioInfo.MapSize) or { 512, 512 }
-        x = math_min(math_max(x, 0), size[1])
-        z = math_min(math_max(z, 0), size[2])
-
-        local approach = { x, AmphibiousSurfaceHeight(layer, x, z), z }
-        if approach and CanPathBetween(layer, startPos, approach) and CanPathBetween(layer, approach, destination) then
-            local first = BuildPathSegment(layer, startPos, approach)
-            local second = BuildPathSegment(layer, approach, destination)
+        if anchor and CanPathBetween(layer, startPos, anchor) and CanPathBetween(layer, anchor, destination) then
+            local first = BuildPathSegment(layer, startPos, anchor)
+            local second = BuildPathSegment(layer, anchor, destination)
             if first and second then
                 local candidate = MergePathSegments({ first, second })
-                local candidateHeading = FinalApproachHeading(candidate, startPos, destination)
-                local angleDiff = candidateHeading and AngleDifferenceDegrees(candidateHeading, baselineHeading) or 0
-                if angleDiff >= 60 then
+                if IsRouteDistinct(candidate, routes, baselineLength) then
+                    table_insert(routes, candidate)
                     local candidateLength = PathLength(candidate)
-                    local lengthRatio = candidateLength / baselineLength
+                    local lengthRatio = (baselineLength > 0) and (candidateLength / baselineLength) or 1
+                    local candidateHeading = FinalApproachHeading(candidate, startPos, destination)
+                    local headingDiff = (candidateHeading and baselineHeading) and AngleDifferenceDegrees(candidateHeading, baselineHeading) or 0
+                    local sideRatio = math_abs(SignedSideRatio(startPos, destination, anchor))
                     local threat = opts.AvoidDef and PathThreatScore(brain, layer, candidate) or 0
-                    local better = false
-                    if not bestPath then
-                        better = true
-                    elseif angleDiff > bestAngleDiff + 0.5 then
-                        better = true
-                    elseif math_abs(angleDiff - bestAngleDiff) <= 0.5 then
-                        if (lengthRatio >= 1.10 and bestLengthRatio < 1.10) or lengthRatio > bestLengthRatio + 0.01 then
-                            better = true
-                        elseif math_abs(lengthRatio - bestLengthRatio) <= 0.01 and opts.AvoidDef and threat < bestThreat - 0.01 then
-                            better = true
-                        end
+
+                    local score = headingDiff + (sideRatio * 130) - (lengthRatio * 18)
+                    if opts.AvoidDef then
+                        score = score - (threat * 0.65)
                     end
-                    if better then
-                        bestPath = candidate
-                        bestAngleDiff = angleDiff
-                        bestLengthRatio = lengthRatio
-                        bestThreat = threat
-                    end
+
+                    table_insert(candidates, {
+                        path = candidate,
+                        threat = threat,
+                        score = score,
+                        flank = sideRatio >= RouteMinFlankSideRatio,
+                    })
                 end
             end
         end
     end
 
-    return bestPath
+    if table_getn(candidates) == 0 then
+        return nil
+    end
+
+    table.sort(candidates, function(a, b)
+        return a.score > b.score
+    end)
+
+    local flankCandidates = {}
+    for _, entry in ipairs(candidates) do
+        if entry.flank then
+            table_insert(flankCandidates, entry)
+        end
+    end
+
+    local pool = table_getn(flankCandidates) > 0 and flankCandidates or candidates
+    local top = math_max(1, math_floor(table_getn(pool) * 0.5))
+    local picked = pool[math_random(1, top)]
+    return picked and picked.path or nil
 end
 
 local function OffsetCorner(prev, corner, next, layer)
@@ -2438,14 +2538,6 @@ local function IdleAtMarker(platoon, markerPos, layer, formation)
     end
 end
 
-local function NormalizeDegrees(deg)
-    deg = math_mod(deg, 360)
-    if deg < 0 then
-        deg = deg + 360
-    end
-    return deg
-end
-
 local function IssuePatrolRoute(platoon, points, formation)
     if not (platoon and points and table_getn(points) > 0) then
         return
@@ -2467,6 +2559,19 @@ local function IssuePatrolRoute(platoon, points, formation)
 
     -- close the loop
     IssuePatrol(units, points[1])
+end
+
+local function BuildLoopRoute(points)
+    local route = {}
+    for _, point in ipairs(points or {}) do
+        table_insert(route, point)
+    end
+
+    if table_getn(route) > 1 then
+        table_insert(route, route[1])
+    end
+
+    return route
 end
 
 local function BuildPerimeterPoints(layer, basePos, distance)
@@ -2657,7 +2762,7 @@ end
 function WaveAttack(platoon, data)
     local opts = CopyOptions(data)
     if not data or data.RandomizeRoute == nil then
-        opts.RandomizeRoute = true
+        opts.RandomizeRoute = false
     end
     opts.Type = opts.Type or opts.TargetType or 'closest'
     local function resolver(brain, p, o, layer)
@@ -2669,7 +2774,7 @@ end
 function RaidAttack(platoon, data)
     local opts = CopyOptions(data)
     if not data or data.RandomizeRoute == nil then
-        opts.RandomizeRoute = true
+        opts.RandomizeRoute = false
     end
     opts.Category = opts.Category or opts.TargetType or 'ECO'
     local function resolver(brain, p, o, layer)
@@ -2747,10 +2852,36 @@ function AreaPatrol(platoon, data)
         route = BuildPingPongRoute(points)
     end
 
-    IssuePatrolRoute(platoon, route, opts.Formation)
+    local useFormationMoves = layer ~= 'Air' and opts.Formation and opts.Formation ~= 'NoFormation'
+    if useFormationMoves then
+        local loopRoute = BuildLoopRoute(route)
+        local arrivalRadiusSq = 20 * 20
+        local maxTravelSeconds = 120
 
-    while PlatoonAlive(platoon) do
-        SafeWait(RecheckDelay)
+        while PlatoonAlive(platoon) do
+            MoveAlongPath(platoon, loopRoute, opts.Formation, false)
+
+            local destination = loopRoute[table_getn(loopRoute)]
+            local elapsed = 0
+            while PlatoonAlive(platoon) do
+                local pos = GetPlatoonPosition(platoon)
+                if pos and destination and DistanceSq(pos, destination) <= arrivalRadiusSq then
+                    break
+                end
+
+                elapsed = elapsed + 1
+                if elapsed >= maxTravelSeconds then
+                    break
+                end
+                SafeWait(1)
+            end
+        end
+    else
+        IssuePatrolRoute(platoon, route, opts.Formation)
+
+        while PlatoonAlive(platoon) do
+            SafeWait(RecheckDelay)
+        end
     end
 end
 
