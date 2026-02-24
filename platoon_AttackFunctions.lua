@@ -639,6 +639,11 @@ local function BuildIngressCandidates(startPos, area)
         AddScanAlongLeftOrRight(area[3] - margin, startPos[3])
     end
 
+    local nearest = ClampToPlayableArea(startPos, area, margin)
+    if nearest then
+        table_insert(candidates, 1, nearest)
+    end
+
     if table_getn(candidates) == 0 then
         table_insert(candidates, ClampToPlayableArea(startPos, area, margin))
     end
@@ -646,21 +651,34 @@ local function BuildIngressCandidates(startPos, area)
     return candidates
 end
 
+local function ClosestReachableIngress(startPos, area, layer)
+    local fallback = ClampToPlayableArea(startPos, area, PlayableIngressBuffer)
+    if not (layer and startPos and area) then
+        return fallback
+    end
+
+    local best = nil
+    local bestDistSq = nil
+    local candidates = BuildIngressCandidates(startPos, area)
+    for _, candidate in ipairs(candidates) do
+        if candidate and CanPathBetween(layer, startPos, candidate) then
+            local distSq = DistanceSq(startPos, candidate)
+            if not bestDistSq or distSq < bestDistSq then
+                best = candidate
+                bestDistSq = distSq
+            end
+        end
+    end
+
+    return best or fallback
+end
+
 local function NearestPlayablePointOnPath(startPos, path, area, layer)
     if PositionInPlayableArea(startPos, area) then
         return SurfacePoint(startPos)
     end
 
-    local entryPoint = ClampToPlayableArea(startPos, area, PlayableIngressBuffer)
-    if layer then
-        local candidates = BuildIngressCandidates(startPos, area)
-        for _, candidate in ipairs(candidates) do
-            if CanPathBetween(layer, startPos, candidate) then
-                entryPoint = candidate
-                break
-            end
-        end
-    end
+    local entryPoint = ClosestReachableIngress(startPos, area, layer)
 
     if path and table_getn(path) > 0 then
         -- Remove any waypoints that are still outside the playable area so we
@@ -676,6 +694,12 @@ local function NearestPlayablePointOnPath(startPos, path, area, layer)
         if firstInside then
             for _ = 1, firstInside - 1 do
                 table_remove(path, 1)
+            end
+
+            for i = table_getn(path), 1, -1 do
+                if not PositionInPlayableArea(path[i], area) then
+                    path[i] = ClampToPlayableArea(path[i], area, PlayableIngressBuffer)
+                end
             end
         else
             for i = table_getn(path), 1, -1 do
@@ -1909,15 +1933,7 @@ local function MoveToIngress(platoon, layer, ingress, formation)
 
     local ingressPath = BuildPathSegment(layer, startPos, ingress)
     if ingressPath and table_getn(ingressPath) > 0 then
-        local units = platoon:GetPlatoonUnits() or {}
-        IssueClearCommands(units)
-        for _, waypoint in ipairs(ingressPath) do
-            if formation and formation ~= 'NoFormation' then
-                IssueFormMove(units, waypoint, formation, 0)
-            else
-                IssueMove(units, waypoint)
-            end
-        end
+        MoveAlongPath(platoon, ingressPath, formation)
     else
         MoveAlongPath(platoon, { ingress }, formation)
     end
@@ -2226,11 +2242,28 @@ local function RandomPoint()
     if not ScenarioInfo then
         return { 0, 0, 0 }
     end
-    local size = ScenarioInfo.size or ScenarioInfo.MapSize or { 512, 512 }
-    local x = math_random(0, size[1])
-    local z = math_random(0, size[2])
+
+    local area = GetPlayableArea()
+    local minX = 0
+    local minZ = 0
+    local maxX = 512
+    local maxZ = 512
+
+    if area then
+        minX = area[1]
+        minZ = area[2]
+        maxX = area[3]
+        maxZ = area[4]
+    else
+        local size = ScenarioInfo.size or ScenarioInfo.MapSize or { 512, 512 }
+        maxX = size[1]
+        maxZ = size[2]
+    end
+
+    local x = math_random(minX, maxX)
+    local z = math_random(minZ, maxZ)
     local y = GetSurfaceHeight(x, z)
-    return { x, y, z }
+    return ClampToPlayableArea({ x, y, z }, area, PlayableIngressBuffer)
 end
 
 local function HottestColdestPosition(brain, hottest)
@@ -2251,7 +2284,8 @@ local function HottestColdestPosition(brain, hottest)
             return (a.threat or 0) < (b.threat or 0)
         end
     end)
-    return CopyVector(list[1].pos)
+    local area = GetPlayableArea()
+    return ClampToPlayableArea(CopyVector(list[1].pos), area, PlayableIngressBuffer)
 end
 
 local function SelectScoutDestination(brain, opts)

@@ -1163,7 +1163,7 @@ function Builder:MonitorLoop()
 
             self:QueueNeededBuilds(haveTbl or {})
 
-            -- Early-handoff idle tracker (10s). Stall revocation handled by base manager.
+            -- Early-handoff idle tracker (30s). Stall revocation handled by base manager.
             local allIdle = self:_AllFactoriesIdle()
             if self._haveSum ~= haveTotal then
                 self._haveSum = haveTotal
@@ -1171,8 +1171,8 @@ function Builder:MonitorLoop()
             else
                 if allIdle and not self:_WaitingForFactories() then
                     self._idleAllCounter = (self._idleAllCounter or 0) + 1
-                    -- Early handoff after 10 consecutive idle seconds
-                    if self._idleAllCounter >= 10 then
+                    -- Early handoff after 30 consecutive idle seconds
+                    if self._idleAllCounter >= 30 then
                         self:Warn(('Monitor: factories idle for %ds -> EarlyHandoff with %d/%d units')
                             :format(self._idleAllCounter, haveTotal, wantTotal))
                         self.stagingPlatoon = self.stagingPlatoon
