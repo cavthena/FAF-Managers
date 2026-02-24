@@ -2875,6 +2875,12 @@ function AreaPatrol(platoon, data)
                 end
                 SafeWait(1)
             end
+
+            -- Yield before re-issuing the path. If the platoon is already at
+            -- the loop destination (for example the first marker in the
+            -- chain), this prevents a tight no-wait command loop that can
+            -- stall the sim thread.
+            SafeWait(1)
         end
     else
         IssuePatrolRoute(platoon, route, opts.Formation)

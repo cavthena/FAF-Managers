@@ -374,28 +374,42 @@ end
 
 
 function Spawner:HandOffToAttack(platoon)
-    if not self.params.attackFn then
+    local attackFn = self.params.attackFn
+    if not attackFn then
         self:Warn('No attackFn provided; spawned platoon will idle.')
         return
     end
- 
-     local function _AttackWrapper(p, fn)
-        if type(fn) == 'function' then
-            return fn(p, self.params.attackData)
-        elseif type(fn) == 'string' and fn ~= '' then
-            local ref = _G and rawget(_G, fn)
-            if type(ref) == 'function' then
-                return ref(p, self.params.attackData)
-            else
-                self:Warn('AttackWrapper: string attackFn not found in _G: '.. tostring(fn))
+
+    if type(attackFn) == 'string' and attackFn ~= '' then
+        attackFn = _G and rawget(_G, attackFn)
+    end
+
+    if type(attackFn) ~= 'function' then
+        self:Warn('AttackWrapper: attackFn is not callable: '.. tostring(self.params.attackFn))
+        return
+    end
+
+    local brain = platoon and platoon.GetBrain and platoon:GetBrain()
+    if not (brain and brain.PlatoonExists and brain:PlatoonExists(platoon)) then
+        self:Warn('AttackWrapper: platoon missing at handoff')
+        return
+    end
+
+    brain:ForkThread(function()
+        WaitTicks(2)
+        if brain:PlatoonExists(platoon) then
+            local units = platoon:GetPlatoonUnits() or {}
+            if table.getn(units) > 0 then
+                IssueClearCommands(units)
             end
-        else
-            self:Warn('AttackWrapper: attackFn is not callable: '.. tostring(fn))
+
+            platoon.PlatoonData = self.params.attackData or platoon.PlatoonData or {}
+            platoon:ForkAIThread(function(p)
+                return attackFn(p, p.PlatoonData)
+            end)
         end
-     end
- 
-     platoon:ForkAIThread(_AttackWrapper, self.params.attackFn)
- end
+    end)
+end
  
 function Spawner:SpawnWave(waveNo, wanted)
     local pos = self:GetNextSpawnPos()
