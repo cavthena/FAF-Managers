@@ -947,6 +947,8 @@ local function LeastDefendedStructures(brain, layer, structures)
     return selected
 end
 
+local CanPathTo
+
 local function ChooseBestArea(brain, platoon, opts, layer, areaRadius, mode, category)
     local startPos = GetPlatoonPosition(platoon)
     if not startPos then return nil end
@@ -962,6 +964,14 @@ local function ChooseBestArea(brain, platoon, opts, layer, areaRadius, mode, cat
         if pos then
             local units = AreaUnits(brain, enemies, pos, areaRadius, category, opts.IntelOnly)
             units = FilterUnits(units, layer, opts.Submersible)
+            if table_getn(units) > 0 then
+                if not opts.Transport and not CanPathTo(platoon, layer, pos) then
+                    -- Skip unreachable areas so wave attacks don't repeatedly
+                    -- retarget locations they cannot move toward.
+                    units = {}
+                end
+            end
+
             if table_getn(units) > 0 then
                 local distance = Distance(startPos, pos)
                 local score = ScoreStructureCluster(units, mode, distance)
@@ -1116,7 +1126,7 @@ local function AmphibiousSurfaceHeight(layer, x, z)
     return GetTerrainHeight(x, z)
 end
 
-local function CanPathTo(platoon, layer, destination)
+CanPathTo = function(platoon, layer, destination)
     local startPos = GetPlatoonPosition(platoon)
     if not (startPos and destination) then
         return false
@@ -2854,14 +2864,24 @@ function AreaPatrol(platoon, data)
 
     local useFormationMoves = layer ~= 'Air' and opts.Formation and opts.Formation ~= 'NoFormation'
     if useFormationMoves then
-        local loopRoute = BuildLoopRoute(route)
         local arrivalRadiusSq = 20 * 20
         local maxTravelSeconds = 120
+        local routeCount = table_getn(route)
+        local index = 1
 
         while PlatoonAlive(platoon) do
-            MoveAlongPath(platoon, loopRoute, opts.Formation, false)
+            local destination = route[index]
+            if not destination then
+                break
+            end
 
-            local destination = loopRoute[table_getn(loopRoute)]
+            local path = FindSafePath(platoon, layer, destination, nil, opts)
+            if path then
+                MoveAlongPath(platoon, path, opts.Formation, false)
+            else
+                MoveAlongPath(platoon, { destination }, opts.Formation, false)
+            end
+
             local elapsed = 0
             while PlatoonAlive(platoon) do
                 local pos = GetPlatoonPosition(platoon)
@@ -2876,10 +2896,11 @@ function AreaPatrol(platoon, data)
                 SafeWait(1)
             end
 
-            -- Yield before re-issuing the path. If the platoon is already at
-            -- the loop destination (for example the first marker in the
-            -- chain), this prevents a tight no-wait command loop that can
-            -- stall the sim thread.
+            index = index + 1
+            if index > routeCount then
+                index = 1
+            end
+
             SafeWait(1)
         end
     else
