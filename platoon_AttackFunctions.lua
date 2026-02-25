@@ -282,6 +282,7 @@ local ThreatSampleRing        = 48
 local AvoidThreatMultiplier   = 1.5
 local PlayableIngressTimeout  = 60
 local PlayableIngressBuffer   = 10
+local PlayableIngressFallbackOffsets = { 0, 20, -20, 40, -40, 60, -60 }
 local HuntRepathDistanceSq    = 400
 local HuntAttackDistanceSq    = 2500
 local HuntDefenseWait         = 5
@@ -542,6 +543,18 @@ local function ClampToPlayableArea(position, area, buffer)
     return { x, y, z }
 end
 
+local function DistanceToPlayableEdge(position, area)
+    if not (position and area) then
+        return math_huge
+    end
+
+    local left = position[1] - area[1]
+    local right = area[3] - position[1]
+    local bottom = position[3] - area[2]
+    local top = area[4] - position[3]
+    return math_min(math_min(left, right), math_min(bottom, top))
+end
+
 local function Midpoint(a, b)
     return { (a[1] + b[1]) * 0.5, 0, (a[3] + b[3]) * 0.5 }
 end
@@ -592,14 +605,110 @@ local function SegmentPlayableIngress(outside, inside, area)
     return entryPoint
 end
 
+local function ComputeNearestEdgeIngress(startPos, area, buffer)
+    if not (startPos and area) then
+        return nil
+    end
+
+    local minX, minZ, maxX, maxZ = area[1], area[2], area[3], area[4]
+    local clampedX = math_min(math_max(startPos[1], minX), maxX)
+    local clampedZ = math_min(math_max(startPos[3], minZ), maxZ)
+
+    local candidates = {
+        { edge = 'left', x = minX, z = clampedZ },
+        { edge = 'right', x = maxX, z = clampedZ },
+        { edge = 'bottom', x = clampedX, z = minZ },
+        { edge = 'top', x = clampedX, z = maxZ },
+    }
+
+    local best = nil
+    local bestDistSq = math_huge
+    for _, candidate in ipairs(candidates) do
+        local dx = startPos[1] - candidate.x
+        local dz = startPos[3] - candidate.z
+        local distSq = dx * dx + dz * dz
+        if distSq < bestDistSq then
+            bestDistSq = distSq
+            best = candidate
+        end
+    end
+
+    if not best then
+        return nil
+    end
+
+    local safeBuffer = math_max(buffer or 0, 4)
+    local ingressX = best.x
+    local ingressZ = best.z
+    if best.edge == 'left' then
+        ingressX = ingressX + safeBuffer
+    elseif best.edge == 'right' then
+        ingressX = ingressX - safeBuffer
+    elseif best.edge == 'bottom' then
+        ingressZ = ingressZ + safeBuffer
+    else
+        ingressZ = ingressZ - safeBuffer
+    end
+
+    local ingress = ClampToPlayableArea({ ingressX, 0, ingressZ }, area, safeBuffer)
+    return ingress, best.edge, best
+end
+
+local function IngressCandidateOnEdge(area, edge, boundaryPoint, offset, buffer)
+    if not (area and edge and boundaryPoint) then
+        return nil
+    end
+
+    local safeBuffer = math_max(buffer or 0, 4)
+    local minX = area[1] + safeBuffer
+    local maxX = area[3] - safeBuffer
+    local minZ = area[2] + safeBuffer
+    local maxZ = area[4] - safeBuffer
+
+    if edge == 'left' or edge == 'right' then
+        local z = math_min(math_max(boundaryPoint.z + offset, minZ), maxZ)
+        local x = (edge == 'left') and minX or maxX
+        return { x, GetSurfaceHeight(x, z), z }
+    else
+        local x = math_min(math_max(boundaryPoint.x + offset, minX), maxX)
+        local z = (edge == 'bottom') and minZ or maxZ
+        return { x, GetSurfaceHeight(x, z), z }
+    end
+end
+
+local function BuildIngressCandidates(startPos, area, buffer)
+    local ingress, edge, boundaryPoint = ComputeNearestEdgeIngress(startPos, area, buffer)
+    if not ingress then
+        return {}, nil
+    end
+
+    local candidates = {}
+    local seen = {}
+    for _, offset in ipairs(PlayableIngressFallbackOffsets) do
+        local point = IngressCandidateOnEdge(area, edge, boundaryPoint, offset, buffer)
+        if point then
+            local key = math_floor(point[1] + 0.5) .. ':' .. math_floor(point[3] + 0.5)
+            if not seen[key] then
+                seen[key] = true
+                table_insert(candidates, point)
+            end
+        end
+    end
+
+    if table_getn(candidates) == 0 then
+        table_insert(candidates, ingress)
+    end
+
+    return candidates, edge
+end
+
 local function ClosestReachableIngress(startPos, area, layer)
     if not (startPos and area) then
         return nil
     end
 
-    -- Ingress is strictly a straight-line move from spawn to the nearest
-    -- playable border point. It intentionally ignores the eventual target.
-    return ClampToPlayableArea(startPos, area, PlayableIngressBuffer)
+    local ingress = ComputeNearestEdgeIngress(startPos, area, PlayableIngressBuffer)
+    return ingress
 end
 
 local function NearestPlayablePointOnPath(startPos, path, area, layer)
@@ -1179,6 +1288,12 @@ local function AppendDestination(path, destination, layer)
 end
 
 local function BuildPathSegment(layer, startPos, destination)
+    local area = GetPlayableArea()
+    if area then
+        startPos = ClampToPlayableArea(startPos, area, 0)
+        destination = ClampToPlayableArea(destination, area, 0)
+    end
+
     local ok, path = pcall(NavUtils.PathTo, layer, startPos, destination)
     if ok and path then
         if table_getn(path) == 0 then
@@ -1711,6 +1826,12 @@ local function FindSafePath(platoon, layer, destination, startOverride, opts)
     local startPos = startOverride or GetPlatoonPosition(platoon)
     if not (startPos and destination) then return nil end
 
+    local area = GetPlayableArea()
+    if area then
+        startPos = ClampToPlayableArea(startPos, area, 0)
+        destination = ClampToPlayableArea(destination, area, 0)
+    end
+
     local path = BuildPathSegment(layer, startPos, destination)
     if not path then
         return nil
@@ -1722,10 +1843,10 @@ local function FindSafePath(platoon, layer, destination, startOverride, opts)
     end
 
     if opts.CorridorCentering == false then
-        return ApplyPathClearance(path, layer)
+        return ClampPathToPlayableArea(ApplyPathClearance(path, layer), PlayableIngressBuffer)
     end
 
-    return ApplyCorridorCentering(path, layer, startPos, destination, opts)
+    return ClampPathToPlayableArea(ApplyCorridorCentering(path, layer, startPos, destination, opts), PlayableIngressBuffer)
 end
 
 local function MaxWeaponRange(platoon)
@@ -1820,6 +1941,27 @@ local function MoveAlongPath(platoon, path, formation, aggressiveFinal)
     -- Make sure we never issue move orders outside the playable area
     path = ClampPathToPlayableArea(path, PlayableIngressBuffer)
 
+    local area = GetPlayableArea()
+    local pos = GetPlatoonPosition(platoon)
+    if area and pos and PositionInPlayableArea(pos, area) then
+        local currentEdgeDistance = DistanceToPlayableEdge(pos, area)
+        while table_getn(path) > 1 do
+            local first = path[1]
+            if not first then
+                table_remove(path, 1)
+            else
+                local firstEdgeDistance = DistanceToPlayableEdge(first, area)
+                if not PositionInPlayableArea(first, area) or firstEdgeDistance + 1 < currentEdgeDistance then
+                    table_remove(path, 1)
+                else
+                    break
+                end
+            end
+        end
+    end
+
+    if not (path and table_getn(path) > 0) then return end
+
     local useFormation = formation and formation ~= 'NoFormation'
     if useFormation then
         platoon:SetPlatoonFormationOverride(formation)
@@ -1863,6 +2005,8 @@ local function MoveToIngress(platoon, layer, ingress, formation)
     MoveAlongPath(platoon, { ingress }, formation)
 
     local timeout = PlayableIngressTimeout
+    local bestDistSq = DistanceSq(startPos, ingress)
+    local stagnant = 0
     while timeout > 0 and PlatoonAlive(platoon) do
         local pos = GetPlatoonPosition(platoon)
         if not pos then
@@ -1873,11 +2017,60 @@ local function MoveToIngress(platoon, layer, ingress, formation)
             return true
         end
 
+        local distSq = DistanceSq(pos, ingress)
+        if distSq < (bestDistSq - TravelProgressEpsilonSq) then
+            bestDistSq = distSq
+            stagnant = 0
+        else
+            stagnant = stagnant + 1
+        end
+
+        if stagnant >= 8 then
+            return false
+        end
+
         timeout = timeout - 1
         SafeWait(1)
     end
 
     return false
+end
+
+local function MoveToNearestPlayableIngress(platoon, layer, area, formation)
+    local startPos = GetPlatoonPosition(platoon)
+    if not (startPos and area) then
+        return false, nil
+    end
+
+    local candidates = BuildIngressCandidates(startPos, area, PlayableIngressBuffer)
+    if table_getn(candidates) == 0 then
+        return false, nil
+    end
+
+    local pathable = {}
+    local fallback = {}
+    for _, candidate in ipairs(candidates) do
+        if layer == 'Air' or CanPathBetween(layer, startPos, candidate) then
+            table_insert(pathable, candidate)
+        else
+            table_insert(fallback, candidate)
+        end
+    end
+
+    for _, candidate in ipairs(fallback) do
+        table_insert(pathable, candidate)
+    end
+
+    for _, candidate in ipairs(pathable) do
+        if MoveToIngress(platoon, layer, candidate, formation) then
+            local pos = GetPlatoonPosition(platoon)
+            if PositionInPlayableArea(pos, area) then
+                return true, candidate
+            end
+        end
+    end
+
+    return false, pathable[1]
 end
 
 local function TransportAndMove(platoon, destination, opts)
@@ -1921,6 +2114,13 @@ local function AttackTargetArea(platoon, target, opts)
         return 'fail'
     end
 
+    local targetPos = target.position
+    if area then
+        targetPos = ClampToPlayableArea(targetPos, area, 0)
+    else
+        targetPos = CopyVector(targetPos)
+    end
+
     local startedOutside = area and not PositionInPlayableArea(startPos, area)
     local bombardRange = nil
     if opts.Bombard then
@@ -1933,25 +2133,44 @@ local function AttackTargetArea(platoon, target, opts)
     local path = nil
     local ingress = nil
     if startedOutside then
-        ingress = NearestPlayablePointOnPath(startPos, nil, area, layer)
-        if ingress then
-            MoveToIngress(platoon, layer, ingress, opts.Formation)
-            path = FindSafePath(platoon, layer, target.position, ingress, opts)
-            if not (path and table_getn(path) > 0) then
-                path = BuildPathSegment(layer, ingress, target.position)
-            end
+        local ingressReached
+        ingressReached, ingress = MoveToNearestPlayableIngress(platoon, layer, area, opts.Formation)
+        if not ingressReached then
+            return 'repath'
+        end
 
-            if path and table_getn(path) > 0 then
-                local first = path[1]
-                if not (first and DistanceSq(first, ingress) < 1) then
-                    table_insert(path, 1, CopyVector(ingress))
-                end
-            else
-                path = { CopyVector(ingress) }
+        path = FindSafePath(platoon, layer, targetPos, ingress, opts)
+        if not (path and table_getn(path) > 0) then
+            path = BuildPathSegment(layer, ingress, targetPos)
+        end
+
+        if path and table_getn(path) > 0 then
+            local first = path[1]
+            if not (first and DistanceSq(first, ingress) < 1) then
+                table_insert(path, 1, CopyVector(ingress))
             end
+        else
+            path = { CopyVector(ingress) }
         end
     else
-        path = FindSafePath(platoon, layer, target.position, nil, opts)
+        path = FindSafePath(platoon, layer, targetPos, nil, opts)
+    end
+
+    local canPath = CanPathTo(platoon, layer, targetPos)
+    if not canPath and ingress then
+        canPath = CanPathBetween(layer, ingress, targetPos)
+    end
+    if not canPath then
+        if opts.Transport then
+            if not TransportAndMove(platoon, targetPos, opts) then
+                return 'fail'
+            end
+            path = FindSafePath(platoon, layer, targetPos, nil, opts)
+        else
+            return 'fail'
+        end
+    elseif not path then
+        path = FindSafePath(platoon, layer, targetPos, nil, opts)
     end
 
     local canPath = CanPathTo(platoon, layer, target.position)
@@ -1976,7 +2195,7 @@ local function AttackTargetArea(platoon, target, opts)
     end
 
     if bombardRange then
-        path = ShortenPathForBombard(path, target.position, bombardRange)
+        path = ShortenPathForBombard(path, targetPos, bombardRange)
     end
 
     MoveAlongPath(platoon, path, opts.Formation)
@@ -1986,7 +2205,7 @@ local function AttackTargetArea(platoon, target, opts)
     local units = platoon:GetPlatoonUnits() or {}
     local stuckSeconds = 0
     local lastPos = GetPlatoonPosition(platoon)
-    local lastDistSq = lastPos and DistanceSq(lastPos, target.position) or nil
+    local lastDistSq = lastPos and DistanceSq(lastPos, targetPos) or nil
     while PlatoonAlive(platoon) do
         local pos = GetPlatoonPosition(platoon)
         if not pos then break end
@@ -1994,14 +2213,14 @@ local function AttackTargetArea(platoon, target, opts)
         if bombardRange and bombardRange > arrivalRadius then
             arrivalRadius = bombardRange
         end
-        if DistanceSq(pos, target.position) < (arrivalRadius * arrivalRadius) then
+        if DistanceSq(pos, targetPos) < (arrivalRadius * arrivalRadius) then
             arrived = true
             break
         end
         SafeWait(1)
         local updatedPos = GetPlatoonPosition(platoon)
         if not updatedPos then break end
-        local distSq = DistanceSq(updatedPos, target.position)
+        local distSq = DistanceSq(updatedPos, targetPos)
         local movedSq = lastPos and DistanceSq(updatedPos, lastPos) or 0
         if lastDistSq and (lastDistSq - distSq) > TravelProgressEpsilonSq then
             stuckSeconds = 0
@@ -2033,16 +2252,16 @@ local function AttackTargetArea(platoon, target, opts)
         -- Hold position and engage at range
     elseif formation ~= 'NoFormation' then
         platoon:SetPlatoonFormationOverride(formation)
-        IssueFormMove(units, target.position, formation, 0)
+        IssueFormMove(units, targetPos, formation, 0)
     else
         local finalAggressive = target and target.finalAggressiveMove
         if finalAggressive == nil then
             finalAggressive = true
         end
         if finalAggressive then
-            IssueAggressiveMove(units, target.position)
+            IssueAggressiveMove(units, targetPos)
         else
-            IssueMove(units, target.position)
+            IssueMove(units, targetPos)
         end
     end
 
