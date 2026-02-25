@@ -610,26 +610,89 @@ local function ComputeNearestEdgeIngress(startPos, area, buffer)
         return nil
     end
 
-    local minX, minZ, maxX, maxZ = area[1], area[2], area[3], area[4]
-    local clampedX = math_min(math_max(startPos[1], minX), maxX)
-    local clampedZ = math_min(math_max(startPos[3], minZ), maxZ)
+    if PositionInPlayableArea(startPos, area) then
+        return ClampToPlayableArea(startPos, area, math_max(buffer or 0, 0)), nil, nil
+    end
 
-    local candidates = {
-        { edge = 'left', x = minX, z = clampedZ },
-        { edge = 'right', x = maxX, z = clampedZ },
-        { edge = 'bottom', x = clampedX, z = minZ },
-        { edge = 'top', x = clampedX, z = maxZ },
+    local minX, minZ, maxX, maxZ = area[1], area[2], area[3], area[4]
+    local sx = startPos[1]
+    local sz = startPos[3]
+
+    -- Only allow ingress discovery via cardinal vectors from the spawn point.
+    -- The first boundary crossing (smallest forward distance) is selected.
+    local cardinal = {
+        { edge = 'left', dx = 1, dz = 0 },
+        { edge = 'right', dx = -1, dz = 0 },
+        { edge = 'bottom', dx = 0, dz = 1 },
+        { edge = 'top', dx = 0, dz = -1 },
     }
 
     local best = nil
-    local bestDistSq = math_huge
-    for _, candidate in ipairs(candidates) do
-        local dx = startPos[1] - candidate.x
-        local dz = startPos[3] - candidate.z
-        local distSq = dx * dx + dz * dz
-        if distSq < bestDistSq then
-            bestDistSq = distSq
-            best = candidate
+    local bestT = math_huge
+    for _, ray in ipairs(cardinal) do
+        local t = nil
+        local hitX = nil
+        local hitZ = nil
+
+        if ray.dx > 0 then
+            if sz >= minZ and sz <= maxZ and sx < minX then
+                t = minX - sx
+                hitX = minX
+                hitZ = sz
+            end
+        elseif ray.dx < 0 then
+            if sz >= minZ and sz <= maxZ and sx > maxX then
+                t = sx - maxX
+                hitX = maxX
+                hitZ = sz
+            end
+        elseif ray.dz > 0 then
+            if sx >= minX and sx <= maxX and sz < minZ then
+                t = minZ - sz
+                hitX = sx
+                hitZ = minZ
+            end
+        else
+            if sx >= minX and sx <= maxX and sz > maxZ then
+                t = sz - maxZ
+                hitX = sx
+                hitZ = maxZ
+            end
+        end
+
+        if t and t >= 0 and t < bestT then
+            bestT = t
+            best = {
+                edge = ray.edge,
+                x = hitX,
+                z = hitZ,
+                dx = ray.dx,
+                dz = ray.dz,
+            }
+        end
+    end
+
+    -- Corner/corrupt spawn safety fallback: if cardinal rays never intersect,
+    -- fall back to nearest-edge behavior so the platoon can still recover.
+    if not best then
+        local clampedX = math_min(math_max(startPos[1], minX), maxX)
+        local clampedZ = math_min(math_max(startPos[3], minZ), maxZ)
+        local candidates = {
+            { edge = 'left', x = minX, z = clampedZ, dx = 1, dz = 0 },
+            { edge = 'right', x = maxX, z = clampedZ, dx = -1, dz = 0 },
+            { edge = 'bottom', x = clampedX, z = minZ, dx = 0, dz = 1 },
+            { edge = 'top', x = clampedX, z = maxZ, dx = 0, dz = -1 },
+        }
+
+        local bestDistSq = math_huge
+        for _, candidate in ipairs(candidates) do
+            local dx = startPos[1] - candidate.x
+            local dz = startPos[3] - candidate.z
+            local distSq = dx * dx + dz * dz
+            if distSq < bestDistSq then
+                bestDistSq = distSq
+                best = candidate
+            end
         end
     end
 
@@ -638,17 +701,8 @@ local function ComputeNearestEdgeIngress(startPos, area, buffer)
     end
 
     local safeBuffer = math_max(buffer or 0, 4)
-    local ingressX = best.x
-    local ingressZ = best.z
-    if best.edge == 'left' then
-        ingressX = ingressX + safeBuffer
-    elseif best.edge == 'right' then
-        ingressX = ingressX - safeBuffer
-    elseif best.edge == 'bottom' then
-        ingressZ = ingressZ + safeBuffer
-    else
-        ingressZ = ingressZ - safeBuffer
-    end
+    local ingressX = best.x + (best.dx or 0) * safeBuffer
+    local ingressZ = best.z + (best.dz or 0) * safeBuffer
 
     local ingress = ClampToPlayableArea({ ingressX, 0, ingressZ }, area, safeBuffer)
     return ingress, best.edge, best
