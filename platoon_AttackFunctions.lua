@@ -592,85 +592,14 @@ local function SegmentPlayableIngress(outside, inside, area)
     return entryPoint
 end
 
-local function BuildIngressCandidates(startPos, area)
-    if not (startPos and area) then
-        return {}
-    end
-
-    local candidates = {}
-    local margin = PlayableIngressBuffer
-    local step = 8
-    local maxSteps = 24
-
-    local function AddCandidate(x, z)
-        x = math_min(math_max(x, area[1] + margin), area[3] - margin)
-        z = math_min(math_max(z, area[2] + margin), area[4] - margin)
-        table_insert(candidates, { x, GetSurfaceHeight(x, z), z })
-    end
-
-    local function AddScanAlongTopOrBottom(baseX, z)
-        AddCandidate(baseX, z)
-        for i = 1, maxSteps do
-            local offset = i * step
-            AddCandidate(baseX - offset, z)
-            AddCandidate(baseX + offset, z)
-        end
-    end
-
-    local function AddScanAlongLeftOrRight(x, baseZ)
-        AddCandidate(x, baseZ)
-        for i = 1, maxSteps do
-            local offset = i * step
-            AddCandidate(x, baseZ - offset)
-            AddCandidate(x, baseZ + offset)
-        end
-    end
-
-    if startPos[3] > area[4] then
-        AddScanAlongTopOrBottom(startPos[1], area[4] - margin)
-    end
-    if startPos[3] < area[2] then
-        AddScanAlongTopOrBottom(startPos[1], area[2] + margin)
-    end
-    if startPos[1] < area[1] then
-        AddScanAlongLeftOrRight(area[1] + margin, startPos[3])
-    end
-    if startPos[1] > area[3] then
-        AddScanAlongLeftOrRight(area[3] - margin, startPos[3])
-    end
-
-    local nearest = ClampToPlayableArea(startPos, area, margin)
-    if nearest then
-        table_insert(candidates, 1, nearest)
-    end
-
-    if table_getn(candidates) == 0 then
-        table_insert(candidates, ClampToPlayableArea(startPos, area, margin))
-    end
-
-    return candidates
-end
-
 local function ClosestReachableIngress(startPos, area, layer)
-    local fallback = ClampToPlayableArea(startPos, area, PlayableIngressBuffer)
-    if not (layer and startPos and area) then
-        return fallback
+    if not (startPos and area) then
+        return nil
     end
 
-    local best = nil
-    local bestDistSq = nil
-    local candidates = BuildIngressCandidates(startPos, area)
-    for _, candidate in ipairs(candidates) do
-        if candidate and CanPathBetween(layer, startPos, candidate) then
-            local distSq = DistanceSq(startPos, candidate)
-            if not bestDistSq or distSq < bestDistSq then
-                best = candidate
-                bestDistSq = distSq
-            end
-        end
-    end
-
-    return best or fallback
+    -- Ingress is strictly a straight-line move from spawn to the nearest
+    -- playable border point. It intentionally ignores the eventual target.
+    return ClampToPlayableArea(startPos, area, PlayableIngressBuffer)
 end
 
 local function NearestPlayablePointOnPath(startPos, path, area, layer)
@@ -1931,12 +1860,7 @@ local function MoveToIngress(platoon, layer, ingress, formation)
         return false
     end
 
-    local ingressPath = BuildPathSegment(layer, startPos, ingress)
-    if ingressPath and table_getn(ingressPath) > 0 then
-        MoveAlongPath(platoon, ingressPath, formation)
-    else
-        MoveAlongPath(platoon, { ingress }, formation)
-    end
+    MoveAlongPath(platoon, { ingress }, formation)
 
     local timeout = PlayableIngressTimeout
     while timeout > 0 and PlatoonAlive(platoon) do
