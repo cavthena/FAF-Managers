@@ -282,7 +282,6 @@ local ThreatSampleRing        = 48
 local AvoidThreatMultiplier   = 1.5
 local PlayableIngressTimeout  = 60
 local PlayableIngressBuffer   = 10
-local PlayableIngressFallbackOffsets = { 0, 20, -20, 40, -40, 60, -60 }
 local HuntRepathDistanceSq    = 400
 local HuntAttackDistanceSq    = 2500
 local HuntDefenseWait         = 5
@@ -672,30 +671,6 @@ local function ComputeNearestEdgeIngress(startPos, area, buffer)
         end
     end
 
-    -- Corner/corrupt spawn safety fallback: if cardinal rays never intersect,
-    -- fall back to nearest-edge behavior so the platoon can still recover.
-    if not best then
-        local clampedX = math_min(math_max(startPos[1], minX), maxX)
-        local clampedZ = math_min(math_max(startPos[3], minZ), maxZ)
-        local candidates = {
-            { edge = 'left', x = minX, z = clampedZ, dx = 1, dz = 0 },
-            { edge = 'right', x = maxX, z = clampedZ, dx = -1, dz = 0 },
-            { edge = 'bottom', x = clampedX, z = minZ, dx = 0, dz = 1 },
-            { edge = 'top', x = clampedX, z = maxZ, dx = 0, dz = -1 },
-        }
-
-        local bestDistSq = math_huge
-        for _, candidate in ipairs(candidates) do
-            local dx = startPos[1] - candidate.x
-            local dz = startPos[3] - candidate.z
-            local distSq = dx * dx + dz * dz
-            if distSq < bestDistSq then
-                bestDistSq = distSq
-                best = candidate
-            end
-        end
-    end
-
     if not best then
         return nil
     end
@@ -708,52 +683,13 @@ local function ComputeNearestEdgeIngress(startPos, area, buffer)
     return ingress, best.edge, best
 end
 
-local function IngressCandidateOnEdge(area, edge, boundaryPoint, offset, buffer)
-    if not (area and edge and boundaryPoint) then
-        return nil
-    end
-
-    local safeBuffer = math_max(buffer or 0, 4)
-    local minX = area[1] + safeBuffer
-    local maxX = area[3] - safeBuffer
-    local minZ = area[2] + safeBuffer
-    local maxZ = area[4] - safeBuffer
-
-    if edge == 'left' or edge == 'right' then
-        local z = math_min(math_max(boundaryPoint.z + offset, minZ), maxZ)
-        local x = (edge == 'left') and minX or maxX
-        return { x, GetSurfaceHeight(x, z), z }
-    else
-        local x = math_min(math_max(boundaryPoint.x + offset, minX), maxX)
-        local z = (edge == 'bottom') and minZ or maxZ
-        return { x, GetSurfaceHeight(x, z), z }
-    end
-end
-
 local function BuildIngressCandidates(startPos, area, buffer)
-    local ingress, edge, boundaryPoint = ComputeNearestEdgeIngress(startPos, area, buffer)
+    local ingress, edge = ComputeNearestEdgeIngress(startPos, area, buffer)
     if not ingress then
         return {}, nil
     end
 
-    local candidates = {}
-    local seen = {}
-    for _, offset in ipairs(PlayableIngressFallbackOffsets) do
-        local point = IngressCandidateOnEdge(area, edge, boundaryPoint, offset, buffer)
-        if point then
-            local key = math_floor(point[1] + 0.5) .. ':' .. math_floor(point[3] + 0.5)
-            if not seen[key] then
-                seen[key] = true
-                table_insert(candidates, point)
-            end
-        end
-    end
-
-    if table_getn(candidates) == 0 then
-        table_insert(candidates, ingress)
-    end
-
-    return candidates, edge
+    return { ingress }, edge
 end
 
 local function ClosestReachableIngress(startPos, area, layer)
@@ -2097,34 +2033,23 @@ local function MoveToNearestPlayableIngress(platoon, layer, area, formation)
     end
 
     local candidates = BuildIngressCandidates(startPos, area, PlayableIngressBuffer)
-    if table_getn(candidates) == 0 then
+    local candidate = candidates[1]
+    if not candidate then
         return false, nil
     end
 
-    local pathable = {}
-    local fallback = {}
-    for _, candidate in ipairs(candidates) do
-        if layer == 'Air' or CanPathBetween(layer, startPos, candidate) then
-            table_insert(pathable, candidate)
-        else
-            table_insert(fallback, candidate)
+    if layer ~= 'Air' and not CanPathBetween(layer, startPos, candidate) then
+        return false, candidate
+    end
+
+    if MoveToIngress(platoon, layer, candidate, formation) then
+        local pos = GetPlatoonPosition(platoon)
+        if PositionInPlayableArea(pos, area) then
+            return true, candidate
         end
     end
 
-    for _, candidate in ipairs(fallback) do
-        table_insert(pathable, candidate)
-    end
-
-    for _, candidate in ipairs(pathable) do
-        if MoveToIngress(platoon, layer, candidate, formation) then
-            local pos = GetPlatoonPosition(platoon)
-            if PositionInPlayableArea(pos, area) then
-                return true, candidate
-            end
-        end
-    end
-
-    return false, pathable[1]
+    return false, candidate
 end
 
 local function TransportAndMove(platoon, destination, opts)
