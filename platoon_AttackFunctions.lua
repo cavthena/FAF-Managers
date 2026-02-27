@@ -2118,18 +2118,33 @@ local function AttackTargetArea(platoon, target, opts)
             return 'repath'
         end
 
-        path = FindSafePath(platoon, layer, targetPos, ingress, opts)
-        if not (path and table_getn(path) > 0) then
-            path = BuildPathSegment(layer, ingress, targetPos)
+        local currentPos = GetPlatoonPosition(platoon)
+        if area and currentPos then
+            currentPos = ClampToPlayableArea(currentPos, area, 0)
         end
 
-        if path and table_getn(path) > 0 then
-            local first = path[1]
-            if not (first and DistanceSq(first, ingress) < 1) then
-                table_insert(path, 1, CopyVector(ingress))
+        local routeStart = currentPos or ingress
+
+        path = FindSafePath(platoon, layer, targetPos, routeStart, opts)
+        if not (path and table_getn(path) > 0) then
+            path = BuildPathSegment(layer, routeStart, targetPos)
+        end
+
+        if path and table_getn(path) > 1 and area and currentPos then
+            local currentEdgeDistance = DistanceToPlayableEdge(currentPos, area)
+            while table_getn(path) > 1 do
+                local first = path[1]
+                if not first then
+                    table_remove(path, 1)
+                else
+                    local firstEdgeDistance = DistanceToPlayableEdge(first, area)
+                    if firstEdgeDistance + 1 < currentEdgeDistance then
+                        table_remove(path, 1)
+                    else
+                        break
+                    end
+                end
             end
-        else
-            path = { CopyVector(ingress) }
         end
     else
         path = FindSafePath(platoon, layer, targetPos, nil, opts)
