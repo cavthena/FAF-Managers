@@ -1982,6 +1982,46 @@ local function MoveAlongPath(platoon, path, formation, aggressiveFinal)
     end
 end
 
+local function TrimInitialBacktrack(path, layer, startPos, targetPos)
+    if not (path and startPos and targetPos and table_getn(path) > 1) then
+        return path
+    end
+
+    local forwardX = targetPos[1] - startPos[1]
+    local forwardZ = targetPos[3] - startPos[3]
+    local forwardLenSq = forwardX * forwardX + forwardZ * forwardZ
+    if forwardLenSq < 1 then
+        return path
+    end
+
+    local probePos = CopyVector(startPos)
+    while table_getn(path) > 1 do
+        local first = path[1]
+        local nextPoint = path[2]
+        if not (first and nextPoint) then
+            break
+        end
+
+        local stepX = first[1] - probePos[1]
+        local stepZ = first[3] - probePos[3]
+        local stepLenSq = stepX * stepX + stepZ * stepZ
+        if stepLenSq < 16 then
+            table_remove(path, 1)
+        else
+            local headingDot = stepX * forwardX + stepZ * forwardZ
+            if headingDot < 0 and CanPathBetween(layer, probePos, nextPoint) then
+                table_remove(path, 1)
+            else
+                break
+            end
+        end
+
+        probePos = CopyVector(startPos)
+    end
+
+    return path
+end
+
 local function MoveToIngress(platoon, layer, ingress, formation)
     if not (platoon and ingress) then
         return false
@@ -2146,6 +2186,8 @@ local function AttackTargetArea(platoon, target, opts)
                 end
             end
         end
+
+        path = TrimInitialBacktrack(path, layer, routeStart, targetPos)
     else
         path = FindSafePath(platoon, layer, targetPos, nil, opts)
     end
