@@ -1810,6 +1810,93 @@ local function ApplyCorridorCentering(path, layer, startPos, destination, opts)
     return path
 end
 
+local function TryAdjustWaypoint(layer, waypoint, prevPoint, nextPoint)
+    if not waypoint then
+        return nil
+    end
+
+    local probeRadii = { 0, 3, 6, 9, 12, 16 }
+    local probeAngles = {
+        { 1, 0 },
+        { 0.707, 0.707 },
+        { 0, 1 },
+        { -0.707, 0.707 },
+        { -1, 0 },
+        { -0.707, -0.707 },
+        { 0, -1 },
+        { 0.707, -0.707 },
+    }
+
+    for _, radius in ipairs(probeRadii) do
+        if radius == 0 then
+            local candidate = {
+                waypoint[1],
+                AmphibiousSurfaceHeight(layer, waypoint[1], waypoint[3]),
+                waypoint[3],
+            }
+
+            if (not prevPoint or CanPathBetween(layer, prevPoint, candidate)) and
+               (not nextPoint or CanPathBetween(layer, candidate, nextPoint)) then
+                return candidate
+            end
+        else
+            for _, angle in ipairs(probeAngles) do
+                local testX = waypoint[1] + angle[1] * radius
+                local testZ = waypoint[3] + angle[2] * radius
+                local candidate = {
+                    testX,
+                    AmphibiousSurfaceHeight(layer, testX, testZ),
+                    testZ,
+                }
+
+                if (not prevPoint or CanPathBetween(layer, prevPoint, candidate)) and
+                   (not nextPoint or CanPathBetween(layer, candidate, nextPoint)) then
+                    return candidate
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+local function SanitizePathWaypoints(path, layer, startPos, destination)
+    if not (path and table_getn(path) > 0) then
+        return path
+    end
+
+    local sanitized = {}
+    local fallbackStart = startPos or path[1]
+
+    for i = 1, table_getn(path) do
+        local prevPoint = sanitized[table_getn(sanitized)] or fallbackStart
+        local nextPoint = path[i + 1]
+        if i == table_getn(path) and destination then
+            nextPoint = nil
+        end
+
+        local adjusted = TryAdjustWaypoint(layer, path[i], prevPoint, nextPoint)
+        if adjusted then
+            table_insert(sanitized, adjusted)
+        elseif nextPoint and prevPoint and CanPathBetween(layer, prevPoint, nextPoint) then
+            -- Skip waypoints that are trapped if we can directly connect around them.
+        elseif i == table_getn(path) and prevPoint and destination then
+            local fallback = TryAdjustWaypoint(layer, destination, prevPoint, nil)
+            if fallback then
+                table_insert(sanitized, fallback)
+            end
+        elseif path[i] and prevPoint and CanPathBetween(layer, prevPoint, path[i]) then
+            table_insert(sanitized, CopyVector(path[i]))
+        end
+    end
+
+    if table_getn(sanitized) == 0 then
+        return path
+    end
+
+    return sanitized
+end
+
 local function FindSafePath(platoon, layer, destination, startOverride, opts)
     opts = opts or {}
 
@@ -1833,10 +1920,13 @@ local function FindSafePath(platoon, layer, destination, startOverride, opts)
     end
 
     if opts.CorridorCentering == false then
-        return ClampPathToPlayableArea(ApplyPathClearance(path, layer), PlayableIngressBuffer)
+        path = ApplyPathClearance(path, layer)
+    else
+        path = ApplyCorridorCentering(path, layer, startPos, destination, opts)
     end
 
-    return ClampPathToPlayableArea(ApplyCorridorCentering(path, layer, startPos, destination, opts), PlayableIngressBuffer)
+    path = SanitizePathWaypoints(path, layer, startPos, destination)
+    return ClampPathToPlayableArea(path, PlayableIngressBuffer)
 end
 
 local function MaxWeaponRange(platoon)
