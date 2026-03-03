@@ -309,6 +309,7 @@ local SegmentDirectMinDistance = 10
 local SegmentDirectMaxRatio    = 1.2
 local FirebaseSafeRadius       = 40
 local FirebaseStructureRadius  = 4
+local RoutingDebug             = false
 
 local ClampPathToPlayableArea
 local CanPathBetween
@@ -347,6 +348,13 @@ local function SafeWait(seconds)
         WaitSeconds(seconds)
     else
         WaitTicks(1)
+    end
+end
+
+local function RoutingLog(...)
+    if RoutingDebug and LOG then
+        local params = { ... }
+        LOG('[AttackRouting]', unpack(params))
     end
 end
 
@@ -1929,6 +1937,77 @@ local function FindSafePath(platoon, layer, destination, startOverride, opts)
     return ClampPathToPlayableArea(path, PlayableIngressBuffer)
 end
 
+local function FindNearbyPathablePoint(layer, startPos, destination)
+    if not (layer and startPos and destination) then
+        return nil
+    end
+
+    local probeRadii = { 10, 20, 30, 45, 60, 80 }
+    local probeAngles = {
+        { 1, 0 },
+        { 0.707, 0.707 },
+        { 0, 1 },
+        { -0.707, 0.707 },
+        { -1, 0 },
+        { -0.707, -0.707 },
+        { 0, -1 },
+        { 0.707, -0.707 },
+    }
+
+    local area = GetPlayableArea()
+    for _, radius in ipairs(probeRadii) do
+        for _, angle in ipairs(probeAngles) do
+            local x = destination[1] + angle[1] * radius
+            local z = destination[3] + angle[2] * radius
+            local candidate = { x, AmphibiousSurfaceHeight(layer, x, z), z }
+            if area then
+                candidate = ClampToPlayableArea(candidate, area, 0)
+            end
+
+            if CanPathBetween(layer, startPos, candidate) then
+                RoutingLog('Using nearby pathable fallback point')
+                return candidate
+            end
+        end
+    end
+
+    return nil
+end
+
+local function RecomputePathWithFallback(platoon, layer, destination, opts)
+    local current = GetPlatoonPosition(platoon)
+    if not (current and destination) then
+        return nil
+    end
+
+    local repathOpts = CopyOptions(opts)
+    repathOpts._repathing = true
+
+    local path = FindSafePath(platoon, layer, destination, current, repathOpts)
+    if path and table_getn(path) > 0 then
+        RoutingLog('Generated safe repath with', table_getn(path), 'waypoints')
+        return path
+    end
+
+    path = BuildPathSegment(layer, current, destination)
+    if path and table_getn(path) > 0 then
+        RoutingLog('Fallback to NavUtils.PathTo segment with', table_getn(path), 'waypoints')
+        return ClampPathToPlayableArea(path, PlayableIngressBuffer)
+    end
+
+    local nearby = FindNearbyPathablePoint(layer, current, destination)
+    if nearby then
+        path = BuildPathSegment(layer, current, nearby)
+        if path and table_getn(path) > 0 then
+            RoutingLog('Fallback path built to nearby pathable point')
+            return ClampPathToPlayableArea(path, PlayableIngressBuffer)
+        end
+    end
+
+    RoutingLog('Repath failed for destination')
+    return nil
+end
+
 local function MaxWeaponRange(platoon)
     local units = platoon and platoon:GetPlatoonUnits() or {}
     local maxRange = 0
@@ -2012,11 +2091,11 @@ ClampPathToPlayableArea = function(path, buffer)
     return clamped
 end
 
-local function MoveAlongPath(platoon, path, formation, aggressiveFinal)
-    if not (path and table_getn(path) > 0) then return end
+local function MoveAlongPath(platoon, path, formation, aggressiveFinal, layer )
+    if not (path and table_getn(path) > 0) then return false end
 
     local units = platoon:GetPlatoonUnits() or {}
-    if table_getn(units) == 0 then return end
+    if table_getn(units) == 0 then return false end
 
     -- Make sure we never issue move orders outside the playable area
     path = ClampPathToPlayableArea(path, PlayableIngressBuffer)
@@ -2040,7 +2119,18 @@ local function MoveAlongPath(platoon, path, formation, aggressiveFinal)
         end
     end
 
-    if not (path and table_getn(path) > 0) then return end
+    if not (path and table_getn(path) > 0) then return false end
+
+    local movementLayer = layer or DetermineLayer(platoon, false)
+    local startPos = GetPlatoonPosition(platoon)
+    local previous = startPos
+    for index, waypoint in ipairs(path) do
+        if waypoint and previous and not CanPathBetween(movementLayer, previous, waypoint) then
+            RoutingLog('Rejected waypoint segment for layer', movementLayer, 'at index', index)
+            return false
+        end
+        previous = waypoint
+    end
 
     local useFormation = formation and formation ~= 'NoFormation'
     if useFormation then
@@ -2070,6 +2160,8 @@ local function MoveAlongPath(platoon, path, formation, aggressiveFinal)
             lastIssued = waypoint
         end
     end
+
+    return true
 end
 
 local function TrimInitialBacktrack(path, layer, startPos, targetPos)
@@ -2324,7 +2416,33 @@ local function AttackTargetArea(platoon, target, opts)
         path = ShortenPathForBombard(path, targetPos, bombardRange)
     end
 
-    MoveAlongPath(platoon, path, opts.Formation)
+    local issued = MoveAlongPath(platoon, path, opts.Formation, false, layer)
+    if not issued then
+        RoutingLog('Initial path issue failed; attempting repath')
+        path = RecomputePathWithFallback(platoon, layer, targetPos, opts)
+        if not path then
+            if opts.Transport then
+                RoutingLog('Path repath failed; attempting transport fallback')
+                if not TransportAndMove(platoon, targetPos, opts) then
+                    return 'repath'
+                end
+                path = RecomputePathWithFallback(platoon, layer, targetPos, opts)
+            end
+        end
+
+        if not path then
+            return 'repath'
+        end
+
+        if bombardRange then
+            path = ShortenPathForBombard(path, targetPos, bombardRange)
+        end
+
+        issued = MoveAlongPath(platoon, path, opts.Formation, false, layer)
+        if not issued then
+            return 'repath'
+        end
+    end
     
     local arrived = false
     local epsilon = 5
