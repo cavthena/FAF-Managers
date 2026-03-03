@@ -309,7 +309,7 @@ local SegmentDirectMinDistance = 10
 local SegmentDirectMaxRatio    = 1.2
 local FirebaseSafeRadius       = 40
 local FirebaseStructureRadius  = 4
-local RoutingDebug             = false
+local RoutingDebug             = true
 
 local ClampPathToPlayableArea
 local CanPathBetween
@@ -351,10 +351,9 @@ local function SafeWait(seconds)
     end
 end
 
-local function RoutingLog(...)
+local function RoutingLog(message, param1, param2, param3, param4, param5)
     if RoutingDebug and LOG then
-        local params = { ... }
-        LOG('[AttackRouting]', unpack(params))
+        LOG('[AttackRouting]', message, param1, param2, param3, param4, param5)
     end
 end
 
