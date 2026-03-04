@@ -1304,6 +1304,61 @@ local function BuildPathSegment(layer, startPos, destination)
     return nil
 end
 
+local function PositionInPlayableAreaBuffered(position, area, buffer)
+    if not (position and area) then
+        return true
+    end
+
+    if not buffer or buffer <= 0 then
+        return PositionInPlayableArea(position, area)
+    end
+
+    local clamped = ClampToPlayableArea(position, area, buffer)
+    return clamped
+        and math_abs(position[1] - clamped[1]) <= 0.1
+        and math_abs(position[3] - clamped[3]) <= 0.1
+end
+
+local function IsPathInsidePlayableArea(path, area, buffer)
+    if not area then
+        return true
+    end
+
+    if not (path and table_getn(path) > 0) then
+        return false
+    end
+
+    for _, node in ipairs(path) do
+        if node and not PositionInPlayableAreaBuffered(node, area, buffer) then
+            return false
+        end
+    end
+
+    return true
+end
+
+local function CanPathSegmentStayInPlayableArea(layer, startPos, destination, area, buffer)
+    if not (startPos and destination) then
+        return false
+    end
+
+    if not area then
+        return CanPathBetween(layer, startPos, destination)
+    end
+
+    if not PositionInPlayableAreaBuffered(startPos, area, buffer)
+        or not PositionInPlayableAreaBuffered(destination, area, buffer) then
+        return CanPathBetween(layer, startPos, destination)
+    end
+
+    local segmentPath = BuildPathSegment(layer, startPos, destination)
+    if not segmentPath then
+        return false
+    end
+
+    return IsPathInsidePlayableArea(segmentPath, area, buffer)
+end
+
 local function PathLength(path)
     if not (path and table_getn(path) >= 2) then
         return 0
@@ -2124,9 +2179,19 @@ local function MoveAlongPath(platoon, path, formation, aggressiveFinal, layer )
     local startPos = GetPlatoonPosition(platoon)
     local previous = startPos
     for index, waypoint in ipairs(path) do
-        if waypoint and previous and not CanPathBetween(movementLayer, previous, waypoint) then
-            RoutingLog('Rejected waypoint segment for layer', movementLayer, 'at index', index)
-            return false
+        if waypoint and previous then
+            if not CanPathBetween(movementLayer, previous, waypoint) then
+                RoutingLog('Rejected waypoint segment for layer', movementLayer, 'at index', index)
+                return false
+            end
+
+            if area
+                and PositionInPlayableAreaBuffered(previous, area, PlayableIngressBuffer)
+                and PositionInPlayableAreaBuffered(waypoint, area, PlayableIngressBuffer)
+                and not CanPathSegmentStayInPlayableArea(movementLayer, previous, waypoint, area, PlayableIngressBuffer) then
+                RoutingLog('Rejected out-of-bounds waypoint segment for layer', movementLayer, 'at index', index)
+                return false
+            end
         end
         previous = waypoint
     end
