@@ -259,6 +259,7 @@ local math_abs      = math.abs
 local math_min      = math.min
 local math_max      = math.max
 local math_floor    = math.floor
+local math_ceil     = math.ceil
 local math_atan2    = math.atan2 or math.atan
 local math_random   = math.random
 local math_cos      = math.cos
@@ -307,9 +308,12 @@ local CorridorDirections       = 8
 local CorridorSimplifyAngle    = 6
 local SegmentDirectMinDistance = 10
 local SegmentDirectMaxRatio    = 1.2
+local SegmentSampleStep        = 2
+local SegmentSampleMaxPerLeg   = 200
+local SegmentPathProbeDistance = 0.75
 local FirebaseSafeRadius       = 40
 local FirebaseStructureRadius  = 4
-local RoutingDebug             = true
+local RoutingDebug             = false
 
 local ClampPathToPlayableArea
 local CanPathBetween
@@ -1359,6 +1363,110 @@ local function CanPathSegmentStayInPlayableArea(layer, startPos, destination, ar
     return IsPathInsidePlayableArea(segmentPath, area, buffer)
 end
 
+local function SegmentPointPathable(layer, point, dirX, dirZ)
+    if not point then
+        return false
+    end
+
+    if layer == 'Air' then
+        return true
+    end
+
+    local probeX, probeZ
+    if dirX and dirZ and (math_abs(dirX) > 0.001 or math_abs(dirZ) > 0.001) then
+        probeX = point[1] + dirX * SegmentPathProbeDistance
+        probeZ = point[3] + dirZ * SegmentPathProbeDistance
+    else
+        probeX = point[1] + SegmentPathProbeDistance
+        probeZ = point[3]
+    end
+
+    local probe = {
+        probeX,
+        AmphibiousSurfaceHeight(layer, probeX, probeZ),
+        probeZ,
+    }
+
+    return CanPathBetween(layer, point, probe)
+end
+
+local function SegmentCrossesImpassable(layer, navPath)
+    if layer == 'Air' then
+        return false
+    end
+
+    if not (navPath and table_getn(navPath) >= 2) then
+        return true
+    end
+
+    for i = 2, table_getn(navPath) do
+        local a = navPath[i - 1]
+        local b = navPath[i]
+        if a and b then
+            local dx = b[1] - a[1]
+            local dz = b[3] - a[3]
+            local legLength = math_sqrt(dx * dx + dz * dz)
+            if legLength > 0.001 then
+                local dirX = dx / legLength
+                local dirZ = dz / legLength
+                local steps = math_min(SegmentSampleMaxPerLeg, math_max(1, math_ceil(legLength / SegmentSampleStep)))
+                for step = 0, steps do
+                    local t = step / steps
+                    local x = a[1] + dx * t
+                    local z = a[3] + dz * t
+                    local sample = { x, AmphibiousSurfaceHeight(layer, x, z), z }
+                    if not SegmentPointPathable(layer, sample, dirX, dirZ) then
+                        return true
+                    end
+                end
+            elseif not SegmentPointPathable(layer, a, 1, 0) then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+local function SegmentIsSafe(layer, startPos, destination, area, buffer)
+    if not (startPos and destination) then
+        return false
+    end
+
+    if not CanPathBetween(layer, startPos, destination) then
+        return false
+    end
+
+    if not area then
+        return true
+    end
+
+    local startInside = PositionInPlayableAreaBuffered(startPos, area, buffer)
+    local endInside = PositionInPlayableAreaBuffered(destination, area, buffer)
+    if not (startInside and endInside) then
+        -- Preserve existing ingress behavior if either endpoint sits outside playable bounds.
+        return true
+    end
+
+    local segmentPath = BuildPathSegment(layer, startPos, destination)
+    if not segmentPath then
+        return false
+    end
+
+    local fullPath = { CopyVector(startPos) }
+    for _, node in ipairs(segmentPath) do
+        if node then
+            table_insert(fullPath, CopyVector(node))
+        end
+    end
+
+    if not IsPathInsidePlayableArea(fullPath, area, buffer) then
+        return false
+    end
+
+    return not SegmentCrossesImpassable(layer, fullPath)
+end
+
 local function PathLength(path)
     if not (path and table_getn(path) >= 2) then
         return 0
@@ -1872,7 +1980,7 @@ local function ApplyCorridorCentering(path, layer, startPos, destination, opts)
     return path
 end
 
-local function TryAdjustWaypoint(layer, waypoint, prevPoint, nextPoint)
+local function TryAdjustWaypoint(layer, waypoint, prevPoint, nextPoint, area, buffer)
     if not waypoint then
         return nil
     end
@@ -1897,8 +2005,8 @@ local function TryAdjustWaypoint(layer, waypoint, prevPoint, nextPoint)
                 waypoint[3],
             }
 
-            if (not prevPoint or CanPathBetween(layer, prevPoint, candidate)) and
-               (not nextPoint or CanPathBetween(layer, candidate, nextPoint)) then
+            if (not prevPoint or SegmentIsSafe(layer, prevPoint, candidate, area, buffer)) and
+               (not nextPoint or SegmentIsSafe(layer, candidate, nextPoint, area, buffer)) then
                 return candidate
             end
         else
@@ -1911,8 +2019,8 @@ local function TryAdjustWaypoint(layer, waypoint, prevPoint, nextPoint)
                     testZ,
                 }
 
-                if (not prevPoint or CanPathBetween(layer, prevPoint, candidate)) and
-                   (not nextPoint or CanPathBetween(layer, candidate, nextPoint)) then
+                if (not prevPoint or SegmentIsSafe(layer, prevPoint, candidate, area, buffer)) and
+                   (not nextPoint or SegmentIsSafe(layer, candidate, nextPoint, area, buffer)) then
                     return candidate
                 end
             end
@@ -1929,6 +2037,8 @@ local function SanitizePathWaypoints(path, layer, startPos, destination)
 
     local sanitized = {}
     local fallbackStart = startPos or path[1]
+    local area = GetPlayableArea()
+    local buffer = PlayableIngressBuffer
 
     for i = 1, table_getn(path) do
         local prevPoint = sanitized[table_getn(sanitized)] or fallbackStart
@@ -1937,17 +2047,17 @@ local function SanitizePathWaypoints(path, layer, startPos, destination)
             nextPoint = nil
         end
 
-        local adjusted = TryAdjustWaypoint(layer, path[i], prevPoint, nextPoint)
+        local adjusted = TryAdjustWaypoint(layer, path[i], prevPoint, nextPoint, area, buffer)
         if adjusted then
             table_insert(sanitized, adjusted)
-        elseif nextPoint and prevPoint and CanPathBetween(layer, prevPoint, nextPoint) then
+        elseif nextPoint and prevPoint and SegmentIsSafe(layer, prevPoint, nextPoint, area, buffer) then
             -- Skip waypoints that are trapped if we can directly connect around them.
         elseif i == table_getn(path) and prevPoint and destination then
-            local fallback = TryAdjustWaypoint(layer, destination, prevPoint, nil)
+            local fallback = TryAdjustWaypoint(layer, destination, prevPoint, nil, area, buffer)
             if fallback then
                 table_insert(sanitized, fallback)
             end
-        elseif path[i] and prevPoint and CanPathBetween(layer, prevPoint, path[i]) then
+        elseif path[i] and prevPoint and SegmentIsSafe(layer, prevPoint, path[i], area, buffer) then
             table_insert(sanitized, CopyVector(path[i]))
         end
     end
@@ -2180,16 +2290,8 @@ local function MoveAlongPath(platoon, path, formation, aggressiveFinal, layer )
     local previous = startPos
     for index, waypoint in ipairs(path) do
         if waypoint and previous then
-            if not CanPathBetween(movementLayer, previous, waypoint) then
+            if not SegmentIsSafe(movementLayer, previous, waypoint, area, PlayableIngressBuffer) then
                 RoutingLog('Rejected waypoint segment for layer', movementLayer, 'at index', index)
-                return false
-            end
-
-            if area
-                and PositionInPlayableAreaBuffered(previous, area, PlayableIngressBuffer)
-                and PositionInPlayableAreaBuffered(waypoint, area, PlayableIngressBuffer)
-                and not CanPathSegmentStayInPlayableArea(movementLayer, previous, waypoint, area, PlayableIngressBuffer) then
-                RoutingLog('Rejected out-of-bounds waypoint segment for layer', movementLayer, 'at index', index)
                 return false
             end
         end
