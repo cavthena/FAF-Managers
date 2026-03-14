@@ -140,6 +140,11 @@ Universal parameters
         Amphibious  (boolean, default = false)
             Treat both land and water as passable terrain when routing.
 
+        AggressiveMove (boolean, default = false)
+            Route using aggressive move orders instead of normal move orders.
+            Supported by WaveAttack, RaidAttack, and HuntAttack. Always enabled
+            for AreaPatrol and DefensePatrol.
+
 WaveAttack specifics
         Type (string, default = 'closest')
             Determines how targets are prioritised: 'closest', 'cluster', or
@@ -151,6 +156,8 @@ WaveAttack specifics
         RandomizeRoute (boolean, default = false)
             Chooses from multiple distinct valid corridors (including flank
             routes) instead of always taking the shortest route.
+        AggressiveMove (boolean, default = false)
+            Optional. Uses aggressive move while routing to each target area.
 
 RaidAttack specifics
         Category (string, default = 'ECO')
@@ -160,6 +167,8 @@ RaidAttack specifics
         RandomizeRoute (boolean, default = false)
             Chooses from multiple distinct valid corridors (including flank
             routes) instead of always taking the shortest route.
+        AggressiveMove (boolean, default = false)
+            Optional. Uses aggressive move while routing to each target area.
 
 ScoutAttack specifics
         Designed for AIR platoons.  Each unit continuously receives move
@@ -168,6 +177,7 @@ ScoutAttack specifics
         hottest or coolest area on the threat map.
 
 AreaPatrol specifics
+        Always routes with aggressive move enabled.
         Patrols along a marker chain specified by `Chain`/`ChainName`. When
         `Continuous` is true the platoon loops from the first marker to the
         last and back to the first. When false, the patrol bounces back and
@@ -195,12 +205,15 @@ HuntAttack specifics
         closest matching unit, travelling through safe paths and refusing to
         switch targets until the victim is destroyed or intel contact is lost.
         When `IntelOnly` is true the target must be scouted or have an existing
-        blip.  Setting `Vulnerable` forces the platoon to avoid defended
+        blip. `AggressiveMove` is optional (default false) and applies to
+        routing while tracking the target. Setting `Vulnerable` forces the
+        platoon to avoid defended
         targets, waiting for them to leave the threat ring or switching if
         another safe target exists.  If no targets are available, the platoon
         idles at `Marker`/`IdleMarker` (air platoons orbit).
 
 DefensePatrol specifics
+        Always routes with aggressive move enabled.
         The platoon defends the specified base marker/position by patrolling a
         perimeter at `PatrolDistance`.  When enemy units enter
         `InterceptDistance` of the base, the platoon moves to intercept before
@@ -478,6 +491,11 @@ local function CopyOptions(data)
     opts.AvoidDef    = opts.AvoidDef    and true or false
     opts.Transport   = opts.Transport   and true or false
     opts.Amphibious  = opts.Amphibious  and true or false
+    local aggressiveMove = opts.AggressiveMove
+    if aggressiveMove == nil then
+        aggressiveMove = opts.Aggressive or opts.UseAggressiveMove
+    end
+    opts.AggressiveMove = aggressiveMove and true or false
     opts.RandomizeRoute = opts.RandomizeRoute and true or false
     opts.Formation   = ValidateFormation(opts.Formation)
     return opts
@@ -2255,7 +2273,7 @@ ClampPathToPlayableArea = function(path, buffer)
     return clamped
 end
 
-local function MoveAlongPath(platoon, path, formation, aggressiveFinal, layer )
+local function MoveAlongPath(platoon, path, formation, aggressiveFinal, layer, aggressiveRoute)
     if not (path and table_getn(path) > 0) then return false end
 
     local units = platoon:GetPlatoonUnits() or {}
@@ -2316,7 +2334,7 @@ local function MoveAlongPath(platoon, path, formation, aggressiveFinal, layer )
             if useFormation then
                 IssueFormMove(units, waypoint, formation, 0)
             else
-                if aggressiveFinal and isFinal then
+                if aggressiveRoute or (aggressiveFinal and isFinal) then
                     IssueAggressiveMove(units, waypoint)
                 else
                     IssueMove(units, waypoint)
@@ -2582,7 +2600,7 @@ local function AttackTargetArea(platoon, target, opts)
         path = ShortenPathForBombard(path, targetPos, bombardRange)
     end
 
-    local issued = MoveAlongPath(platoon, path, opts.Formation, false, layer)
+    local issued = MoveAlongPath(platoon, path, opts.Formation, false, layer, opts.AggressiveMove)
     if not issued then
         RoutingLog('Initial path issue failed; attempting repath')
         path = RecomputePathWithFallback(platoon, layer, targetPos, opts)
@@ -2604,7 +2622,7 @@ local function AttackTargetArea(platoon, target, opts)
             path = ShortenPathForBombard(path, targetPos, bombardRange)
         end
 
-        issued = MoveAlongPath(platoon, path, opts.Formation, false, layer)
+        issued = MoveAlongPath(platoon, path, opts.Formation, false, layer, opts.AggressiveMove)
         if not issued then
             return 'repath'
         end
@@ -3424,7 +3442,7 @@ local function TrackHuntTarget(platoon, targetInfo, opts, layer)
                     SafeWait(RecheckDelay)
                     skipIteration = true
                 else
-                    MoveAlongPath(platoon, path, opts.Formation, true)
+                    MoveAlongPath(platoon, path, opts.Formation, true, nil, opts.AggressiveMove)
                     lastCommandPos = CopyVector(unitPos)
                 end
             end
@@ -3472,6 +3490,7 @@ end
 
 function WaveAttack(platoon, data)
     local opts = CopyOptions(data)
+    opts.AggressiveMove = opts.AggressiveMove and true or false
     if not data or data.RandomizeRoute == nil then
         opts.RandomizeRoute = false
     end
@@ -3484,6 +3503,7 @@ end
 
 function RaidAttack(platoon, data)
     local opts = CopyOptions(data)
+    opts.AggressiveMove = opts.AggressiveMove and true or false
     if not data or data.RandomizeRoute == nil then
         opts.RandomizeRoute = false
     end
@@ -3533,6 +3553,7 @@ end
 
 function AreaPatrol(platoon, data)
     local opts = CopyOptions(data)
+    opts.AggressiveMove = true
     local layer = DetermineLayer(platoon, opts.Amphibious)
     if not layer then return end
 
@@ -3578,9 +3599,9 @@ function AreaPatrol(platoon, data)
 
             local path = FindSafePath(platoon, layer, destination, nil, opts)
             if path then
-                MoveAlongPath(platoon, path, opts.Formation, false)
+                MoveAlongPath(platoon, path, opts.Formation, false, nil, opts.AggressiveMove)
             else
-                MoveAlongPath(platoon, { destination }, opts.Formation, false)
+                MoveAlongPath(platoon, { destination }, opts.Formation, false, nil, opts.AggressiveMove)
             end
 
             local elapsed = 0
@@ -3727,6 +3748,7 @@ end
 
 function HuntAttack(platoon, data)
     local opts = CopyOptions(data)
+    opts.AggressiveMove = opts.AggressiveMove and true or false
     opts.Vulnerable = opts.Vulnerable and true or false
     local blueprintData = data and (data.Blueprints or data.Blueprint or data.TargetBlueprints or data.TargetBPs or data.TargetBP)
     opts.HuntSet = NormalizeBlueprintSet(blueprintData)
@@ -3786,6 +3808,7 @@ end
 
 function DefensePatrol(platoon, data)
     local opts = CopyOptions(data)
+    opts.AggressiveMove = true
     local brain = platoon:GetBrain()
     if not brain then return end
     local layer = DetermineLayer(platoon, opts.Amphibious)
@@ -3809,7 +3832,7 @@ function DefensePatrol(platoon, data)
             if targetPos then
                 local path = FindSafePath(platoon, layer, targetPos, nil, opts)
                 if path then
-                    MoveAlongPath(platoon, path, opts.Formation, true)
+                    MoveAlongPath(platoon, path, opts.Formation, true, nil, opts.AggressiveMove)
                 else
                     local units = platoon:GetPlatoonUnits() or {}
                     if table_getn(units) > 0 then

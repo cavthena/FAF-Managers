@@ -198,6 +198,15 @@ local function _safeCQ(u)
     return {}
 end
 
+local function _IsAcuOrScuEngineer(u, faction)
+    local bp = unitBpId(u)
+    if not bp then return false end
+    local map = EngBp[faction] or EngBp[1]
+    if bp == map.SCU then return true end
+    if bp == (ACUBp[faction] or ACUBp[1]) then return true end
+    return false
+end
+
 local M = {}
 M.__index = M
 
@@ -1659,6 +1668,132 @@ function M:_TickExp(u, id, now)
     end
 end
 
+function M:_FindBaseEnemyUnits()
+    if not (self.brain and self.basePos) then return {} end
+    local r = self.params.radius or 60
+    local enemies = self.brain:GetUnitsAroundPoint(categories.ALLUNITS, self.basePos, r, 'Enemy') or {}
+    local out = {}
+    local i = 1
+    while i <= table.getn(enemies) do
+        local enemy = enemies[i]
+        if enemy and (not enemy.Dead) then
+            table.insert(out, enemy)
+        end
+        i = i + 1
+    end
+    return out
+end
+
+local function _EngineerHealthRatio(u)
+    if not (u and u.GetHealth and u.GetMaxHealth) then return 1 end
+    local hp = u:GetHealth() or 0
+    local mx = u:GetMaxHealth() or 0
+    if mx <= 0 then return 1 end
+    return hp / mx
+end
+
+local function _RetreatFromEnemy(unitPos, enemyPos, fallbackPos, dist)
+    dist = dist or 25
+    if not unitPos then return fallbackPos end
+    local dx = 0
+    local dz = 0
+    if enemyPos then
+        dx = unitPos[1] - enemyPos[1]
+        dz = unitPos[3] - enemyPos[3]
+    elseif fallbackPos then
+        dx = unitPos[1] - fallbackPos[1]
+        dz = unitPos[3] - fallbackPos[3]
+    end
+    local len = math.sqrt((dx * dx) + (dz * dz))
+    if len < 0.1 then
+        dx = (Random() * 2) - 1
+        dz = (Random() * 2) - 1
+        len = math.sqrt((dx * dx) + (dz * dz))
+    end
+    if len < 0.1 then
+        return { unitPos[1] + dist, unitPos[2], unitPos[3] }
+    end
+    local nx = dx / len
+    local nz = dz / len
+    return { unitPos[1] + (nx * dist), unitPos[2], unitPos[3] + (nz * dist) }
+end
+
+function M:_TickBaseDefense(u, id, enemies)
+    if not u or u.Dead then return false end
+    if not _IsAcuOrScuEngineer(u, self.faction) then
+        if self.baseDefenseTarget then
+            self.baseDefenseTarget[id] = nil
+        end
+        return false
+    end
+    if table.getn(enemies or {}) == 0 then
+        if self.baseDefenseTarget then
+            self.baseDefenseTarget[id] = nil
+        end
+        return false
+    end
+
+    local pos = u.GetPosition and u:GetPosition()
+    local best = nil
+    local bestDistSq = nil
+    local i = 1
+    while i <= table.getn(enemies) do
+        local enemy = enemies[i]
+        if enemy and (not enemy.Dead) then
+            local epos = enemy.GetPosition and enemy:GetPosition()
+            if pos and epos then
+                local dx = pos[1] - epos[1]
+                local dz = pos[3] - epos[3]
+                local d2 = (dx * dx) + (dz * dz)
+                if (not bestDistSq) or d2 < bestDistSq then
+                    bestDistSq = d2
+                    best = enemy
+                end
+            elseif not best then
+                best = enemy
+            end
+        end
+        i = i + 1
+    end
+
+    if not best then return false end
+
+    self.baseDefenseTarget = self.baseDefenseTarget or {}
+    local healthRatio = _EngineerHealthRatio(u)
+    if healthRatio <= 0.25 then
+        local enemyPos = best.GetPosition and best:GetPosition() or nil
+        local retreatPos = _RetreatFromEnemy(pos, enemyPos, self.basePos, 30)
+        local rx = math.floor(retreatPos[1] + 0.5)
+        local rz = math.floor(retreatPos[3] + 0.5)
+        local retreatKey = ('RETREAT:%d:%d'):format(rx, rz)
+        if self.baseDefenseTarget[id] ~= retreatKey then
+            IssueClearCommands({u})
+            IssueMove({u}, retreatPos)
+            self.baseDefenseTarget[id] = retreatKey
+        else
+            local q = _safeCQ(u)
+            if table.getn(q) == 0 then
+                IssueMove({u}, retreatPos)
+            end
+        end
+        return true
+    end
+
+    local targetId = best.GetEntityId and best:GetEntityId() or nil
+    if self.baseDefenseTarget[id] ~= targetId then
+        IssueClearCommands({u})
+        IssueAttack({u}, best)
+        self.baseDefenseTarget[id] = targetId
+    else
+        local q = _safeCQ(u)
+        if table.getn(q) == 0 then
+            IssueAttack({u}, best)
+        end
+    end
+
+    return true
+end
+
 function M:_ExpWatcher()
     while not self.stopped do
         if self.expState.active and self.expState.bp and self.expState.pos then
@@ -1707,6 +1842,7 @@ function M:TaskLoop()
     while not self.stopped do
         local now = GetGameTimeSeconds and GetGameTimeSeconds() or 0
         local all = self:_EnumerateEngineers()
+        local baseEnemies = self:_FindBaseEnemyUnits()
         local assistTargets = self:_FindAssistTargets() or {}
         local assistCount = table.getn(assistTargets)
         local buildTasks = self:_BuildTasks()
@@ -1953,15 +2089,17 @@ function M:TaskLoop()
         local distrib = {}
         for _, rec in ipairs(all) do
             local id, u = rec.id, rec.u
-            local t = self.engTask[id] or 'IDLE'
-            if t == 'BUILD' then
-                self:_TickBuild(u, id, now, buildAssignments[id])
-            elseif t == 'ASSIST' then
-                self:_TickAssist(u, id, now, assistTargets, distrib)
-            elseif t == 'EXP' then
-                self:_TickExp(u, id, now)
-            else
-                self:_TickIdle(u, id, now)
+            if not self:_TickBaseDefense(u, id, baseEnemies) then
+                local t = self.engTask[id] or 'IDLE'
+                if t == 'BUILD' then
+                    self:_TickBuild(u, id, now, buildAssignments[id])
+                elseif t == 'ASSIST' then
+                    self:_TickAssist(u, id, now, assistTargets, distrib)
+                elseif t == 'EXP' then
+                    self:_TickExp(u, id, now)
+                else
+                    self:_TickIdle(u, id, now)
+                end
             end
         end
 

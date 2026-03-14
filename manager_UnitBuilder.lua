@@ -308,12 +308,6 @@ local function scaledWanted(baseWanted, factor)
     return out
 end
 
-local function chainFirstPos(chainName)
-    local chain = chainName and ScenarioUtils.ChainToPositions(chainName)
-    if chain and chain[1] then return { chain[1][1], chain[1][2], chain[1][3] } end
-    return nil
-end
-
 local function markerPos(mark)
     return mark and ScenarioUtils.MarkerToPosition(mark) or nil
 end
