@@ -319,6 +319,8 @@ local CorridorMaxShiftPerPass  = 6
 local CorridorPasses           = 2
 local CorridorDirections       = 8
 local CorridorSimplifyAngle    = 6
+local RouteBacktrackMinDistanceSq = 16
+local RouteZigZagAngle          = 22
 local SegmentDirectMinDistance = 10
 local SegmentDirectMaxRatio    = 1.2
 local SegmentSampleStep        = 2
@@ -712,13 +714,71 @@ local function ComputeNearestEdgeIngress(startPos, area, buffer)
     return ingress, best.edge, best
 end
 
-local function BuildIngressCandidates(startPos, area, buffer)
-    local ingress, edge = ComputeNearestEdgeIngress(startPos, area, buffer)
-    if not ingress then
-        return {}, nil
+local function BuildIngressCandidates(startPos, area, buffer, destination)
+    local ingress, edge, edgeInfo = ComputeNearestEdgeIngress(startPos, area, buffer)
+    if not (ingress and area) then
+        return {}, edge
     end
 
-    return { ingress }, edge
+    local minX, minZ, maxX, maxZ = area[1], area[2], area[3], area[4]
+    local safeBuffer = math_max(buffer or 0, 4)
+
+    local function addCandidate(list, candidate)
+        if not candidate then
+            return
+        end
+        for _, existing in ipairs(list) do
+            if DistanceSq(existing, candidate) <= 4 then
+                return
+            end
+        end
+        table_insert(list, candidate)
+    end
+
+    local candidates = {}
+    addCandidate(candidates, ingress)
+
+    local sampleRatios = { 0.25, 0.5, 0.75 }
+    local inward = {
+        left = { 1, 0 },
+        right = { -1, 0 },
+        bottom = { 0, 1 },
+        top = { 0, -1 },
+    }
+
+    if edgeInfo and inward[edgeInfo.edge] then
+        local dir = inward[edgeInfo.edge]
+
+        if edgeInfo.edge == 'top' or edgeInfo.edge == 'bottom' then
+            for _, ratio in ipairs(sampleRatios) do
+                local x = minX + (maxX - minX) * ratio
+                local z = (edgeInfo.edge == 'top') and maxZ or minZ
+                local probe = ClampToPlayableArea({ x + dir[1] * safeBuffer, 0, z + dir[2] * safeBuffer }, area, safeBuffer)
+                addCandidate(candidates, probe)
+            end
+        else
+            for _, ratio in ipairs(sampleRatios) do
+                local x = (edgeInfo.edge == 'left') and minX or maxX
+                local z = minZ + (maxZ - minZ) * ratio
+                local probe = ClampToPlayableArea({ x + dir[1] * safeBuffer, 0, z + dir[2] * safeBuffer }, area, safeBuffer)
+                addCandidate(candidates, probe)
+            end
+        end
+
+        if destination then
+            local projected = nil
+            if edgeInfo.edge == 'top' or edgeInfo.edge == 'bottom' then
+                local z = (edgeInfo.edge == 'top') and maxZ or minZ
+                projected = ClampToPlayableArea({ destination[1] + dir[1] * safeBuffer, 0, z + dir[2] * safeBuffer }, area, safeBuffer)
+            else
+                local x = (edgeInfo.edge == 'left') and minX or maxX
+                projected = ClampToPlayableArea({ x + dir[1] * safeBuffer, 0, destination[3] + dir[2] * safeBuffer }, area, safeBuffer)
+            end
+            addCandidate(candidates, projected)
+        end
+    end
+
+    return candidates, edge
 end
 
 local function ClosestReachableIngress(startPos, area, layer)
@@ -1920,53 +1980,39 @@ local function ApplyCorridorCentering(path, layer, startPos, destination, opts)
         return path
     end
 
-    local cumulative = {}
-    local total = 0
-    local prev = startPos
-    for i = 1, table_getn(path) do
-        local point = path[i]
-        if prev and point then
-            total = total + Distance(prev, point)
-        end
-        cumulative[i] = total
-        prev = point
-    end
-
     for _ = 1, CorridorPasses do
         for i = 2, table_getn(path) - 1 do
-            if cumulative[i] <= CorridorNearDistance then
-                local prevPoint = path[i - 1]
-                local current = path[i]
-                local nextPoint = path[i + 1]
-                if prevPoint and current and nextPoint then
-                    local clearance, pushDir = GetClearanceEstimate(layer, current)
-                    if pushDir and clearance < CorridorDesiredClearance then
-                        local pushAmount = math_min(CorridorMaxShiftPerPass, CorridorDesiredClearance - clearance)
-                        local attemptAmounts = { pushAmount, pushAmount * 0.5, pushAmount * 0.25 }
-                        local accepted = false
+            local prevPoint = path[i - 1]
+            local current = path[i]
+            local nextPoint = path[i + 1]
+            if prevPoint and current and nextPoint then
+                local clearance, pushDir = GetClearanceEstimate(layer, current)
+                if pushDir and clearance < CorridorDesiredClearance then
+                    local pushAmount = math_min(CorridorMaxShiftPerPass, CorridorDesiredClearance - clearance)
+                    local attemptAmounts = { pushAmount, pushAmount * 0.5, pushAmount * 0.25 }
+                    local accepted = false
 
-                        for _, amount in ipairs(attemptAmounts) do
-                            local newX = current[1] + pushDir[1] * amount
-                            local newZ = current[3] + pushDir[3] * amount
-                            local candidate = { newX, AmphibiousSurfaceHeight(layer, newX, newZ), newZ }
+                    for _, amount in ipairs(attemptAmounts) do
+                        local newX = current[1] + pushDir[1] * amount
+                        local newZ = current[3] + pushDir[3] * amount
+                        local candidate = { newX, AmphibiousSurfaceHeight(layer, newX, newZ), newZ }
 
-                            if ClampPathToPlayableArea then
-                                local clamped = ClampPathToPlayableArea({ candidate }, 0)
-                                if clamped and clamped[1] then
-                                    candidate = clamped[1]
-                                end
-                            end
-
-                            if IsDirectPathSegment(layer, prevPoint, candidate) and IsDirectPathSegment(layer, candidate, nextPoint) then
-                                path[i] = candidate
-                                accepted = true
-                                break
+                        if ClampPathToPlayableArea then
+                            local clamped = ClampPathToPlayableArea({ candidate }, 0)
+                            if clamped and clamped[1] then
+                                candidate = clamped[1]
                             end
                         end
 
-                        if not accepted then
-                            path[i] = current
+                        if IsDirectPathSegment(layer, prevPoint, candidate) and IsDirectPathSegment(layer, candidate, nextPoint) then
+                            path[i] = candidate
+                            accepted = true
+                            break
                         end
+                    end
+
+                    if not accepted then
+                        path[i] = current
                     end
                 end
             end
@@ -2087,6 +2133,69 @@ local function SanitizePathWaypoints(path, layer, startPos, destination)
     return sanitized
 end
 
+local function RemoveImmediateBacktracks(path, layer, startPos)
+    if not (path and startPos and table_getn(path) > 1) then
+        return path
+    end
+
+    local cleaned = {}
+    local prev = startPos
+    for index = 1, table_getn(path) do
+        local point = path[index]
+        local nextPoint = path[index + 1]
+        if point then
+            local stepX = point[1] - prev[1]
+            local stepZ = point[3] - prev[3]
+            local stepLenSq = stepX * stepX + stepZ * stepZ
+            local remove = false
+
+            if stepLenSq <= RouteBacktrackMinDistanceSq and nextPoint and CanPathBetween(layer, prev, nextPoint) then
+                remove = true
+            elseif nextPoint then
+                local toNextX = nextPoint[1] - prev[1]
+                local toNextZ = nextPoint[3] - prev[3]
+                local dot = stepX * toNextX + stepZ * toNextZ
+                if dot <= 0 and CanPathBetween(layer, prev, nextPoint) then
+                    remove = true
+                end
+            end
+
+            if not remove then
+                table_insert(cleaned, point)
+                prev = point
+            end
+        end
+    end
+
+    return (table_getn(cleaned) > 0) and cleaned or path
+end
+
+local function RemoveSafeZigZags(path, layer, startPos)
+    if not (path and table_getn(path) >= 3) then
+        return path
+    end
+
+    local cleaned = { CopyVector(path[1]) }
+    local cosThreshold = math_cos(RouteZigZagAngle * math_pi / 180)
+    for i = 2, table_getn(path) - 1 do
+        local a = cleaned[table_getn(cleaned)] or startPos
+        local b = path[i]
+        local c = path[i + 1]
+        if a and b and c then
+            local abX, abZ = Normalize2D(b[1] - a[1], b[3] - a[3])
+            local bcX, bcZ = Normalize2D(c[1] - b[1], c[3] - b[3])
+            local dot = abX * bcX + abZ * bcZ
+            if dot >= cosThreshold and CanPathBetween(layer, a, c) then
+                -- Skip a near-straight intermediate waypoint.
+            else
+                table_insert(cleaned, CopyVector(b))
+            end
+        end
+    end
+    table_insert(cleaned, CopyVector(path[table_getn(path)]))
+    return cleaned
+end
+
 local function FindSafePath(platoon, layer, destination, startOverride, opts)
     opts = opts or {}
 
@@ -2109,13 +2218,16 @@ local function FindSafePath(platoon, layer, destination, startOverride, opts)
         path = alternate
     end
 
+    -- Full-route refinement stage: keep waypoints valid while improving
+    -- corridor clearance and removing unstable early corrections.
     if opts.CorridorCentering == false then
         path = ApplyPathClearance(path, layer)
     else
         path = ApplyCorridorCentering(path, layer, startPos, destination, opts)
     end
-
     path = SanitizePathWaypoints(path, layer, startPos, destination)
+    path = RemoveImmediateBacktracks(path, layer, startPos)
+    path = RemoveSafeZigZags(path, layer, startPos)
     return ClampPathToPlayableArea(path, PlayableIngressBuffer)
 end
 
@@ -2432,20 +2544,41 @@ local function MoveToIngress(platoon, layer, ingress, formation)
     return false
 end
 
-local function MoveToNearestPlayableIngress(platoon, layer, area, formation)
+local function MoveToNearestPlayableIngress(platoon, layer, area, formation, destination)
     local startPos = GetPlatoonPosition(platoon)
     if not (startPos and area) then
         return false, nil
     end
 
-    local candidates = BuildIngressCandidates(startPos, area, PlayableIngressBuffer)
-    local candidate = candidates[1]
-    if not candidate then
+    local candidates = BuildIngressCandidates(startPos, area, PlayableIngressBuffer, destination)
+    if table_getn(candidates) == 0 then
         return false, nil
     end
 
-    if layer ~= 'Air' and not CanPathBetween(layer, startPos, candidate) then
-        return false, candidate
+    local candidate = nil
+    local bestScore = math_huge
+    for _, ingress in ipairs(candidates) do
+        local canReachIngress = (layer == 'Air') or CanPathBetween(layer, startPos, ingress)
+        if canReachIngress then
+            local score = Distance(startPos, ingress)
+            if destination then
+                local routeToTarget = BuildPathSegment(layer, ingress, destination)
+                if routeToTarget then
+                    score = score + PathLength(routeToTarget)
+                else
+                    score = score + Distance(ingress, destination) * 3
+                end
+            end
+
+            if score < bestScore then
+                bestScore = score
+                candidate = ingress
+            end
+        end
+    end
+
+    if not candidate then
+        return false, candidates[1]
     end
 
     if MoveToIngress(platoon, layer, candidate, formation) then
@@ -2519,7 +2652,7 @@ local function AttackTargetArea(platoon, target, opts)
     local ingress = nil
     if startedOutside then
         local ingressReached
-        ingressReached, ingress = MoveToNearestPlayableIngress(platoon, layer, area, opts.Formation)
+        ingressReached, ingress = MoveToNearestPlayableIngress(platoon, layer, area, opts.Formation, targetPos)
         if not ingressReached then
             return 'repath'
         end
@@ -2573,23 +2706,6 @@ local function AttackTargetArea(platoon, target, opts)
         end
     elseif not path then
         path = FindSafePath(platoon, layer, targetPos, nil, opts)
-    end
-
-    local canPath = CanPathTo(platoon, layer, target.position)
-    if not canPath and ingress then
-        canPath = CanPathBetween(layer, ingress, target.position)
-    end
-    if not canPath then
-        if opts.Transport then
-            if not TransportAndMove(platoon, target.position, opts) then
-                return 'fail'
-            end
-            path = FindSafePath(platoon, layer, target.position, nil, opts)
-        else
-            return 'fail'
-        end
-    elseif not path then
-        path = FindSafePath(platoon, layer, target.position, nil, opts)
     end
 
     if not path then
@@ -2678,10 +2794,14 @@ local function AttackTargetArea(platoon, target, opts)
     if opts.Bombard and bombardRange then
         platoon:SetPlatoonFormationOverride(formation)
         -- Hold position and engage at range
-    elseif formation ~= 'NoFormation' then
-        platoon:SetPlatoonFormationOverride(formation)
-        IssueFormMove(units, targetPos, formation, 0)
     else
+        -- Final assault stage: always transition into combat movement so platoons
+        -- push through the approach ring instead of idling at the perimeter.
+        if formation ~= 'NoFormation' then
+            platoon:SetPlatoonFormationOverride(formation)
+        else
+            platoon:SetPlatoonFormationOverride('NoFormation')
+        end
         local finalAggressive = target and target.finalAggressiveMove
         if finalAggressive == nil then
             finalAggressive = true
