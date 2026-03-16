@@ -262,24 +262,24 @@ local function ResolveBaseManagerModule()
 end
 
 local BaseManager = ResolveBaseManagerModule()
-local GetTerrainHeight  = GetTerrainHeight
-local GetSurfaceHeight  = GetSurfaceHeight
-local table_getn    = table.getn
-local table_insert  = table.insert
-local table_remove  = table.remove
-local math_sqrt     = math.sqrt
-local math_abs      = math.abs
-local math_min      = math.min
-local math_max      = math.max
-local math_floor    = math.floor
-local math_ceil     = math.ceil
-local math_atan2    = math.atan2 or math.atan
-local math_random   = math.random
-local math_cos      = math.cos
-local math_sin      = math.sin
-local math_pi       = math.pi
-local math_huge     = math.huge or 1e9
-local math_mod      = math.mod or math.fmod
+GetTerrainHeight  = GetTerrainHeight
+GetSurfaceHeight  = GetSurfaceHeight
+table_getn    = table.getn
+table_insert  = table.insert
+table_remove  = table.remove
+math_sqrt     = math.sqrt
+math_abs      = math.abs
+math_min      = math.min
+math_max      = math.max
+math_floor    = math.floor
+math_ceil     = math.ceil
+math_atan2    = math.atan2 or math.atan
+math_random   = math.random
+math_cos      = math.cos
+math_sin      = math.sin
+math_pi       = math.pi
+math_huge     = math.huge or 1e9
+math_mod      = math.mod or math.fmod
 
 local RecheckDelay            = 60
 local ScoutRecheckDelay       = 1
