@@ -321,6 +321,8 @@ local CorridorDirections       = 8
 local CorridorSimplifyAngle    = 6
 local RouteBacktrackMinDistanceSq = 16
 local RouteZigZagAngle          = 22
+local RouteCornerRoundAngle     = 28
+local RouteCornerRoundRatio     = 0.28
 local SegmentDirectMinDistance = 10
 local SegmentDirectMaxRatio    = 1.2
 local SegmentSampleStep        = 2
@@ -1907,6 +1909,80 @@ local function ApplyPathClearance(path, layer)
     return widened
 end
 
+local function AppendIfDistinct(path, point)
+    if not (path and point) then
+        return
+    end
+
+    local count = table_getn(path)
+    if count > 0 and DistanceSq(path[count], point) < 1 then
+        return
+    end
+
+    table_insert(path, point)
+end
+
+local function BuildRoundedPath(path, layer)
+    if not (path and table_getn(path) >= 3) then
+        return path
+    end
+
+    local rounded = {}
+    AppendIfDistinct(rounded, CopyVector(path[1]))
+    local cosThreshold = math_cos(RouteCornerRoundAngle * math_pi / 180)
+
+    for i = 2, table_getn(path) - 1 do
+        local prev = path[i - 1]
+        local corner = path[i]
+        local nextPoint = path[i + 1]
+        if prev and corner and nextPoint then
+            local inX, inZ = Normalize2D(corner[1] - prev[1], corner[3] - prev[3])
+            local outX, outZ = Normalize2D(nextPoint[1] - corner[1], nextPoint[3] - corner[3])
+            local dot = inX * outX + inZ * outZ
+            local inLen = Distance(prev, corner)
+            local outLen = Distance(corner, nextPoint)
+            local radius = math_min(RouteClearanceOffset, inLen * RouteCornerRoundRatio, outLen * RouteCornerRoundRatio)
+
+            if dot < cosThreshold and radius > 1 then
+                local entryX = corner[1] - inX * radius
+                local entryZ = corner[3] - inZ * radius
+                local exitX = corner[1] + outX * radius
+                local exitZ = corner[3] + outZ * radius
+                local bisectorX, bisectorZ = Normalize2D(inX + outX, inZ + outZ)
+
+                local entry = { entryX, AmphibiousSurfaceHeight(layer, entryX, entryZ), entryZ }
+                local exit = { exitX, AmphibiousSurfaceHeight(layer, exitX, exitZ), exitZ }
+
+                if bisectorX ~= 0 or bisectorZ ~= 0 then
+                    local bulge = radius * 0.7
+                    local arcX = corner[1] - bisectorX * bulge
+                    local arcZ = corner[3] - bisectorZ * bulge
+                    local arc = { arcX, AmphibiousSurfaceHeight(layer, arcX, arcZ), arcZ }
+
+                    if IsDirectPathSegment(layer, prev, entry) and
+                       IsDirectPathSegment(layer, entry, arc) and
+                       IsDirectPathSegment(layer, arc, exit) and
+                       IsDirectPathSegment(layer, exit, nextPoint)
+                    then
+                        AppendIfDistinct(rounded, entry)
+                        AppendIfDistinct(rounded, arc)
+                        AppendIfDistinct(rounded, exit)
+                    else
+                        AppendIfDistinct(rounded, CopyVector(corner))
+                    end
+                else
+                    AppendIfDistinct(rounded, CopyVector(corner))
+                end
+            else
+                AppendIfDistinct(rounded, CopyVector(corner))
+            end
+        end
+    end
+
+    AppendIfDistinct(rounded, CopyVector(path[table_getn(path)]))
+    return rounded
+end
+
 local function Normalize2D(dx, dz)
     local len = math_sqrt(dx * dx + dz * dz)
     if len < 0.001 then
@@ -1976,6 +2052,7 @@ end
 
 local function ApplyCorridorCentering(path, layer, startPos, destination, opts)
     path = ApplyPathClearance(path, layer)
+    path = BuildRoundedPath(path, layer)
     if not (path and table_getn(path) >= 3) then
         return path
     end
@@ -2443,14 +2520,13 @@ local function MoveAlongPath(platoon, path, formation, aggressiveFinal, layer, a
     for index, waypoint in ipairs(path) do
         if not (lastIssued and DistanceSq(lastIssued, waypoint) < minPointSpacingSq) then
             local isFinal = index == count
-            if useFormation then
+            local isAggressive = aggressiveRoute or (aggressiveFinal and isFinal)
+            if isAggressive then
+                IssueAggressiveMove(units, waypoint)
+            elseif useFormation then
                 IssueFormMove(units, waypoint, formation, 0)
             else
-                if aggressiveRoute or (aggressiveFinal and isFinal) then
-                    IssueAggressiveMove(units, waypoint)
-                else
-                    IssueMove(units, waypoint)
-                end
+                IssueMove(units, waypoint)
             end
 
             lastIssued = waypoint
@@ -2458,6 +2534,50 @@ local function MoveAlongPath(platoon, path, formation, aggressiveFinal, layer, a
     end
 
     return true
+end
+
+local function RemoveIngressDoubleBack(path, layer, startPos, targetPos, ingressEdge)
+    if not (path and startPos and targetPos and ingressEdge and table_getn(path) > 1) then
+        return path
+    end
+
+    local inward = {
+        left = { 1, 0 },
+        right = { -1, 0 },
+        bottom = { 0, 1 },
+        top = { 0, -1 },
+    }
+
+    local entryDir = inward[ingressEdge]
+    if not entryDir then
+        return path
+    end
+
+    local prev = startPos
+    local index = 1
+    while index < table_getn(path) do
+        local point = path[index]
+        local nextPoint = path[index + 1]
+        if not (point and nextPoint) then
+            break
+        end
+
+        local stepX = point[1] - prev[1]
+        local stepZ = point[3] - prev[3]
+        local inwardDot = stepX * entryDir[1] + stepZ * entryDir[2]
+        if inwardDot >= -1 then
+            break
+        end
+
+        if CanPathBetween(layer, prev, nextPoint) then
+            table_remove(path, index)
+        else
+            prev = point
+            index = index + 1
+        end
+    end
+
+    return path
 end
 
 local function TrimInitialBacktrack(path, layer, startPos, targetPos)
@@ -2550,9 +2670,9 @@ local function MoveToNearestPlayableIngress(platoon, layer, area, formation, des
         return false, nil
     end
 
-    local candidates = BuildIngressCandidates(startPos, area, PlayableIngressBuffer, destination)
+    local candidates, ingressEdge = BuildIngressCandidates(startPos, area, PlayableIngressBuffer, destination)
     if table_getn(candidates) == 0 then
-        return false, nil
+        return false, nil, ingressEdge
     end
 
     local candidate = nil
@@ -2578,17 +2698,17 @@ local function MoveToNearestPlayableIngress(platoon, layer, area, formation, des
     end
 
     if not candidate then
-        return false, candidates[1]
+        return false, candidates[1], ingressEdge
     end
 
     if MoveToIngress(platoon, layer, candidate, formation) then
         local pos = GetPlatoonPosition(platoon)
         if PositionInPlayableArea(pos, area) then
-            return true, candidate
+            return true, candidate, ingressEdge
         end
     end
 
-    return false, candidate
+    return false, candidate, ingressEdge
 end
 
 local function TransportAndMove(platoon, destination, opts)
@@ -2651,8 +2771,8 @@ local function AttackTargetArea(platoon, target, opts)
     local path = nil
     local ingress = nil
     if startedOutside then
-        local ingressReached
-        ingressReached, ingress = MoveToNearestPlayableIngress(platoon, layer, area, opts.Formation, targetPos)
+        local ingressReached, ingress, ingressEdge
+        ingressReached, ingress, ingressEdge = MoveToNearestPlayableIngress(platoon, layer, area, opts.Formation, targetPos)
         if not ingressReached then
             return 'repath'
         end
@@ -2687,6 +2807,7 @@ local function AttackTargetArea(platoon, target, opts)
         end
 
         path = TrimInitialBacktrack(path, layer, routeStart, targetPos)
+        path = RemoveIngressDoubleBack(path, layer, routeStart, targetPos, ingressEdge)
     else
         path = FindSafePath(platoon, layer, targetPos, nil, opts)
     end
@@ -2746,6 +2867,7 @@ local function AttackTargetArea(platoon, target, opts)
     
     local arrived = false
     local epsilon = 5
+    local attackTransitionRadius = (target.radius or 0) + 40
     local units = platoon:GetPlatoonUnits() or {}
     local stuckSeconds = 0
     local lastPos = GetPlatoonPosition(platoon)
@@ -2754,6 +2876,9 @@ local function AttackTargetArea(platoon, target, opts)
         local pos = GetPlatoonPosition(platoon)
         if not pos then break end
         local arrivalRadius = target.radius + epsilon
+        if attackTransitionRadius > arrivalRadius then
+            arrivalRadius = attackTransitionRadius
+        end
         if bombardRange and bombardRange > arrivalRadius then
             arrivalRadius = bombardRange
         end
