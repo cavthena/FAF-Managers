@@ -2517,19 +2517,26 @@ local function MoveAlongPath(platoon, path, formation, aggressiveFinal, layer, a
     local minPointSpacingSq = 20 * 20
     local lastIssued = nil
     local count = table_getn(path)
+    local headingFrom = startPos
     for index, waypoint in ipairs(path) do
         if not (lastIssued and DistanceSq(lastIssued, waypoint) < minPointSpacingSq) then
+            local degrees = HeadingDegrees(headingFrom, waypoint)
             local isFinal = index == count
             local isAggressive = aggressiveRoute or (aggressiveFinal and isFinal)
             if isAggressive then
-                IssueAggressiveMove(units, waypoint)
+                if useFormation then
+                    IssueFormAggressiveMove(units, waypoint, formation, degrees)
+                else
+                    IssueAggressiveMove(units, waypoint)
+                end
             elseif useFormation then
-                IssueFormMove(units, waypoint, formation, 0)
+                IssueFormMove(units, waypoint, formation, degrees)
             else
                 IssueMove(units, waypoint)
             end
 
             lastIssued = waypoint
+            headingFrom = waypoint
         end
     end
 
@@ -2993,7 +3000,12 @@ local function AttackTargetArea(platoon, target, opts)
             finalAggressive = true
         end
         if finalAggressive then
-            IssueAggressiveMove(units, targetPos)
+            if formation ~= 'NoFormation' then
+                local approachDegrees = HeadingDegrees(GetPlatoonPosition(platoon), targetPos)
+                IssueFormAggressiveMove(units, targetPos, formation, approachDegrees)
+            else
+                IssueAggressiveMove(units, targetPos)
+            end
         else
             IssueMove(units, targetPos)
         end
@@ -4081,7 +4093,12 @@ function DefensePatrol(platoon, data)
                 else
                     local units = platoon:GetPlatoonUnits() or {}
                     if table_getn(units) > 0 then
-                        IssueAggressiveMove(units, targetPos)
+                        if opts.Formation and opts.Formation ~= 'NoFormation' then
+                            local interceptDegrees = HeadingDegrees(GetPlatoonPosition(platoon), targetPos)
+                            IssueFormAggressiveMove(units, targetPos, opts.Formation, interceptDegrees)
+                        else
+                            IssueAggressiveMove(units, targetPos)
+                        end
                     end
                 end
 
