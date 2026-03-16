@@ -1922,6 +1922,14 @@ local function AppendIfDistinct(path, point)
     table_insert(path, point)
 end
 
+local function Normalize2D(dx, dz)
+    local len = math_sqrt(dx * dx + dz * dz)
+    if len < 0.001 then
+        return 0, 0
+    end
+    return dx / len, dz / len
+end
+
 local function BuildRoundedPath(path, layer)
     if not (path and table_getn(path) >= 3) then
         return path
@@ -1981,14 +1989,6 @@ local function BuildRoundedPath(path, layer)
 
     AppendIfDistinct(rounded, CopyVector(path[table_getn(path)]))
     return rounded
-end
-
-local function Normalize2D(dx, dz)
-    local len = math_sqrt(dx * dx + dz * dz)
-    if len < 0.001 then
-        return 0, 0
-    end
-    return dx / len, dz / len
 end
 
 local function GetClearanceEstimate(layer, pos)
