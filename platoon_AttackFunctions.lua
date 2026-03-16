@@ -2739,6 +2739,67 @@ local function TransportAndMove(platoon, destination, opts)
     return false
 end
 
+local function UpdateStructureAttacks(platoon, target, opts, brain, enemyBrains, layer, issuedTargets)
+    local units = platoon:GetPlatoonUnits() or {}
+    if table_getn(units) == 0 then
+        return 'fail'
+    end
+
+    local category = target.category or StructureCategory
+    local combined = {}
+    if target.units then
+        for _, structure in ipairs(target.units) do
+            table_insert(combined, structure)
+        end
+    end
+
+    local restrictStructures = target and target.restrictStructures
+    if not restrictStructures then
+        local radius = (target.radius or 0) + AreaClearRadius
+        local areaUnits = AreaUnits(brain, enemyBrains, target.position, radius, category, opts.IntelOnly) or {}
+        for _, structure in ipairs(areaUnits) do
+            table_insert(combined, structure)
+        end
+    end
+
+    combined = FilterUnits(combined, layer, opts.Submersible)
+
+    local unique = {}
+    local remaining = {}
+    for _, structure in ipairs(combined) do
+        if structure and not structure.Dead then
+            local id = structure.EntityId
+            if id and not unique[id] then
+                unique[id] = true
+                table_insert(remaining, structure)
+            end
+        end
+    end
+
+    if table_getn(remaining) == 0 then
+        return 'success'
+    end
+
+    local newTargets = {}
+    for _, structure in ipairs(remaining) do
+        local id = structure.EntityId
+        if id and not issuedTargets[id] then
+            issuedTargets[id] = true
+            table_insert(newTargets, structure)
+        end
+    end
+
+    if table_getn(newTargets) > 0 then
+        for _, structure in ipairs(newTargets) do
+            if structure and not structure.Dead then
+                IssueAttack(units, structure)
+            end
+        end
+    end
+
+    return 'continue'
+end
+
 local function AttackTargetArea(platoon, target, opts)
     local brain = platoon:GetBrain()
     if not brain or not target or not target.position then
@@ -2940,75 +3001,14 @@ local function AttackTargetArea(platoon, target, opts)
 
     local issuedTargets = {}
     local enemyBrains = BrainEnemies(brain, opts.TargetArmy)
-    local function UpdateStructureAttacks()
-        units = platoon:GetPlatoonUnits() or {}
-        if table_getn(units) == 0 then
-            return 'fail'
-        end
-
-        local category = target.category or StructureCategory
-        local combined = {}
-        if target.units then
-            for _, structure in ipairs(target.units) do
-                table_insert(combined, structure)
-            end
-        end
-
-        local restrictStructures = target and target.restrictStructures
-        if not restrictStructures then
-            local radius = (target.radius or 0) + AreaClearRadius
-            local areaUnits = AreaUnits(brain, enemyBrains, target.position, radius, category, opts.IntelOnly) or {}
-            for _, structure in ipairs(areaUnits) do
-                table_insert(combined, structure)
-            end
-        end
-
-        combined = FilterUnits(combined, layer, opts.Submersible)
-
-        local unique = {}
-        local remaining = {}
-        for _, structure in ipairs(combined) do
-            if structure and not structure.Dead then
-                local id = structure.EntityId
-                if id and not unique[id] then
-                    unique[id] = true
-                    table_insert(remaining, structure)
-                end
-            end
-        end
-
-        if table_getn(remaining) == 0 then
-            return 'success'
-        end
-
-        local newTargets = {}
-        for _, structure in ipairs(remaining) do
-            local id = structure.EntityId
-            if id and not issuedTargets[id] then
-                issuedTargets[id] = true
-                table_insert(newTargets, structure)
-            end
-        end
-
-        if table_getn(newTargets) > 0 then
-            for _, structure in ipairs(newTargets) do
-                if structure and not structure.Dead then
-                    IssueAttack(units, structure)
-                end
-            end
-        end
-
-        return 'continue'
-    end
-
-    local attackState = UpdateStructureAttacks()
+    local attackState = UpdateStructureAttacks(platoon, target, opts, brain, enemyBrains, layer, issuedTargets)
     if attackState == 'fail' then
         return 'fail'
     end
 
     while PlatoonAlive(platoon) and attackState ~= 'success' do
         SafeWait(3)
-        attackState = UpdateStructureAttacks()
+        attackState = UpdateStructureAttacks(platoon, target, opts, brain, enemyBrains, layer, issuedTargets)
         if attackState == 'fail' then
             return 'fail'
         end
