@@ -223,7 +223,6 @@ DefensePatrol specifics
 
 local ScenarioFramework = import('/lua/ScenarioFramework.lua')
 local ScenarioUtils     = import('/lua/sim/ScenarioUtilities.lua')
-local NavUtils          = import('/lua/sim/NavUtils.lua')
 
 local function ResolveBaseManagerModule()
     local ok, info = pcall(debug.getinfo, 1, 'S')
@@ -262,24 +261,60 @@ local function ResolveBaseManagerModule()
 end
 
 local BaseManager = ResolveBaseManagerModule()
+
+local function ResolveRoutingModule()
+    local ok, info = pcall(debug.getinfo, 1, 'S')
+    if ok and info and info.source then
+        local src = info.source
+        if type(src) == 'string' and string.sub(src, 1, 1) == '@' then
+            local dir = string.match(src, '^@(.*/)[^/]*$')
+            if dir then
+                local path = dir .. 'platoon_Routing.lua'
+                local okImport, mod = pcall(import, path)
+                if okImport and mod then
+                    return mod
+                end
+            end
+        end
+    end
+
+    if ScenarioInfo and ScenarioInfo.MapPath then
+        local mp = ScenarioInfo.MapPath
+        if type(mp) == 'string' then
+            local dir = string.match(mp, '^(.-)/[^/]*$') or mp
+            if dir then
+                if string.sub(dir, 1, 1) ~= '/' then
+                    dir = '/' .. dir
+                end
+                local path = dir .. '/platoon_Routing.lua'
+                local okImport, mod = pcall(import, path)
+                if okImport and mod then
+                    return mod
+                end
+            end
+        end
+    end
+
+    return import('/maps/faf_coop_U01.v0001/platoon_Routing.lua')
+end
+
+local Routing = ResolveRoutingModule()
 GetTerrainHeight  = GetTerrainHeight
 GetSurfaceHeight  = GetSurfaceHeight
-table_getn    = table.getn
-table_insert  = table.insert
-table_remove  = table.remove
-math_sqrt     = math.sqrt
-math_abs      = math.abs
-math_min      = math.min
-math_max      = math.max
-math_floor    = math.floor
-math_ceil     = math.ceil
-math_atan2    = math.atan2 or math.atan
-math_random   = math.random
-math_cos      = math.cos
-math_sin      = math.sin
-math_pi       = math.pi
-math_huge     = math.huge or 1e9
-math_mod      = math.mod or math.fmod
+
+local function HeadingDegrees(a, b)
+    if not (a and b) then
+        return 0
+    end
+
+    local dx = (b[1] or 0) - (a[1] or 0)
+    local dz = (b[3] or 0) - (a[3] or 0)
+    if math.abs(dx) < 0.001 and math.abs(dz) < 0.001 then
+        return 0
+    end
+
+    return math.deg((math.atan2 or math.atan)(dz, dx))
+end
 
 local RecheckDelay            = 60
 local ScoutRecheckDelay       = 1
@@ -401,7 +436,7 @@ local function PlatoonAlive(platoon)
     if not brain then return false end
     if not brain:PlatoonExists(platoon) then return false end
     local units = platoon:GetPlatoonUnits()
-    return (units and table_getn(units) > 0)
+    return (units and table.getn(units) > 0)
 end
 
 local function CopyVector(vec)
@@ -420,7 +455,7 @@ local function DistanceSq(a, b)
 end
 
 local function Distance(a, b)
-    return math_sqrt(DistanceSq(a, b))
+    return math.sqrt(DistanceSq(a, b))
 end
 
 local function PrependWaypoint(path, waypoint)
@@ -429,21 +464,21 @@ local function PrependWaypoint(path, waypoint)
     end
 
     path = path or {}
-    local count = table_getn(path)
+    local count = table.getn(path)
 
     if count == 0 then
-        table_insert(path, CopyVector(waypoint))
+        table.insert(path, CopyVector(waypoint))
         return path
     end
 
     local first = path[1]
     if not first then
-        table_insert(path, 1, CopyVector(waypoint))
+        table.insert(path, 1, CopyVector(waypoint))
         return path
     end
 
     if DistanceSq(first, waypoint) > 1 then
-        table_insert(path, 1, CopyVector(waypoint))
+        table.insert(path, 1, CopyVector(waypoint))
     end
 
     return path
@@ -568,8 +603,8 @@ local function ClampToPlayableArea(position, area, buffer)
         maxZ = mid
     end
 
-    local x = math_min(math_max(position[1], minX), maxX)
-    local z = math_min(math_max(position[3], minZ), maxZ)
+    local x = math.min(math.max(position[1], minX), maxX)
+    local z = math.min(math.max(position[3], minZ), maxZ)
     local y = GetSurfaceHeight(x, z)
 
     return { x, y, z }
@@ -577,14 +612,14 @@ end
 
 local function DistanceToPlayableEdge(position, area)
     if not (position and area) then
-        return math_huge
+        return (math.huge or 1e9)
     end
 
     local left = position[1] - area[1]
     local right = area[3] - position[1]
     local bottom = position[3] - area[2]
     local top = area[4] - position[3]
-    return math_min(math_min(left, right), math_min(bottom, top))
+    return math.min(math.min(left, right), math.min(bottom, top))
 end
 
 local function Midpoint(a, b)
@@ -624,7 +659,7 @@ local function SegmentPlayableIngress(outside, inside, area)
     if PlayableIngressBuffer > 0 then
         local dirX = entry[1] - exit[1]
         local dirZ = entry[3] - exit[3]
-        local len = math_sqrt(dirX * dirX + dirZ * dirZ)
+        local len = math.sqrt(dirX * dirX + dirZ * dirZ)
         if len > 0 then
             local scale = PlayableIngressBuffer / len
             entryPoint[1] = entryPoint[1] + dirX * scale
@@ -643,7 +678,7 @@ local function ComputeNearestEdgeIngress(startPos, area, buffer)
     end
 
     if PositionInPlayableArea(startPos, area) then
-        return ClampToPlayableArea(startPos, area, math_max(buffer or 0, 0)), nil, nil
+        return ClampToPlayableArea(startPos, area, math.max(buffer or 0, 0)), nil, nil
     end
 
     local minX, minZ, maxX, maxZ = area[1], area[2], area[3], area[4]
@@ -660,7 +695,7 @@ local function ComputeNearestEdgeIngress(startPos, area, buffer)
     }
 
     local best = nil
-    local bestT = math_huge
+    local bestT = (math.huge or 1e9)
     for _, ray in ipairs(cardinal) do
         local t = nil
         local hitX = nil
@@ -708,7 +743,7 @@ local function ComputeNearestEdgeIngress(startPos, area, buffer)
         return nil
     end
 
-    local safeBuffer = math_max(buffer or 0, 4)
+    local safeBuffer = math.max(buffer or 0, 4)
     local ingressX = best.x + (best.dx or 0) * safeBuffer
     local ingressZ = best.z + (best.dz or 0) * safeBuffer
 
@@ -723,7 +758,7 @@ local function BuildIngressCandidates(startPos, area, buffer, destination)
     end
 
     local minX, minZ, maxX, maxZ = area[1], area[2], area[3], area[4]
-    local safeBuffer = math_max(buffer or 0, 4)
+    local safeBuffer = math.max(buffer or 0, 4)
 
     local function addCandidate(list, candidate)
         if not candidate then
@@ -734,7 +769,7 @@ local function BuildIngressCandidates(startPos, area, buffer, destination)
                 return
             end
         end
-        table_insert(list, candidate)
+        table.insert(list, candidate)
     end
 
     local candidates = {}
@@ -799,7 +834,7 @@ local function NearestPlayablePointOnPath(startPos, path, area, layer)
 
     local entryPoint = ClosestReachableIngress(startPos, area, layer)
 
-    if path and table_getn(path) > 0 then
+    if path and table.getn(path) > 0 then
         -- Remove any waypoints that are still outside the playable area so we
         -- don't order the platoon to leave the map again after ingress.
         local firstInside = nil
@@ -812,16 +847,16 @@ local function NearestPlayablePointOnPath(startPos, path, area, layer)
 
         if firstInside then
             for _ = 1, firstInside - 1 do
-                table_remove(path, 1)
+                table.remove(path, 1)
             end
 
-            for i = table_getn(path), 1, -1 do
+            for i = table.getn(path), 1, -1 do
                 if not PositionInPlayableArea(path[i], area) then
                     path[i] = ClampToPlayableArea(path[i], area, PlayableIngressBuffer)
                 end
             end
         else
-            for i = table_getn(path), 1, -1 do
+            for i = table.getn(path), 1, -1 do
                 path[i] = nil
             end
         end
@@ -843,7 +878,7 @@ local function BrainEnemies(brain, targetArmy)
         if ab and idx ~= myIndex then
             local ok, isEnemy = pcall(IsEnemy, myIndex, idx)
             if ok and isEnemy then
-                table_insert(enemies, idx)
+                table.insert(enemies, idx)
             end
         end
     end
@@ -867,12 +902,12 @@ local function BrainEnemies(brain, targetArmy)
     for _, idx in ipairs(enemies) do
         local name = ArmyBrains[idx] and ArmyBrains[idx].Nickname
         if allow[idx] or (name and allow[name]) then
-            table_insert(filtered, idx)
+            table.insert(filtered, idx)
         end
     end
 
     -- fall back to all enemies if filter didn't match anything
-    return (table_getn(filtered) > 0) and filtered or enemies
+    return (table.getn(filtered) > 0) and filtered or enemies
 end
 
 
@@ -883,7 +918,7 @@ local function AreaUnits(brain, enemies, position, radius, category, intelOnly)
     -- Intel path: current behaviour (uses fog-of-war)
     if intelOnly then
         local list = brain:GetUnitsAroundPoint(category, position, radius, 'Enemy') or {}
-        if not enemies or table_getn(enemies) == 0 then
+        if not enemies or table.getn(enemies) == 0 then
             return list
         end
 
@@ -905,7 +940,7 @@ local function AreaUnits(brain, enemies, position, radius, category, intelOnly)
                     name = ub.Nickname
                 end
                 if (idx and allow[idx]) or (name and allow[name]) then
-                    table_insert(units, unit)
+                    table.insert(units, unit)
                 end
             end
         end
@@ -930,7 +965,7 @@ local function AreaUnits(brain, enemies, position, radius, category, intelOnly)
                         local dx = pos[1] - position[1]
                         local dz = pos[3] - position[3]
                         if dx * dx + dz * dz <= r2 then
-                            table_insert(units, unit)
+                            table.insert(units, unit)
                         end
                     end
                 end
@@ -966,15 +1001,15 @@ local function FilterUnits(units, layer, submersible)
     local out = {}
     for _, unit in ipairs(units) do
         if CanTargetUnit(layer, submersible, unit) then
-            table_insert(out, unit)
+            table.insert(out, unit)
         end
     end
     return out
 end
 
 local function ScoreStructureCluster(units, mode, distance)
-    if table_getn(units) == 0 then
-        return -math_huge
+    if table.getn(units) == 0 then
+        return -(math.huge or 1e9)
     end
     if mode == 'closest' then
         local dist = distance or 1
@@ -991,7 +1026,7 @@ local function ScoreStructureCluster(units, mode, distance)
         end
         return score
     else
-        return table_getn(units)
+        return table.getn(units)
     end
 end
 
@@ -1023,7 +1058,7 @@ local function FindThreatLocations(brain, startPos, layer)
         end
         if threat and threat > 0 and type(x) == 'number' and type(z) == 'number' then
             local pos = { x, GetSurfaceHeight(x, z), z }
-            table_insert(results, { pos = pos, threat = threat })
+            table.insert(results, { pos = pos, threat = threat })
         end
     end
     return results
@@ -1035,15 +1070,15 @@ local function FloodFillLocations(brain, startPos)
     local results = {}
     local size = ScenarioInfo and (ScenarioInfo.size or ScenarioInfo.MapSize) or { 512, 512 }
     local function key(pos)
-        return string.format('%d:%d', math_floor(pos[1] / FloodFillCell), math_floor(pos[3] / FloodFillCell))
+        return string.format('%d:%d', math.floor(pos[1] / FloodFillCell), math.floor(pos[3] / FloodFillCell))
     end
 
-    while table_getn(queue) > 0 do
-        local pos = table_remove(queue, 1)
+    while table.getn(queue) > 0 do
+        local pos = table.remove(queue, 1)
         local k = key(pos)
         if not visited[k] then
             visited[k] = true
-            table_insert(results, { pos = pos })
+            table.insert(results, { pos = pos })
             if Distance(startPos, pos) < FloodFillMaxRadius then
                 local offsets = {
                     { FloodFillCell, 0, 0 },
@@ -1053,10 +1088,10 @@ local function FloodFillLocations(brain, startPos)
                 }
                 for _, off in ipairs(offsets) do
                     local nextPos = VectorAdd(pos, off)
-                    nextPos[1] = math_min(math_max(nextPos[1], 0), size[1])
-                    nextPos[3] = math_min(math_max(nextPos[3], 0), size[2])
+                    nextPos[1] = math.min(math.max(nextPos[1], 0), size[1])
+                    nextPos[3] = math.min(math.max(nextPos[3], 0), size[2])
                     nextPos[2] = GetSurfaceHeight(nextPos[1], nextPos[3])
-                    table_insert(queue, nextPos)
+                    table.insert(queue, nextPos)
                 end
             end
         end
@@ -1090,7 +1125,7 @@ local function AdjustForAvoidance(brain, candidates, layer)
     table.sort(candidates, function(a, b)
         local ta = a.threat or 0
         local tb = b.threat or 0
-        if math_abs(ta - tb) < 0.001 then
+        if math.abs(ta - tb) < 0.001 then
             return (a.pos[1] + a.pos[3]) < (b.pos[1] + b.pos[3])
         end
         return ta < tb
@@ -1112,7 +1147,7 @@ local function LeastDefendedStructures(brain, layer, structures)
     end
 
     local scored = {}
-    local minThreat = math_huge
+    local minThreat = (math.huge or 1e9)
 
     for _, structure in ipairs(structures) do
         if structure and not structure.Dead then
@@ -1120,18 +1155,18 @@ local function LeastDefendedStructures(brain, layer, structures)
             if pos then
                 local threat = DefenseThreatNear(brain, pos, layer)
                 threat = tonumber(threat) or 0
-                minThreat = math_min(minThreat, threat)
-                table_insert(scored, { unit = structure, threat = threat })
+                minThreat = math.min(minThreat, threat)
+                table.insert(scored, { unit = structure, threat = threat })
             end
         end
     end
 
-    if table_getn(scored) == 0 then
+    if table.getn(scored) == 0 then
         return {}
     end
 
     table.sort(scored, function(a, b)
-        if math_abs(a.threat - b.threat) < 0.001 then
+        if math.abs(a.threat - b.threat) < 0.001 then
             return (a.unit.EntityId or 0) < (b.unit.EntityId or 0)
         end
         return a.threat < b.threat
@@ -1141,14 +1176,14 @@ local function LeastDefendedStructures(brain, layer, structures)
     local selected = {}
     for _, entry in ipairs(scored) do
         if entry.threat <= threshold then
-            table_insert(selected, entry.unit)
+            table.insert(selected, entry.unit)
         else
             break
         end
     end
 
-    if table_getn(selected) == 0 then
-        table_insert(selected, scored[1].unit)
+    if table.getn(selected) == 0 then
+        table.insert(selected, scored[1].unit)
     end
 
     return selected
@@ -1171,7 +1206,7 @@ local function ChooseBestArea(brain, platoon, opts, layer, areaRadius, mode, cat
         if pos then
             local units = AreaUnits(brain, enemies, pos, areaRadius, category, opts.IntelOnly)
             units = FilterUnits(units, layer, opts.Submersible)
-            if table_getn(units) > 0 then
+            if table.getn(units) > 0 then
                 if not opts.Transport and not CanPathTo(platoon, layer, pos) then
                     -- Skip unreachable areas so wave attacks don't repeatedly
                     -- retarget locations they cannot move toward.
@@ -1179,7 +1214,7 @@ local function ChooseBestArea(brain, platoon, opts, layer, areaRadius, mode, cat
                 end
             end
 
-            if table_getn(units) > 0 then
+            if table.getn(units) > 0 then
                 local distance = Distance(startPos, pos)
                 local score = ScoreStructureCluster(units, mode, distance)
                 if opts.AvoidDef then
@@ -1228,9 +1263,9 @@ local function FindRaidTarget(brain, platoon, opts, layer)
                             local cat = RaidCategories[label]
                             local units = AreaUnits(brain, enemies, pos, RaidAreaRadius, cat, opts.IntelOnly)
                             units = FilterUnits(units, layer, opts.Submersible)
-                            local count = table_getn(units)
+                            local count = table.getn(units)
                             if count > 0 then
-                                local score = count / math_max(1, threat + 1)
+                                local score = count / math.max(1, threat + 1)
                                 if score > localBestScore then
                                     localBestScore = score
                                     localBestCategory = cat
@@ -1241,7 +1276,7 @@ local function FindRaidTarget(brain, platoon, opts, layer)
                         if localBestCategory and localBestScore > bestScore then
                             bestScore = localBestScore
                             local selected = LeastDefendedStructures(brain, layer, localUnits)
-                            if table_getn(selected) > 0 then
+                            if table.getn(selected) > 0 then
                                 -- Move towards the least-defended structure instead of the area center
                                 local targetPos = pos
                                 if selected[1] and not selected[1].Dead then
@@ -1269,8 +1304,8 @@ local function FindRaidTarget(brain, platoon, opts, layer)
                     local candidates = CollectAdjustedCandidates(brain, startPos, opts, layer)
 
                     local best
-                    local bestThreat   = math_huge   -- lowest local defence wins
-                    local bestDistance = math_huge   -- tie-breaker: closer is better
+                    local bestThreat   = (math.huge or 1e9)   -- lowest local defence wins
+                    local bestDistance = (math.huge or 1e9)   -- tie-breaker: closer is better
                     local bestCount    = -1          -- secondary tie-breaker: more eco in that area
 
                     for _, entry in ipairs(candidates) do
@@ -1278,11 +1313,11 @@ local function FindRaidTarget(brain, platoon, opts, layer)
                         if pos then
                             local units = AreaUnits(brain, enemies, pos, RaidAreaRadius, category, opts.IntelOnly)
                             units = FilterUnits(units, layer, opts.Submersible)
-                            local count = table_getn(units)
+                            local count = table.getn(units)
                             if count > 0 then
                                 -- Find the least defended structure *in this area*
                                 local selected = LeastDefendedStructures(brain, layer, units)
-                                if table_getn(selected) > 0 then
+                                if table.getn(selected) > 0 then
                                     local structure = selected[1]
                                     if structure and not structure.Dead then
                                         local sPos        = structure:GetPosition()
@@ -1292,8 +1327,8 @@ local function FindRaidTarget(brain, platoon, opts, layer)
                                         -- Compare by threat, then by distance, then by how much eco is nearby
                                         local better =
                                             (localThreat < bestThreat - 0.001) or
-                                            (math_abs(localThreat - bestThreat) < 0.001 and distance < bestDistance - 0.1) or
-                                            (math_abs(localThreat - bestThreat) < 0.001 and math_abs(distance - bestDistance) < 0.1 and count > bestCount)
+                                            (math.abs(localThreat - bestThreat) < 0.001 and distance < bestDistance - 0.1) or
+                                            (math.abs(localThreat - bestThreat) < 0.001 and math.abs(distance - bestDistance) < 0.1 and count > bestCount)
 
                                         if better then
                                             bestThreat   = localThreat
@@ -1334,1388 +1369,56 @@ local function AmphibiousSurfaceHeight(layer, x, z)
 end
 
 CanPathTo = function(platoon, layer, destination)
-    local startPos = GetPlatoonPosition(platoon)
-    if not (startPos and destination) then
+    if not (Routing and Routing.CanPathTo) then
         return false
     end
-    local ok, can = pcall(NavUtils.CanPathTo, layer, startPos, destination)
-    if not ok then
-        return false
-    end
-    return can
+    return Routing.CanPathTo(platoon, layer, destination)
 end
 
 CanPathBetween = function(layer, a, b)
-    if not (a and b) then
+    if not (Routing and Routing.CanPathBetween) then
         return false
     end
-    local ok, can = pcall(NavUtils.CanPathTo, layer, a, b)
-    return ok and can
-end
-
-local function AppendDestination(path, destination, layer)
-    path = path or {}
-    if not destination then return path end
-    local function close(a, b) return DistanceSq(a, b) < 4 end -- ~2 units
-    if table.getn(path) == 0 then
-        table_insert(path, CopyVector(destination))
-        return path
-    end
-    local last = path[table_getn(path)]
-    if not close(last, destination) and (not layer or CanPathBetween(layer, last, destination)) then
-        table_insert(path, CopyVector(destination))
-    end
-    return path
+    return Routing.CanPathBetween(layer, a, b)
 end
 
 local function BuildPathSegment(layer, startPos, destination)
-    local area = GetPlayableArea()
-    if area then
-        startPos = ClampToPlayableArea(startPos, area, 0)
-        destination = ClampToPlayableArea(destination, area, 0)
-    end
-
-    local ok, path = pcall(NavUtils.PathTo, layer, startPos, destination)
-    if ok and path then
-        if table_getn(path) == 0 then
-            if CanPathBetween(layer, startPos, destination) then
-                return { CopyVector(destination) }
-            end
-            return nil
-        end
-        return AppendDestination(path, destination, layer)
-    end
-    return nil
-end
-
-local function PositionInPlayableAreaBuffered(position, area, buffer)
-    if not (position and area) then
-        return true
-    end
-
-    if not buffer or buffer <= 0 then
-        return PositionInPlayableArea(position, area)
-    end
-
-    local clamped = ClampToPlayableArea(position, area, buffer)
-    return clamped
-        and math_abs(position[1] - clamped[1]) <= 0.1
-        and math_abs(position[3] - clamped[3]) <= 0.1
-end
-
-local function IsPathInsidePlayableArea(path, area, buffer)
-    if not area then
-        return true
-    end
-
-    if not (path and table_getn(path) > 0) then
-        return false
-    end
-
-    for _, node in ipairs(path) do
-        if node and not PositionInPlayableAreaBuffered(node, area, buffer) then
-            return false
-        end
-    end
-
-    return true
-end
-
-local function CanPathSegmentStayInPlayableArea(layer, startPos, destination, area, buffer)
-    if not (startPos and destination) then
-        return false
-    end
-
-    if not area then
-        return CanPathBetween(layer, startPos, destination)
-    end
-
-    if not PositionInPlayableAreaBuffered(startPos, area, buffer)
-        or not PositionInPlayableAreaBuffered(destination, area, buffer) then
-        return CanPathBetween(layer, startPos, destination)
-    end
-
-    local segmentPath = BuildPathSegment(layer, startPos, destination)
-    if not segmentPath then
-        return false
-    end
-
-    return IsPathInsidePlayableArea(segmentPath, area, buffer)
-end
-
-local function SegmentPointPathable(layer, point, dirX, dirZ)
-    if not point then
-        return false
-    end
-
-    if layer == 'Air' then
-        return true
-    end
-
-    local probeX, probeZ
-    if dirX and dirZ and (math_abs(dirX) > 0.001 or math_abs(dirZ) > 0.001) then
-        probeX = point[1] + dirX * SegmentPathProbeDistance
-        probeZ = point[3] + dirZ * SegmentPathProbeDistance
-    else
-        probeX = point[1] + SegmentPathProbeDistance
-        probeZ = point[3]
-    end
-
-    local probe = {
-        probeX,
-        AmphibiousSurfaceHeight(layer, probeX, probeZ),
-        probeZ,
-    }
-
-    return CanPathBetween(layer, point, probe)
-end
-
-local function SegmentCrossesImpassable(layer, navPath)
-    if layer == 'Air' then
-        return false
-    end
-
-    if not (navPath and table_getn(navPath) >= 2) then
-        return true
-    end
-
-    for i = 2, table_getn(navPath) do
-        local a = navPath[i - 1]
-        local b = navPath[i]
-        if a and b then
-            local dx = b[1] - a[1]
-            local dz = b[3] - a[3]
-            local legLength = math_sqrt(dx * dx + dz * dz)
-            if legLength > 0.001 then
-                local dirX = dx / legLength
-                local dirZ = dz / legLength
-                local steps = math_min(SegmentSampleMaxPerLeg, math_max(1, math_ceil(legLength / SegmentSampleStep)))
-                for step = 0, steps do
-                    local t = step / steps
-                    local x = a[1] + dx * t
-                    local z = a[3] + dz * t
-                    local sample = { x, AmphibiousSurfaceHeight(layer, x, z), z }
-                    if not SegmentPointPathable(layer, sample, dirX, dirZ) then
-                        return true
-                    end
-                end
-            elseif not SegmentPointPathable(layer, a, 1, 0) then
-                return true
-            end
-        end
-    end
-
-    return false
-end
-
-local function SegmentIsSafe(layer, startPos, destination, area, buffer)
-    if not (startPos and destination) then
-        return false
-    end
-
-    if not CanPathBetween(layer, startPos, destination) then
-        return false
-    end
-
-    if not area then
-        return true
-    end
-
-    local startInside = PositionInPlayableAreaBuffered(startPos, area, buffer)
-    local endInside = PositionInPlayableAreaBuffered(destination, area, buffer)
-    if not (startInside and endInside) then
-        -- Preserve existing ingress behavior if either endpoint sits outside playable bounds.
-        return true
-    end
-
-    local segmentPath = BuildPathSegment(layer, startPos, destination)
-    if not segmentPath then
-        return false
-    end
-
-    local fullPath = { CopyVector(startPos) }
-    for _, node in ipairs(segmentPath) do
-        if node then
-            table_insert(fullPath, CopyVector(node))
-        end
-    end
-
-    if not IsPathInsidePlayableArea(fullPath, area, buffer) then
-        return false
-    end
-
-    return not SegmentCrossesImpassable(layer, fullPath)
-end
-
-local function PathLength(path)
-    if not (path and table_getn(path) >= 2) then
-        return 0
-    end
-    local total = 0
-    for i = 2, table_getn(path) do
-        local a = path[i - 1]
-        local b = path[i]
-        if a and b then
-            total = total + Distance(a, b)
-        end
-    end
-    return total
-end
-
-local function IsDirectPathSegment(layer, a, b)
-    if not (a and b) then
-        return false
-    end
-
-    local straight = Distance(a, b)
-    if straight <= SegmentDirectMinDistance then
-        return CanPathBetween(layer, a, b)
-    end
-
-    local path = BuildPathSegment(layer, a, b)
-    if not path then
-        return false
-    end
-
-    local navLength = PathLength(path)
-    if navLength <= 0 then
-        return false
-    end
-
-    return (navLength / straight) <= SegmentDirectMaxRatio
-end
-
-local function HeadingDegrees(a, b)
-    if not (a and b) then
-        return 0
-    end
-    local dx = b[1] - a[1]
-    local dz = b[3] - a[3]
-    if dx == 0 and dz == 0 then
-        return 0
-    end
-    return math_atan2(dz, dx) * 180 / math_pi
-end
-
-local function NormalizeDegrees(deg)
-    deg = math_mod(deg, 360)
-    if deg < 0 then
-        deg = deg + 360
-    end
-    return deg
-end
-
-local function AngleDifferenceDegrees(a, b)
-    local diff = math_abs(NormalizeDegrees(a) - NormalizeDegrees(b))
-    if diff > 180 then
-        diff = 360 - diff
-    end
-    return diff
-end
-
-local function FinalApproachHeading(path, startPos, destination)
-    if not destination then
+    if not (Routing and Routing.BuildPathSegment) then
         return nil
     end
-    local prev = startPos
-    if path and table_getn(path) >= 2 then
-        prev = path[table_getn(path) - 1]
-        destination = path[table_getn(path)] or destination
-    end
-    if not prev then
-        return nil
-    end
-    return HeadingDegrees(prev, destination)
-end
-
-local function PathThreatScore(brain, layer, path)
-    if not (brain and path) then
-        return 0
-    end
-    local maxThreat = 0
-    for _, waypoint in ipairs(path) do
-        maxThreat = math_max(maxThreat, DefenseThreatNear(brain, waypoint, layer))
-    end
-    return maxThreat
-end
-
-local function MergePathSegments(segments)
-    local merged = {}
-    if not segments then
-        return merged
-    end
-
-    for _, segment in ipairs(segments) do
-        if segment then
-            for _, waypoint in ipairs(segment) do
-                if waypoint then
-                    local last = merged[table_getn(merged)]
-                    if not (last and DistanceSq(last, waypoint) < 1) then
-                        table_insert(merged, CopyVector(waypoint))
-                    end
-                end
-            end
-        end
-    end
-
-    return merged
-end
-
-local function PathMaxSeparation(pathA, pathB)
-    if not (pathA and pathB) then
-        return 0
-    end
-
-    local maxSeparation = 0
-    for _, pointA in ipairs(pathA) do
-        local nearest = math_huge
-        for _, pointB in ipairs(pathB) do
-            local d = Distance(pointA, pointB)
-            if d < nearest then
-                nearest = d
-            end
-        end
-        if nearest > maxSeparation then
-            maxSeparation = nearest
-        end
-    end
-
-    return maxSeparation
-end
-
-local function BuildRouteAnchor(layer, startPos, destination)
-    local dx = destination[1] - startPos[1]
-    local dz = destination[3] - startPos[3]
-    local length = math_sqrt(dx * dx + dz * dz)
-    if length < 0.001 then
-        return nil
-    end
-    local forwardX = dx / length
-    local forwardZ = dz / length
-    local sideX = -forwardZ
-    local sideZ = forwardX
-
-    local progress = 0.3 + math_random() * 1.0
-    local sideSign = (math_random() < 0.5) and -1 or 1
-    local lateral = (0.35 + math_random() * 0.95) * length
-
-    local x = startPos[1] + forwardX * (length * progress) + sideX * lateral * sideSign
-    local z = startPos[3] + forwardZ * (length * progress) + sideZ * lateral * sideSign
-
-    local size = ScenarioInfo and (ScenarioInfo.size or ScenarioInfo.MapSize) or { 512, 512 }
-    x = math_min(math_max(x, 0), size[1])
-    z = math_min(math_max(z, 0), size[2])
-
-    return { x, AmphibiousSurfaceHeight(layer, x, z), z }
-end
-
-local function BuildDestinationFlankAnchor(layer, startPos, destination)
-    local dx = startPos[1] - destination[1]
-    local dz = startPos[3] - destination[3]
-    local length = math_sqrt(dx * dx + dz * dz)
-    if length < 0.001 then
-        return nil
-    end
-
-    local backAngle = math_atan2(dz, dx)
-    local sideOffset = (70 + math_random() * 95) * math_pi / 180
-    if math_random() < 0.5 then
-        sideOffset = -sideOffset
-    end
-
-    local radius = length * (0.4 + math_random() * 0.8)
-    local angle = backAngle + sideOffset
-    local x = destination[1] + math_cos(angle) * radius
-    local z = destination[3] + math_sin(angle) * radius
-
-    local size = ScenarioInfo and (ScenarioInfo.size or ScenarioInfo.MapSize) or { 512, 512 }
-    x = math_min(math_max(x, 0), size[1])
-    z = math_min(math_max(z, 0), size[2])
-
-    return { x, AmphibiousSurfaceHeight(layer, x, z), z }
-end
-
-local function SignedSideRatio(startPos, destination, point)
-    if not (startPos and destination and point) then
-        return 0
-    end
-
-    local vx = destination[1] - startPos[1]
-    local vz = destination[3] - startPos[3]
-    local length = math_sqrt(vx * vx + vz * vz)
-    if length < 0.001 then
-        return 0
-    end
-
-    local px = point[1] - startPos[1]
-    local pz = point[3] - startPos[3]
-    local cross = (vx * pz) - (vz * px)
-    return cross / (length * length)
-end
-
-local function IsRouteDistinct(candidate, existingRoutes, baselineLength)
-    local candidateLength = PathLength(candidate)
-    if candidateLength <= 0 then
-        return false
-    end
-    if baselineLength > 0 and (candidateLength / baselineLength) > RouteMaxLengthRatio then
-        return false
-    end
-
-    local minSeparation = math_max(RouteMinPathSeparation, baselineLength * RouteMinPathSeparationRatio)
-    local candidateHeading = FinalApproachHeading(candidate)
-    for _, route in ipairs(existingRoutes) do
-        local routeHeading = FinalApproachHeading(route)
-        local headingDiff = (candidateHeading and routeHeading) and AngleDifferenceDegrees(candidateHeading, routeHeading) or 0
-        local pathGap = math_max(PathMaxSeparation(candidate, route), PathMaxSeparation(route, candidate))
-        if headingDiff < RouteMinHeadingSeparation and pathGap < minSeparation then
-            return false
-        end
-    end
-
-    return true
-end
-
-local function TryAlternatePath(platoon, layer, startPos, destination, opts)
-    if not (opts and opts.RandomizeRoute) or opts._repathing then
-        return nil
-    end
-
-    local brain = platoon:GetBrain()
-    local baseline = BuildPathSegment(layer, startPos, destination)
-    if not baseline then
-        return nil
-    end
-
-    local baselineLength = PathLength(baseline)
-    if baselineLength <= 0 then
-        return nil
-    end
-
-    local baselineHeading = FinalApproachHeading(baseline, startPos, destination)
-    local routes = { baseline }
-    local candidates = {}
-
-    for _ = 1, RouteAlternateAttempts do
-        local anchor
-        if math_random() < 0.5 then
-            anchor = BuildRouteAnchor(layer, startPos, destination)
-        else
-            anchor = BuildDestinationFlankAnchor(layer, startPos, destination)
-        end
-
-        if anchor and CanPathBetween(layer, startPos, anchor) and CanPathBetween(layer, anchor, destination) then
-            local first = BuildPathSegment(layer, startPos, anchor)
-            local second = BuildPathSegment(layer, anchor, destination)
-            if first and second then
-                local candidate = MergePathSegments({ first, second })
-                if IsRouteDistinct(candidate, routes, baselineLength) then
-                    table_insert(routes, candidate)
-                    local candidateLength = PathLength(candidate)
-                    local lengthRatio = (baselineLength > 0) and (candidateLength / baselineLength) or 1
-                    local candidateHeading = FinalApproachHeading(candidate, startPos, destination)
-                    local headingDiff = (candidateHeading and baselineHeading) and AngleDifferenceDegrees(candidateHeading, baselineHeading) or 0
-                    local sideRatio = math_abs(SignedSideRatio(startPos, destination, anchor))
-                    local threat = opts.AvoidDef and PathThreatScore(brain, layer, candidate) or 0
-
-                    local score = headingDiff + (sideRatio * 130) - (lengthRatio * 18)
-                    if opts.AvoidDef then
-                        score = score - (threat * 0.65)
-                    end
-
-                    table_insert(candidates, {
-                        path = candidate,
-                        threat = threat,
-                        score = score,
-                        flank = sideRatio >= RouteMinFlankSideRatio,
-                    })
-                end
-            end
-        end
-    end
-
-    if table_getn(candidates) == 0 then
-        return nil
-    end
-
-    table.sort(candidates, function(a, b)
-        return a.score > b.score
-    end)
-
-    local flankCandidates = {}
-    for _, entry in ipairs(candidates) do
-        if entry.flank then
-            table_insert(flankCandidates, entry)
-        end
-    end
-
-    local pool = table_getn(flankCandidates) > 0 and flankCandidates or candidates
-    local top = math_max(1, math_floor(table_getn(pool) * 0.5))
-    local picked = pool[math_random(1, top)]
-    return picked and picked.path or nil
-end
-
-local function OffsetCorner(prev, corner, next, layer)
-    local inDx = corner[1] - prev[1]
-    local inDz = corner[3] - prev[3]
-    local outDx = next[1] - corner[1]
-    local outDz = next[3] - corner[3]
-
-    local inLen = math_sqrt(inDx * inDx + inDz * inDz)
-    local outLen = math_sqrt(outDx * outDx + outDz * outDz)
-    if inLen < 0.001 or outLen < 0.001 then
-        return CopyVector(corner)
-    end
-
-    local clamp = math_min(RouteClearanceOffset, inLen * 0.5, outLen * 0.5)
-    local sumX = (inDx / inLen) + (outDx / outLen)
-    local sumZ = (inDz / inLen) + (outDz / outLen)
-    local sumLen = math_sqrt(sumX * sumX + sumZ * sumZ)
-    if sumLen < 0.001 then
-        return CopyVector(corner)
-    end
-
-    local offsetX = sumX / sumLen * clamp
-    local offsetZ = sumZ / sumLen * clamp
-    local adjusted = {
-        corner[1] - offsetX,
-        AmphibiousSurfaceHeight(layer, corner[1] - offsetX, corner[3] - offsetZ),
-        corner[3] - offsetZ,
-    }
-
-    if IsDirectPathSegment(layer, prev, adjusted) and IsDirectPathSegment(layer, adjusted, next) then
-        return adjusted
-    end
-
-    return CopyVector(corner)
-end
-
-local function ApplyPathClearance(path, layer)
-    if not (path and table_getn(path) >= 3) then
-        return path
-    end
-
-    local widened = { CopyVector(path[1]) }
-    for i = 2, table_getn(path) - 1 do
-        local prev = widened[table_getn(widened)] or path[i - 1]
-        local corner = path[i]
-        local next = path[i + 1]
-        if prev and corner and next then
-            table_insert(widened, OffsetCorner(prev, corner, next, layer))
-        end
-    end
-
-    table_insert(widened, CopyVector(path[table_getn(path)]))
-    return widened
-end
-
-local function AppendIfDistinct(path, point)
-    if not (path and point) then
-        return
-    end
-
-    local count = table_getn(path)
-    if count > 0 and DistanceSq(path[count], point) < 1 then
-        return
-    end
-
-    table_insert(path, point)
-end
-
-local function Normalize2D(dx, dz)
-    local len = math_sqrt(dx * dx + dz * dz)
-    if len < 0.001 then
-        return 0, 0
-    end
-    return dx / len, dz / len
-end
-
-local function BuildRoundedPath(path, layer)
-    if not (path and table_getn(path) >= 3) then
-        return path
-    end
-
-    local rounded = {}
-    AppendIfDistinct(rounded, CopyVector(path[1]))
-    local cosThreshold = math_cos(RouteCornerRoundAngle * math_pi / 180)
-
-    for i = 2, table_getn(path) - 1 do
-        local prev = path[i - 1]
-        local corner = path[i]
-        local nextPoint = path[i + 1]
-        if prev and corner and nextPoint then
-            local inX, inZ = Normalize2D(corner[1] - prev[1], corner[3] - prev[3])
-            local outX, outZ = Normalize2D(nextPoint[1] - corner[1], nextPoint[3] - corner[3])
-            local dot = inX * outX + inZ * outZ
-            local inLen = Distance(prev, corner)
-            local outLen = Distance(corner, nextPoint)
-            local radius = math_min(RouteClearanceOffset, inLen * RouteCornerRoundRatio, outLen * RouteCornerRoundRatio)
-
-            if dot < cosThreshold and radius > 1 then
-                local entryX = corner[1] - inX * radius
-                local entryZ = corner[3] - inZ * radius
-                local exitX = corner[1] + outX * radius
-                local exitZ = corner[3] + outZ * radius
-                local bisectorX, bisectorZ = Normalize2D(inX + outX, inZ + outZ)
-
-                local entry = { entryX, AmphibiousSurfaceHeight(layer, entryX, entryZ), entryZ }
-                local exit = { exitX, AmphibiousSurfaceHeight(layer, exitX, exitZ), exitZ }
-
-                if bisectorX ~= 0 or bisectorZ ~= 0 then
-                    local bulge = radius * 0.7
-                    local arcX = corner[1] - bisectorX * bulge
-                    local arcZ = corner[3] - bisectorZ * bulge
-                    local arc = { arcX, AmphibiousSurfaceHeight(layer, arcX, arcZ), arcZ }
-
-                    if IsDirectPathSegment(layer, prev, entry) and
-                       IsDirectPathSegment(layer, entry, arc) and
-                       IsDirectPathSegment(layer, arc, exit) and
-                       IsDirectPathSegment(layer, exit, nextPoint)
-                    then
-                        AppendIfDistinct(rounded, entry)
-                        AppendIfDistinct(rounded, arc)
-                        AppendIfDistinct(rounded, exit)
-                    else
-                        AppendIfDistinct(rounded, CopyVector(corner))
-                    end
-                else
-                    AppendIfDistinct(rounded, CopyVector(corner))
-                end
-            else
-                AppendIfDistinct(rounded, CopyVector(corner))
-            end
-        end
-    end
-
-    AppendIfDistinct(rounded, CopyVector(path[table_getn(path)]))
-    return rounded
-end
-
-local function GetClearanceEstimate(layer, pos)
-    if not pos then
-        return CorridorProbeMax + 1, nil
-    end
-
-    local directions = {
-        { 0, 1 },
-        { 1, 1 },
-        { 1, 0 },
-        { 1, -1 },
-        { 0, -1 },
-        { -1, -1 },
-        { -1, 0 },
-        { -1, 1 },
-    }
-    if CorridorDirections and CorridorDirections <= 4 then
-        directions = {
-            { 0, 1 },
-            { 1, 0 },
-            { 0, -1 },
-            { -1, 0 },
-        }
-    end
-
-    local x = pos[1]
-    local z = pos[3]
-    local minDistance = CorridorProbeMax + 1
-    local minDirX = nil
-    local minDirZ = nil
-
-    for _, direction in ipairs(directions) do
-        local dirX, dirZ = Normalize2D(direction[1], direction[2])
-        local blocked = nil
-        for distance = CorridorProbeStep, CorridorProbeMax, CorridorProbeStep do
-            local testX = x + dirX * distance
-            local testZ = z + dirZ * distance
-            local testPos = { testX, AmphibiousSurfaceHeight(layer, testX, testZ), testZ }
-            if not IsDirectPathSegment(layer, pos, testPos) then
-                blocked = distance
-                break
-            end
-        end
-
-        local clearance = blocked or (CorridorProbeMax + 1)
-        if clearance < minDistance then
-            minDistance = clearance
-            minDirX = dirX
-            minDirZ = dirZ
-        end
-    end
-
-    if minDirX then
-        local pushX, pushZ = Normalize2D(-minDirX, -minDirZ)
-        return minDistance, { pushX, 0, pushZ }
-    end
-
-    return minDistance, nil
-end
-
-local function ApplyCorridorCentering(path, layer, startPos, destination, opts)
-    path = ApplyPathClearance(path, layer)
-    path = BuildRoundedPath(path, layer)
-    if not (path and table_getn(path) >= 3) then
-        return path
-    end
-
-    for _ = 1, CorridorPasses do
-        for i = 2, table_getn(path) - 1 do
-            local prevPoint = path[i - 1]
-            local current = path[i]
-            local nextPoint = path[i + 1]
-            if prevPoint and current and nextPoint then
-                local clearance, pushDir = GetClearanceEstimate(layer, current)
-                if pushDir and clearance < CorridorDesiredClearance then
-                    local pushAmount = math_min(CorridorMaxShiftPerPass, CorridorDesiredClearance - clearance)
-                    local attemptAmounts = { pushAmount, pushAmount * 0.5, pushAmount * 0.25 }
-                    local accepted = false
-
-                    for _, amount in ipairs(attemptAmounts) do
-                        local newX = current[1] + pushDir[1] * amount
-                        local newZ = current[3] + pushDir[3] * amount
-                        local candidate = { newX, AmphibiousSurfaceHeight(layer, newX, newZ), newZ }
-
-                        if ClampPathToPlayableArea then
-                            local clamped = ClampPathToPlayableArea({ candidate }, 0)
-                            if clamped and clamped[1] then
-                                candidate = clamped[1]
-                            end
-                        end
-
-                        if IsDirectPathSegment(layer, prevPoint, candidate) and IsDirectPathSegment(layer, candidate, nextPoint) then
-                            path[i] = candidate
-                            accepted = true
-                            break
-                        end
-                    end
-
-                    if not accepted then
-                        path[i] = current
-                    end
-                end
-            end
-        end
-    end
-
-    if CorridorSimplifyAngle and CorridorSimplifyAngle > 0 and table_getn(path) >= 3 then
-        local simplified = { path[1] }
-        local cosThreshold = math_cos(CorridorSimplifyAngle * math_pi / 180)
-        for i = 2, table_getn(path) - 1 do
-            local a = simplified[table_getn(simplified)]
-            local b = path[i]
-            local c = path[i + 1]
-            if a and b and c then
-                local abX, abZ = Normalize2D(b[1] - a[1], b[3] - a[3])
-                local bcX, bcZ = Normalize2D(c[1] - b[1], c[3] - b[3])
-                local dot = abX * bcX + abZ * bcZ
-                if dot >= cosThreshold and IsDirectPathSegment(layer, a, c) then
-                    -- skip b
-                else
-                    table_insert(simplified, b)
-                end
-            end
-        end
-        table_insert(simplified, path[table_getn(path)])
-        path = simplified
-    end
-
-    return path
-end
-
-local function TryAdjustWaypoint(layer, waypoint, prevPoint, nextPoint, area, buffer)
-    if not waypoint then
-        return nil
-    end
-
-    local probeRadii = { 0, 3, 6, 9, 12, 16 }
-    local probeAngles = {
-        { 1, 0 },
-        { 0.707, 0.707 },
-        { 0, 1 },
-        { -0.707, 0.707 },
-        { -1, 0 },
-        { -0.707, -0.707 },
-        { 0, -1 },
-        { 0.707, -0.707 },
-    }
-
-    for _, radius in ipairs(probeRadii) do
-        if radius == 0 then
-            local candidate = {
-                waypoint[1],
-                AmphibiousSurfaceHeight(layer, waypoint[1], waypoint[3]),
-                waypoint[3],
-            }
-
-            if (not prevPoint or SegmentIsSafe(layer, prevPoint, candidate, area, buffer)) and
-               (not nextPoint or SegmentIsSafe(layer, candidate, nextPoint, area, buffer)) then
-                return candidate
-            end
-        else
-            for _, angle in ipairs(probeAngles) do
-                local testX = waypoint[1] + angle[1] * radius
-                local testZ = waypoint[3] + angle[2] * radius
-                local candidate = {
-                    testX,
-                    AmphibiousSurfaceHeight(layer, testX, testZ),
-                    testZ,
-                }
-
-                if (not prevPoint or SegmentIsSafe(layer, prevPoint, candidate, area, buffer)) and
-                   (not nextPoint or SegmentIsSafe(layer, candidate, nextPoint, area, buffer)) then
-                    return candidate
-                end
-            end
-        end
-    end
-
-    return nil
-end
-
-local function SanitizePathWaypoints(path, layer, startPos, destination)
-    if not (path and table_getn(path) > 0) then
-        return path
-    end
-
-    local sanitized = {}
-    local fallbackStart = startPos or path[1]
-    local area = GetPlayableArea()
-    local buffer = PlayableIngressBuffer
-
-    for i = 1, table_getn(path) do
-        local prevPoint = sanitized[table_getn(sanitized)] or fallbackStart
-        local nextPoint = path[i + 1]
-        if i == table_getn(path) and destination then
-            nextPoint = nil
-        end
-
-        local adjusted = TryAdjustWaypoint(layer, path[i], prevPoint, nextPoint, area, buffer)
-        if adjusted then
-            table_insert(sanitized, adjusted)
-        elseif nextPoint and prevPoint and SegmentIsSafe(layer, prevPoint, nextPoint, area, buffer) then
-            -- Skip waypoints that are trapped if we can directly connect around them.
-        elseif i == table_getn(path) and prevPoint and destination then
-            local fallback = TryAdjustWaypoint(layer, destination, prevPoint, nil, area, buffer)
-            if fallback then
-                table_insert(sanitized, fallback)
-            end
-        elseif path[i] and prevPoint and SegmentIsSafe(layer, prevPoint, path[i], area, buffer) then
-            table_insert(sanitized, CopyVector(path[i]))
-        end
-    end
-
-    if table_getn(sanitized) == 0 then
-        return path
-    end
-
-    return sanitized
-end
-
-local function RemoveImmediateBacktracks(path, layer, startPos)
-    if not (path and startPos and table_getn(path) > 1) then
-        return path
-    end
-
-    local cleaned = {}
-    local prev = startPos
-    for index = 1, table_getn(path) do
-        local point = path[index]
-        local nextPoint = path[index + 1]
-        if point then
-            local stepX = point[1] - prev[1]
-            local stepZ = point[3] - prev[3]
-            local stepLenSq = stepX * stepX + stepZ * stepZ
-            local remove = false
-
-            if stepLenSq <= RouteBacktrackMinDistanceSq and nextPoint and CanPathBetween(layer, prev, nextPoint) then
-                remove = true
-            elseif nextPoint then
-                local toNextX = nextPoint[1] - prev[1]
-                local toNextZ = nextPoint[3] - prev[3]
-                local dot = stepX * toNextX + stepZ * toNextZ
-                if dot <= 0 and CanPathBetween(layer, prev, nextPoint) then
-                    remove = true
-                end
-            end
-
-            if not remove then
-                table_insert(cleaned, point)
-                prev = point
-            end
-        end
-    end
-
-    return (table_getn(cleaned) > 0) and cleaned or path
-end
-
-local function RemoveSafeZigZags(path, layer, startPos)
-    if not (path and table_getn(path) >= 3) then
-        return path
-    end
-
-    local cleaned = { CopyVector(path[1]) }
-    local cosThreshold = math_cos(RouteZigZagAngle * math_pi / 180)
-    for i = 2, table_getn(path) - 1 do
-        local a = cleaned[table_getn(cleaned)] or startPos
-        local b = path[i]
-        local c = path[i + 1]
-        if a and b and c then
-            local abX, abZ = Normalize2D(b[1] - a[1], b[3] - a[3])
-            local bcX, bcZ = Normalize2D(c[1] - b[1], c[3] - b[3])
-            local dot = abX * bcX + abZ * bcZ
-            if dot >= cosThreshold and CanPathBetween(layer, a, c) then
-                -- Skip a near-straight intermediate waypoint.
-            else
-                table_insert(cleaned, CopyVector(b))
-            end
-        end
-    end
-    table_insert(cleaned, CopyVector(path[table_getn(path)]))
-    return cleaned
+    return Routing.BuildPathSegment(layer, startPos, destination)
 end
 
 local function FindSafePath(platoon, layer, destination, startOverride, opts)
-    opts = opts or {}
-
-    local startPos = startOverride or GetPlatoonPosition(platoon)
-    if not (startPos and destination) then return nil end
-
-    local area = GetPlayableArea()
-    if area then
-        startPos = ClampToPlayableArea(startPos, area, 0)
-        destination = ClampToPlayableArea(destination, area, 0)
-    end
-
-    local path = BuildPathSegment(layer, startPos, destination)
-    if not path then
+    if not (Routing and Routing.FindSafePath) then
         return nil
     end
-
-    local alternate = TryAlternatePath(platoon, layer, startPos, destination, opts)
-    if alternate then
-        path = alternate
-    end
-
-    -- Full-route refinement stage: keep waypoints valid while improving
-    -- corridor clearance and removing unstable early corrections.
-    if opts.CorridorCentering == false then
-        path = ApplyPathClearance(path, layer)
-    else
-        path = ApplyCorridorCentering(path, layer, startPos, destination, opts)
-    end
-    path = SanitizePathWaypoints(path, layer, startPos, destination)
-    path = RemoveImmediateBacktracks(path, layer, startPos)
-    path = RemoveSafeZigZags(path, layer, startPos)
-    return ClampPathToPlayableArea(path, PlayableIngressBuffer)
-end
-
-local function FindNearbyPathablePoint(layer, startPos, destination)
-    if not (layer and startPos and destination) then
-        return nil
-    end
-
-    local probeRadii = { 10, 20, 30, 45, 60, 80 }
-    local probeAngles = {
-        { 1, 0 },
-        { 0.707, 0.707 },
-        { 0, 1 },
-        { -0.707, 0.707 },
-        { -1, 0 },
-        { -0.707, -0.707 },
-        { 0, -1 },
-        { 0.707, -0.707 },
-    }
-
-    local area = GetPlayableArea()
-    for _, radius in ipairs(probeRadii) do
-        for _, angle in ipairs(probeAngles) do
-            local x = destination[1] + angle[1] * radius
-            local z = destination[3] + angle[2] * radius
-            local candidate = { x, AmphibiousSurfaceHeight(layer, x, z), z }
-            if area then
-                candidate = ClampToPlayableArea(candidate, area, 0)
-            end
-
-            if CanPathBetween(layer, startPos, candidate) then
-                RoutingLog('Using nearby pathable fallback point')
-                return candidate
-            end
-        end
-    end
-
-    return nil
+    return Routing.FindSafePath(platoon, layer, destination, startOverride, CopyOptions(opts))
 end
 
 local function RecomputePathWithFallback(platoon, layer, destination, opts)
-    local current = GetPlatoonPosition(platoon)
-    if not (current and destination) then
+    if not (Routing and Routing.RecomputePathWithFallback) then
         return nil
     end
-
-    local repathOpts = CopyOptions(opts)
-    repathOpts._repathing = true
-
-    local path = FindSafePath(platoon, layer, destination, current, repathOpts)
-    if path and table_getn(path) > 0 then
-        RoutingLog('Generated safe repath with', table_getn(path), 'waypoints')
-        return path
-    end
-
-    path = BuildPathSegment(layer, current, destination)
-    if path and table_getn(path) > 0 then
-        RoutingLog('Fallback to NavUtils.PathTo segment with', table_getn(path), 'waypoints')
-        return ClampPathToPlayableArea(path, PlayableIngressBuffer)
-    end
-
-    local nearby = FindNearbyPathablePoint(layer, current, destination)
-    if nearby then
-        path = BuildPathSegment(layer, current, nearby)
-        if path and table_getn(path) > 0 then
-            RoutingLog('Fallback path built to nearby pathable point')
-            return ClampPathToPlayableArea(path, PlayableIngressBuffer)
-        end
-    end
-
-    RoutingLog('Repath failed for destination')
-    return nil
-end
-
-local function MaxWeaponRange(platoon)
-    local units = platoon and platoon:GetPlatoonUnits() or {}
-    local maxRange = 0
-    for _, unit in ipairs(units) do
-        if unit and not unit.Dead then
-            local bp = unit:GetBlueprint()
-            if bp and bp.Weapon then
-                for _, weapon in ipairs(bp.Weapon) do
-                    if weapon.MaxRadius and weapon.MaxRadius > maxRange then
-                        maxRange = weapon.MaxRadius
-                    end
-                end
-            end
-        end
-    end
-    return maxRange
-end
-
-local function ShortenPathForBombard(path, targetPos, range)
-    if not (path and targetPos and range and range > 0 and table_getn(path) > 0) then
-        return path
-    end
-
-    local last = path[table_getn(path)]
-    if not last then
-        return path
-    end
-
-    local dx = targetPos[1] - last[1]
-    local dz = targetPos[3] - last[3]
-    local dist = math_sqrt(dx * dx + dz * dz)
-    if dist < 0.001 then
-        return path
-    end
-
-    local desired = math_max(range * 0.9, 5)
-    local scale = (dist - desired) / dist
-    if scale <= 0 then
-        return path
-    end
-
-    local adjusted = {
-        last[1] + dx * scale,
-        last[2],
-        last[3] + dz * scale,
-    }
-
-    path[table_getn(path)] = adjusted
-    return path
-end
-
-local function RequestTransports(brain, platoon, destination)
-    local units = platoon:GetPlatoonUnits() or {}
-    if table_getn(units) == 0 then
-        return false
-    end
-
-    local ok, transports = pcall(ScenarioFramework.UseTransports, units, brain, destination)
-    if ok and transports then
-        return true
-    end
-
-    return false
+    return Routing.RecomputePathWithFallback(platoon, layer, destination, CopyOptions(opts))
 end
 
 ClampPathToPlayableArea = function(path, buffer)
-    local area = GetPlayableArea()
-    if not (area and path and table_getn(path) > 0) then
-        return path
-    end
-
-    buffer = buffer or 0
-
-    local clamped = {}
-    for _, waypoint in ipairs(path) do
-        if waypoint then
-            table_insert(clamped, ClampToPlayableArea(waypoint, area, buffer))
-        end
-    end
-
-    return clamped
+    return path
 end
 
 local function MoveAlongPath(platoon, path, formation, aggressiveFinal, layer, aggressiveRoute)
-    if not (path and table_getn(path) > 0) then return false end
-
-    local units = platoon:GetPlatoonUnits() or {}
-    if table_getn(units) == 0 then return false end
-
-    -- Make sure we never issue move orders outside the playable area
-    path = ClampPathToPlayableArea(path, PlayableIngressBuffer)
-
-    local area = GetPlayableArea()
-    local pos = GetPlatoonPosition(platoon)
-    if area and pos and PositionInPlayableArea(pos, area) then
-        local currentEdgeDistance = DistanceToPlayableEdge(pos, area)
-        while table_getn(path) > 1 do
-            local first = path[1]
-            if not first then
-                table_remove(path, 1)
-            else
-                local firstEdgeDistance = DistanceToPlayableEdge(first, area)
-                if not PositionInPlayableArea(first, area) or firstEdgeDistance + 1 < currentEdgeDistance then
-                    table_remove(path, 1)
-                else
-                    break
-                end
-            end
-        end
-    end
-
-    if not (path and table_getn(path) > 0) then return false end
-
-    local movementLayer = layer or DetermineLayer(platoon, false)
-    local startPos = GetPlatoonPosition(platoon)
-    local previous = startPos
-    for index, waypoint in ipairs(path) do
-        if waypoint and previous then
-            if not SegmentIsSafe(movementLayer, previous, waypoint, area, PlayableIngressBuffer) then
-                RoutingLog('Rejected waypoint segment for layer', movementLayer, 'at index', index)
-                return false
-            end
-        end
-        previous = waypoint
-    end
-
-    local useFormation = formation and formation ~= 'NoFormation'
-    if useFormation then
-        platoon:SetPlatoonFormationOverride(formation)
-    else
-        platoon:SetPlatoonFormationOverride('NoFormation')
-    end
-
-    IssueClearCommands(units)
-
-    local minPointSpacingSq = 20 * 20
-    local lastIssued = nil
-    local count = table_getn(path)
-    local headingFrom = startPos
-    for index, waypoint in ipairs(path) do
-        if not (lastIssued and DistanceSq(lastIssued, waypoint) < minPointSpacingSq) then
-            local degrees = HeadingDegrees(headingFrom, waypoint)
-            local isFinal = index == count
-            local isAggressive = aggressiveRoute or (aggressiveFinal and isFinal)
-            if isAggressive then
-                if useFormation then
-                    IssueFormAggressiveMove(units, waypoint, formation, degrees)
-                else
-                    IssueAggressiveMove(units, waypoint)
-                end
-            elseif useFormation then
-                IssueFormMove(units, waypoint, formation, degrees)
-            else
-                IssueMove(units, waypoint)
-            end
-
-            lastIssued = waypoint
-            headingFrom = waypoint
-        end
-    end
-
-    return true
-end
-
-local function RemoveIngressDoubleBack(path, layer, startPos, targetPos, ingressEdge)
-    if not (path and startPos and targetPos and ingressEdge and table_getn(path) > 1) then
-        return path
-    end
-
-    local inward = {
-        left = { 1, 0 },
-        right = { -1, 0 },
-        bottom = { 0, 1 },
-        top = { 0, -1 },
-    }
-
-    local entryDir = inward[ingressEdge]
-    if not entryDir then
-        return path
-    end
-
-    local prev = startPos
-    local index = 1
-    while index < table_getn(path) do
-        local point = path[index]
-        local nextPoint = path[index + 1]
-        if not (point and nextPoint) then
-            break
-        end
-
-        local stepX = point[1] - prev[1]
-        local stepZ = point[3] - prev[3]
-        local inwardDot = stepX * entryDir[1] + stepZ * entryDir[2]
-        if inwardDot >= -1 then
-            break
-        end
-
-        if CanPathBetween(layer, prev, nextPoint) then
-            table_remove(path, index)
-        else
-            prev = point
-            index = index + 1
-        end
-    end
-
-    return path
-end
-
-local function TrimInitialBacktrack(path, layer, startPos, targetPos)
-    if not (path and startPos and targetPos and table_getn(path) > 1) then
-        return path
-    end
-
-    local forwardX = targetPos[1] - startPos[1]
-    local forwardZ = targetPos[3] - startPos[3]
-    local forwardLenSq = forwardX * forwardX + forwardZ * forwardZ
-    if forwardLenSq < 1 then
-        return path
-    end
-
-    local probePos = CopyVector(startPos)
-    while table_getn(path) > 1 do
-        local first = path[1]
-        local nextPoint = path[2]
-        if not (first and nextPoint) then
-            break
-        end
-
-        local stepX = first[1] - probePos[1]
-        local stepZ = first[3] - probePos[3]
-        local stepLenSq = stepX * stepX + stepZ * stepZ
-        if stepLenSq < 16 then
-            table_remove(path, 1)
-        else
-            local headingDot = stepX * forwardX + stepZ * forwardZ
-            if headingDot < 0 and CanPathBetween(layer, probePos, nextPoint) then
-                table_remove(path, 1)
-            else
-                break
-            end
-        end
-
-        probePos = CopyVector(startPos)
-    end
-
-    return path
-end
-
-local function MoveToIngress(platoon, layer, ingress, formation)
-    if not (platoon and ingress) then
+    if not (Routing and Routing.MoveAlongPath) then
         return false
     end
-
-    local startPos = GetPlatoonPosition(platoon)
-    if not startPos then
-        return false
-    end
-
-    MoveAlongPath(platoon, { ingress }, formation)
-
-    local timeout = PlayableIngressTimeout
-    local bestDistSq = DistanceSq(startPos, ingress)
-    local stagnant = 0
-    while timeout > 0 and PlatoonAlive(platoon) do
-        local pos = GetPlatoonPosition(platoon)
-        if not pos then
-            return false
-        end
-
-        if DistanceSq(pos, ingress) <= 64 then
-            return true
-        end
-
-        local distSq = DistanceSq(pos, ingress)
-        if distSq < (bestDistSq - TravelProgressEpsilonSq) then
-            bestDistSq = distSq
-            stagnant = 0
-        else
-            stagnant = stagnant + 1
-        end
-
-        if stagnant >= 8 then
-            return false
-        end
-
-        timeout = timeout - 1
-        SafeWait(1)
-    end
-
-    return false
+    return Routing.MoveAlongPath(platoon, path, formation, aggressiveFinal, layer, aggressiveRoute)
 end
 
 local function MoveToNearestPlayableIngress(platoon, layer, area, formation, destination)
-    local startPos = GetPlatoonPosition(platoon)
-    if not (startPos and area) then
-        return false, nil
+    if not (Routing and Routing.MoveToNearestPlayableIngress) then
+        return false, nil, nil
     end
-
-    local candidates, ingressEdge = BuildIngressCandidates(startPos, area, PlayableIngressBuffer, destination)
-    if table_getn(candidates) == 0 then
-        return false, nil, ingressEdge
-    end
-
-    local candidate = nil
-    local bestScore = math_huge
-    for _, ingress in ipairs(candidates) do
-        local canReachIngress = (layer == 'Air') or CanPathBetween(layer, startPos, ingress)
-        if canReachIngress then
-            local score = Distance(startPos, ingress)
-            if destination then
-                local routeToTarget = BuildPathSegment(layer, ingress, destination)
-                if routeToTarget then
-                    score = score + PathLength(routeToTarget)
-                else
-                    score = score + Distance(ingress, destination) * 3
-                end
-            end
-
-            if score < bestScore then
-                bestScore = score
-                candidate = ingress
-            end
-        end
-    end
-
-    if not candidate then
-        return false, candidates[1], ingressEdge
-    end
-
-    if MoveToIngress(platoon, layer, candidate, formation) then
-        local pos = GetPlatoonPosition(platoon)
-        if PositionInPlayableArea(pos, area) then
-            return true, candidate, ingressEdge
-        end
-    end
-
-    return false, candidate, ingressEdge
+    return Routing.MoveToNearestPlayableIngress(platoon, layer, area, formation, destination)
 end
 
 local function TransportAndMove(platoon, destination, opts)
@@ -2731,8 +1434,8 @@ local function TransportAndMove(platoon, destination, opts)
     local drop = CopyVector(destination)
     if drop then
         local size = ScenarioInfo and (ScenarioInfo.size or ScenarioInfo.MapSize) or { 512, 512 }
-        drop[1] = math_min(math_max(drop[1] - TransportStagingOffset, 0), size[1])
-        drop[3] = math_min(math_max(drop[3] - TransportStagingOffset, 0), size[2])
+        drop[1] = math.min(math.max(drop[1] - TransportStagingOffset, 0), size[1])
+        drop[3] = math.min(math.max(drop[3] - TransportStagingOffset, 0), size[2])
     else
         drop = startPos
     end
@@ -2748,7 +1451,7 @@ end
 
 local function UpdateStructureAttacks(platoon, target, opts, brain, enemyBrains, layer, issuedTargets)
     local units = platoon:GetPlatoonUnits() or {}
-    if table_getn(units) == 0 then
+    if table.getn(units) == 0 then
         return 'fail'
     end
 
@@ -2756,7 +1459,7 @@ local function UpdateStructureAttacks(platoon, target, opts, brain, enemyBrains,
     local combined = {}
     if target.units then
         for _, structure in ipairs(target.units) do
-            table_insert(combined, structure)
+            table.insert(combined, structure)
         end
     end
 
@@ -2765,7 +1468,7 @@ local function UpdateStructureAttacks(platoon, target, opts, brain, enemyBrains,
         local radius = (target.radius or 0) + AreaClearRadius
         local areaUnits = AreaUnits(brain, enemyBrains, target.position, radius, category, opts.IntelOnly) or {}
         for _, structure in ipairs(areaUnits) do
-            table_insert(combined, structure)
+            table.insert(combined, structure)
         end
     end
 
@@ -2778,12 +1481,12 @@ local function UpdateStructureAttacks(platoon, target, opts, brain, enemyBrains,
             local id = structure.EntityId
             if id and not unique[id] then
                 unique[id] = true
-                table_insert(remaining, structure)
+                table.insert(remaining, structure)
             end
         end
     end
 
-    if table_getn(remaining) == 0 then
+    if table.getn(remaining) == 0 then
         return 'success'
     end
 
@@ -2792,11 +1495,11 @@ local function UpdateStructureAttacks(platoon, target, opts, brain, enemyBrains,
         local id = structure.EntityId
         if id and not issuedTargets[id] then
             issuedTargets[id] = true
-            table_insert(newTargets, structure)
+            table.insert(newTargets, structure)
         end
     end
 
-    if table_getn(newTargets) > 0 then
+    if table.getn(newTargets) > 0 then
         for _, structure in ipairs(newTargets) do
             if structure and not structure.Dead then
                 IssueAttack(units, structure)
@@ -2853,20 +1556,20 @@ local function AttackTargetArea(platoon, target, opts)
         local routeStart = currentPos or ingress
 
         path = FindSafePath(platoon, layer, targetPos, routeStart, opts)
-        if not (path and table_getn(path) > 0) then
+        if not (path and table.getn(path) > 0) then
             path = BuildPathSegment(layer, routeStart, targetPos)
         end
 
-        if path and table_getn(path) > 1 and area and currentPos then
+        if path and table.getn(path) > 1 and area and currentPos then
             local currentEdgeDistance = DistanceToPlayableEdge(currentPos, area)
-            while table_getn(path) > 1 do
+            while table.getn(path) > 1 do
                 local first = path[1]
                 if not first then
-                    table_remove(path, 1)
+                    table.remove(path, 1)
                 else
                     local firstEdgeDistance = DistanceToPlayableEdge(first, area)
                     if firstEdgeDistance + 1 < currentEdgeDistance then
-                        table_remove(path, 1)
+                        table.remove(path, 1)
                     else
                         break
                     end
@@ -2874,8 +1577,6 @@ local function AttackTargetArea(platoon, target, opts)
             end
         end
 
-        path = TrimInitialBacktrack(path, layer, routeStart, targetPos)
-        path = RemoveIngressDoubleBack(path, layer, routeStart, targetPos, ingressEdge)
     else
         path = FindSafePath(platoon, layer, targetPos, nil, opts)
     end
@@ -2932,7 +1633,7 @@ local function AttackTargetArea(platoon, target, opts)
             return 'repath'
         end
     end
-    
+
     local arrived = false
     local epsilon = 5
     local attackTransitionRadius = (target.radius or 0) + 40
@@ -2978,7 +1679,7 @@ local function AttackTargetArea(platoon, target, opts)
     end
 
     units = platoon:GetPlatoonUnits() or {}
-    if table_getn(units) == 0 then
+    if table.getn(units) == 0 then
         return 'fail'
     end
 
@@ -3088,8 +1789,8 @@ local function RandomPoint()
         maxZ = size[2]
     end
 
-    local x = math_random(minX, maxX)
-    local z = math_random(minZ, maxZ)
+    local x = math.random(minX, maxX)
+    local z = math.random(minZ, maxZ)
     local y = GetSurfaceHeight(x, z)
     return ClampToPlayableArea({ x, y, z }, area, PlayableIngressBuffer)
 end
@@ -3102,7 +1803,7 @@ local function HottestColdestPosition(brain, hottest)
     local start = { size[1] * 0.5, 0, size[2] * 0.5 }
     start[2] = GetSurfaceHeight(start[1], start[3])
     local list = FindThreatLocations(brain, start, 'Air')
-    if table_getn(list) == 0 then
+    if table.getn(list) == 0 then
         return RandomPoint()
     end
     table.sort(list, function(a, b)
@@ -3117,7 +1818,7 @@ local function HottestColdestPosition(brain, hottest)
 end
 
 local function SelectScoutDestination(brain, opts)
-    local roll = math_random()
+    local roll = math.random()
     if opts.IntelOnly and roll < HotColdChance then
         return HottestColdestPosition(brain, true)
     elseif opts.IntelOnly and roll < HotColdChance * 2 then
@@ -3140,10 +1841,10 @@ local function OrbitWaypoints(center, count, radius)
     end
     for i = 1, count do
         local angle = (i / count) * 6.28318
-        local x = center[1] + math_cos(angle) * radius
-        local z = center[3] + math_sin(angle) * radius
+        local x = center[1] + math.cos(angle) * radius
+        local z = center[3] + math.sin(angle) * radius
         local y = GetSurfaceHeight(x, z)
-        table_insert(list, { x, y, z })
+        table.insert(list, { x, y, z })
     end
     return list
 end
@@ -3166,7 +1867,7 @@ local function NormalizeCategoryList(value)
     local list = {}
     local function add(cat)
         if cat then
-            table_insert(list, cat)
+            table.insert(list, cat)
         end
     end
     local function parse(entry)
@@ -3285,7 +1986,7 @@ local function UnitMatchesBlueprint(unit, set)
 end
 
 local function UnitMatchesCategory(unit, categoriesList)
-    if not (unit and categoriesList and table_getn(categoriesList) > 0) then
+    if not (unit and categoriesList and table.getn(categoriesList) > 0) then
         return false
     end
     for _, category in ipairs(categoriesList) do
@@ -3345,7 +2046,7 @@ local function ResolveChainPositions(chainName)
     local points = {}
     for _, pos in ipairs(chain) do
         if pos and pos[1] and pos[3] then
-            table_insert(points, { pos[1], pos[2] or GetSurfaceHeight(pos[1], pos[3]), pos[3] })
+            table.insert(points, { pos[1], pos[2] or GetSurfaceHeight(pos[1], pos[3]), pos[3] })
         end
     end
     return points
@@ -3356,7 +2057,7 @@ local function NormalizePatrolPoints(points, layer)
     for _, pos in ipairs(points or {}) do
         if pos and pos[1] and pos[3] then
             local y = AmphibiousSurfaceHeight(layer, pos[1], pos[3])
-            table_insert(out, { pos[1], y, pos[3] })
+            table.insert(out, { pos[1], y, pos[3] })
         end
     end
     return out
@@ -3364,12 +2065,12 @@ end
 
 local function BuildPingPongRoute(points)
     local out = {}
-    local count = table_getn(points)
+    local count = table.getn(points)
     for i = 1, count do
-        table_insert(out, points[i])
+        table.insert(out, points[i])
     end
     for i = count - 1, 2, -1 do
-        table_insert(out, points[i])
+        table.insert(out, points[i])
     end
     return out
 end
@@ -3386,14 +2087,14 @@ local function FirebaseLocationsFromData(data)
                 local marker = entry.marker or entry.Marker or entry.location or entry.Location or entry[1]
                 local group = entry.group or entry.Group or entry.structGroup or entry.StructGroup or entry[2]
                 if marker or group then
-                    table_insert(locations, { marker = marker, group = group })
+                    table.insert(locations, { marker = marker, group = group })
                 end
             end
         end
     elseif type(data.Markers) == 'table' then
         local groups = data.Groups or data.StructureGroups or data.GroupNames
         for i, marker in ipairs(data.Markers) do
-            table_insert(locations, { marker = marker, group = groups and groups[i] or nil })
+            table.insert(locations, { marker = marker, group = groups and groups[i] or nil })
         end
     end
 
@@ -3403,7 +2104,7 @@ end
 local function FirebaseLocationSafe(brain, pos, safeRadius, opts)
     local enemies = BrainEnemies(brain, opts and opts.TargetArmy)
     local units = AreaUnits(brain, enemies, pos, safeRadius, categories.ALLUNITS, opts and opts.IntelOnly)
-    return table_getn(units) == 0
+    return table.getn(units) == 0
 end
 
 local function FirebaseMissingStructures(brain, groupName, radius)
@@ -3423,7 +2124,7 @@ local function FirebaseMissingStructures(brain, groupName, radius)
                 end
             end
             if not found then
-                table_insert(missing, { bp = bp, pos = pos, facing = facing })
+                table.insert(missing, { bp = bp, pos = pos, facing = facing })
             end
         end
     end
@@ -3432,7 +2133,7 @@ end
 
 local function IssueFirebaseBuilds(platoon, builds)
     local units = platoon:GetPlatoonUnits() or {}
-    if table_getn(units) == 0 then
+    if table.getn(units) == 0 then
         return
     end
     IssueClearCommands(units)
@@ -3504,14 +2205,14 @@ end
 local function IdleAtMarker(platoon, markerPos, layer, formation)
     if not (platoon and markerPos) then return end
     local units = platoon:GetPlatoonUnits() or {}
-    if table_getn(units) == 0 then return end
+    if table.getn(units) == 0 then return end
     IssueClearCommands(units)
     if layer == 'Air' then
         local waypoints = OrbitWaypoints(markerPos, HuntOrbitPoints, HuntOrbitRadius)
         for _, point in ipairs(waypoints) do
             IssuePatrol(units, point)
         end
-        if table_getn(waypoints) > 0 then
+        if table.getn(waypoints) > 0 then
             IssuePatrol(units, waypoints[1])
         end
     else
@@ -3525,11 +2226,11 @@ local function IdleAtMarker(platoon, markerPos, layer, formation)
 end
 
 local function IssuePatrolRoute(platoon, points, formation)
-    if not (platoon and points and table_getn(points) > 0) then
+    if not (platoon and points and table.getn(points) > 0) then
         return
     end
     local units = platoon:GetPlatoonUnits() or {}
-    if table_getn(units) == 0 then
+    if table.getn(units) == 0 then
         return
     end
 
@@ -3538,7 +2239,7 @@ local function IssuePatrolRoute(platoon, points, formation)
 
     IssueMove(units, points[1])
 
-    for i = 2, table_getn(points) do
+    for i = 2, table.getn(points) do
         local point = points[i]
         IssuePatrol(units, point)
     end
@@ -3550,11 +2251,11 @@ end
 local function BuildLoopRoute(points)
     local route = {}
     for _, point in ipairs(points or {}) do
-        table_insert(route, point)
+        table.insert(route, point)
     end
 
-    if table_getn(route) > 1 then
-        table_insert(route, route[1])
+    if table.getn(route) > 1 then
+        table.insert(route, route[1])
     end
 
     return route
@@ -3565,16 +2266,16 @@ local function BuildPerimeterPoints(layer, basePos, distance)
     local count = 6
     for i = 1, count do
         local angle = (i / count) * 6.28318
-        local x = basePos[1] + math_cos(angle) * distance
-        local z = basePos[3] + math_sin(angle) * distance
+        local x = basePos[1] + math.cos(angle) * distance
+        local z = basePos[3] + math.sin(angle) * distance
         local point = { x, AmphibiousSurfaceHeight(layer, x, z), z }
         if CanPathBetween(layer, basePos, point) then
-            table_insert(points, point)
+            table.insert(points, point)
         end
     end
 
-    if table_getn(points) == 0 then
-        table_insert(points, basePos)
+    if table.getn(points) == 0 then
+        table.insert(points, basePos)
     end
     return points
 end
@@ -3585,7 +2286,7 @@ local function FindIntruder(brain, layer, basePos, interceptRadius, opts)
     units = FilterUnits(units, layer, opts and opts.Submersible)
 
     local closest
-    local closestDist = math_huge
+    local closestDist = (math.huge or 1e9)
     for _, unit in ipairs(units) do
         if unit and not unit.Dead and CanTargetUnit(layer, opts and opts.Submersible, unit) then
             local pos = unit:GetPosition()
@@ -3603,7 +2304,7 @@ end
 
 local function FindHuntTarget(brain, platoon, opts, layer, excluded, requireSafe)
     local hasBlueprints = opts and opts.HuntSet and next(opts.HuntSet)
-    local hasCategories = opts and opts.HuntCategories and table_getn(opts.HuntCategories) > 0
+    local hasCategories = opts and opts.HuntCategories and table.getn(opts.HuntCategories) > 0
     if not (brain and platoon and (hasBlueprints or hasCategories)) then
         return nil
     end
@@ -3613,8 +2314,8 @@ local function FindHuntTarget(brain, platoon, opts, layer, excluded, requireSafe
     end
     local enemies = BrainEnemies(brain, opts.TargetArmy)
     local excludedSet = excluded or {}
-    local best, bestDist = nil, math_huge
-    local bestSafe, bestSafeDist = nil, math_huge
+    local best, bestDist = nil, (math.huge or 1e9)
+    local bestSafe, bestSafeDist = nil, (math.huge or 1e9)
     for _, enemyIndex in ipairs(enemies) do
         local eBrain = ArmyBrains[enemyIndex]
         if eBrain then
@@ -3714,7 +2415,7 @@ local function TrackHuntTarget(platoon, targetInfo, opts, layer)
         end
         if not skipIteration and DistanceSq(platoonPos, unitPos) <= HuntAttackDistanceSq then
             local units = platoon:GetPlatoonUnits() or {}
-            if table_getn(units) == 0 then
+            if table.getn(units) == 0 then
                 return 'fail'
             end
             IssueAttack(units, unit)
@@ -3776,7 +2477,7 @@ function ScoutAttack(platoon, data)
     local brain = platoon:GetBrain()
     if not brain then return end
     local units = platoon:GetPlatoonUnits() or {}
-    if table_getn(units) == 0 then return end
+    if table.getn(units) == 0 then return end
 
     local state = {}
     for _, unit in ipairs(units) do
@@ -3787,7 +2488,7 @@ function ScoutAttack(platoon, data)
     while PlatoonAlive(platoon) do
         SafeWait(ScoutRecheckDelay)
         units = platoon:GetPlatoonUnits() or {}
-        if table_getn(units) == 0 then break end
+        if table.getn(units) == 0 then break end
         for _, unit in ipairs(units) do
             if unit and not unit.Dead then
                 local info = state[unit.EntityId]
@@ -3821,13 +2522,13 @@ function AreaPatrol(platoon, data)
         for _, marker in ipairs(data.Markers) do
             local pos = ResolveMarkerPosition(marker)
             if pos then
-                table_insert(points, pos)
+                table.insert(points, pos)
             end
         end
     end
 
     points = NormalizePatrolPoints(points, layer)
-    if table_getn(points) < 2 then
+    if table.getn(points) < 2 then
         return
     end
 
@@ -3845,7 +2546,7 @@ function AreaPatrol(platoon, data)
     if useFormationMoves then
         local arrivalRadiusSq = 20 * 20
         local maxTravelSeconds = 120
-        local routeCount = table_getn(route)
+        local routeCount = table.getn(route)
         local index = 1
 
         while PlatoonAlive(platoon) do
@@ -3907,14 +2608,14 @@ function Firebase(platoon, data)
             local pos = ResolveMarkerPosition(loc.marker) or loc.position
             if pos and FirebaseLocationSafe(brain, pos, safeRadius, opts) then
                 local missing = FirebaseMissingStructures(brain, loc.group, structureRadius)
-                if table_getn(missing) > 0 then
+                if table.getn(missing) > 0 then
                     acted = true
                     local path = FindSafePath(platoon, layer, pos, nil, opts)
                     if path then
                         MoveAlongPath(platoon, path, opts.Formation, true)
                     else
                         local units = platoon:GetPlatoonUnits() or {}
-                        if table_getn(units) > 0 then
+                        if table.getn(units) > 0 then
                             IssueMove(units, pos)
                         end
                     end
@@ -3981,7 +2682,7 @@ function Supportbase(platoon, data)
                     MoveAlongPath(platoon, path, opts.Formation, true)
                 else
                     local units = platoon:GetPlatoonUnits() or {}
-                    if table_getn(units) > 0 then
+                    if table.getn(units) > 0 then
                         IssueMove(units, basePos)
                     end
                 end
@@ -4010,7 +2711,7 @@ function HuntAttack(platoon, data)
     local blueprintData = data and (data.Blueprints or data.Blueprint or data.TargetBlueprints or data.TargetBPs or data.TargetBP)
     opts.HuntSet = NormalizeBlueprintSet(blueprintData)
     opts.HuntCategories = NormalizeCategoryList(data and (data.Category or data.Categories or data.TargetCategory or data.TargetCategories))
-    if not (next(opts.HuntSet) or table_getn(opts.HuntCategories) > 0) then
+    if not (next(opts.HuntSet) or table.getn(opts.HuntCategories) > 0) then
         return
     end
 
@@ -4092,7 +2793,7 @@ function DefensePatrol(platoon, data)
                     MoveAlongPath(platoon, path, opts.Formation, true, nil, opts.AggressiveMove)
                 else
                     local units = platoon:GetPlatoonUnits() or {}
-                    if table_getn(units) > 0 then
+                    if table.getn(units) > 0 then
                         if opts.Formation and opts.Formation ~= 'NoFormation' then
                             local interceptDegrees = HeadingDegrees(GetPlatoonPosition(platoon), targetPos)
                             IssueFormAggressiveMove(units, targetPos, opts.Formation, interceptDegrees)
@@ -4103,12 +2804,12 @@ function DefensePatrol(platoon, data)
                 end
 
                 local units = platoon:GetPlatoonUnits() or {}
-                if table_getn(units) > 0 then
+                if table.getn(units) > 0 then
                     IssueAttack(units, intruder)
                 end
 
                 local elapsed = 0
-                local maxIntercept = math_max(interceptRadius * 1.5, interceptRadius + 32)
+                local maxIntercept = math.max(interceptRadius * 1.5, interceptRadius + 32)
                 while PlatoonAlive(platoon) and intruder and not intruder.Dead do
                     local pos = intruder:GetPosition()
                     if not pos or DistanceSq(pos, basePos) > (maxIntercept * maxIntercept) then
