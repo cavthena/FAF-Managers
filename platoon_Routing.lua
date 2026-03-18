@@ -7,10 +7,12 @@ local function CopyVec(v)
     end
 
     local copy = { v[1] or 0, v[2] or 0, v[3] or 0 }
-    copy._curve = v._curve
-    copy._centered = v._centered
-    copy._ingress = v._ingress
-    copy._ingressEdge = v._ingressEdge
+    if type(v) == 'table' then
+        copy._curve = v._curve
+        copy._centered = v._centered
+        copy._ingress = v._ingress
+        copy._ingressEdge = v._ingressEdge
+    end
     return copy
 end
 
