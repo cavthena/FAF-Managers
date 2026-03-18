@@ -36,6 +36,14 @@ local function VecZ(v)
     return ReadVecComponent(v, 3, 'z') or 0
 end
 
+local function ReadVecMetadata(v, fieldName)
+    if type(v) ~= 'table' then
+        return nil
+    end
+
+    return rawget(v, fieldName)
+end
+
 local function CopyVec(v)
     if not v then
         return nil
@@ -46,12 +54,10 @@ local function CopyVec(v)
         VecY(v),
         VecZ(v)
     }
-    if type(v) == 'table' then
-        copy._curve = v._curve
-        copy._centered = v._centered
-        copy._ingress = v._ingress
-        copy._ingressEdge = v._ingressEdge
-    end
+    copy._curve = ReadVecMetadata(v, '_curve')
+    copy._centered = ReadVecMetadata(v, '_centered')
+    copy._ingress = ReadVecMetadata(v, '_ingress')
+    copy._ingressEdge = ReadVecMetadata(v, '_ingressEdge')
     return copy
 end
 
