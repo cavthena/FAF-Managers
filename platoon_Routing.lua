@@ -1,12 +1,51 @@
 local ScenarioUtils = import('/lua/sim/ScenarioUtilities.lua')
 local NavUtils = import('/lua/sim/NavUtils.lua')
 
+local function ReadVecComponent(v, numericIndex, axisName)
+    if v == nil then
+        return nil
+    end
+
+    if type(v) == 'table' then
+        local value = rawget(v, numericIndex)
+        if value == nil then
+            value = rawget(v, axisName)
+        end
+        return value
+    end
+
+    local ok, value = pcall(function()
+        return v[axisName]
+    end)
+    if ok then
+        return value
+    end
+
+    return nil
+end
+
+local function VecX(v)
+    return ReadVecComponent(v, 1, 'x') or 0
+end
+
+local function VecY(v)
+    return ReadVecComponent(v, 2, 'y') or 0
+end
+
+local function VecZ(v)
+    return ReadVecComponent(v, 3, 'z') or 0
+end
+
 local function CopyVec(v)
     if not v then
         return nil
     end
 
-    local copy = { v[1] or 0, v[2] or 0, v[3] or 0 }
+    local copy = {
+        VecX(v),
+        VecY(v),
+        VecZ(v)
+    }
     if type(v) == 'table' then
         copy._curve = v._curve
         copy._centered = v._centered
@@ -21,8 +60,8 @@ local function DistSq(a, b)
         return math.huge
     end
 
-    local dx = (a[1] or 0) - (b[1] or 0)
-    local dz = (a[3] or 0) - (b[3] or 0)
+    local dx = VecX(a) - VecX(b)
+    local dz = VecZ(a) - VecZ(b)
     return dx * dx + dz * dz
 end
 
@@ -31,8 +70,8 @@ local function HeadingDegrees(a, b)
         return 0
     end
 
-    local dx = (b[1] or 0) - (a[1] or 0)
-    local dz = (b[3] or 0) - (a[3] or 0)
+    local dx = VecX(b) - VecX(a)
+    local dz = VecZ(b) - VecZ(a)
     if math.abs(dx) < 0.001 and math.abs(dz) < 0.001 then
         return 0
     end
@@ -66,7 +105,7 @@ local function DirectionBetween(a, b)
         return 0, 0, 0
     end
 
-    return Normalize2D((b[1] or 0) - (a[1] or 0), (b[3] or 0) - (a[3] or 0))
+    return Normalize2D(VecX(b) - VecX(a), VecZ(b) - VecZ(a))
 end
 
 local function OffsetPoint(point, dx, dz, y)
@@ -74,7 +113,7 @@ local function OffsetPoint(point, dx, dz, y)
         return nil
     end
 
-    return { (point[1] or 0) + dx, y or point[2] or 0, (point[3] or 0) + dz }
+    return { VecX(point) + dx, y or VecY(point), VecZ(point) + dz }
 end
 
 local function SegmentLength(a, b)
@@ -87,18 +126,18 @@ local function DistanceToLine(point, lineA, lineB)
         return math.huge
     end
 
-    local dx = (lineB[1] or 0) - (lineA[1] or 0)
-    local dz = (lineB[3] or 0) - (lineA[3] or 0)
+    local dx = VecX(lineB) - VecX(lineA)
+    local dz = VecZ(lineB) - VecZ(lineA)
     local lengthSq = dx * dx + dz * dz
     if lengthSq < 0.001 then
         return math.sqrt(DistSq(point, lineA))
     end
 
-    local t = (((point[1] or 0) - (lineA[1] or 0)) * dx + ((point[3] or 0) - (lineA[3] or 0)) * dz) / lengthSq
-    local projX = (lineA[1] or 0) + dx * t
-    local projZ = (lineA[3] or 0) + dz * t
-    local diffX = (point[1] or 0) - projX
-    local diffZ = (point[3] or 0) - projZ
+    local t = ((VecX(point) - VecX(lineA)) * dx + (VecZ(point) - VecZ(lineA)) * dz) / lengthSq
+    local projX = VecX(lineA) + dx * t
+    local projZ = VecZ(lineA) + dz * t
+    local diffX = VecX(point) - projX
+    local diffZ = VecZ(point) - projZ
     return math.sqrt((diffX * diffX) + (diffZ * diffZ))
 end
 
@@ -148,7 +187,7 @@ local function PositionInPlayableArea(pos, area)
         return true
     end
 
-    return pos[1] >= area[1] and pos[1] <= area[3] and pos[3] >= area[2] and pos[3] <= area[4]
+    return VecX(pos) >= area[1] and VecX(pos) <= area[3] and VecZ(pos) >= area[2] and VecZ(pos) <= area[4]
 end
 
 local function ClampToPlayableArea(pos, area, margin)
@@ -157,9 +196,9 @@ local function ClampToPlayableArea(pos, area, margin)
     end
 
     local buffer = margin or 0
-    local x = math.min(math.max(pos[1], area[1] + buffer), area[3] - buffer)
-    local z = math.min(math.max(pos[3], area[2] + buffer), area[4] - buffer)
-    return { x, pos[2] or GetTerrainHeight(x, z), z }
+    local x = math.min(math.max(VecX(pos), area[1] + buffer), area[3] - buffer)
+    local z = math.min(math.max(VecZ(pos), area[2] + buffer), area[4] - buffer)
+    return { x, ReadVecComponent(pos, 2, 'y') or GetTerrainHeight(x, z), z }
 end
 
 local function SurfaceHeightForLayer(layer, x, z)
@@ -175,7 +214,7 @@ local function PointPassable(layer, position)
         return false
     end
 
-    local ok, passable = pcall(NavUtils.CanPathTo, layer, fromPos, toPos)
+    local ok, passable = pcall(NavUtils.CanPathTo, layer, position, position)
     return ok and passable
 end
 
@@ -231,9 +270,9 @@ local function SegmentHasClearance(layer, fromPos, toPos, desiredClearance)
     for i = 0, samples do
         local t = i / samples
         local sample = {
-            Lerp(fromPos[1], toPos[1], t),
-            Lerp(fromPos[2] or 0, toPos[2] or 0, t),
-            Lerp(fromPos[3], toPos[3], t),
+            Lerp(VecX(fromPos), VecX(toPos), t),
+            Lerp(ReadVecComponent(fromPos, 2, 'y') or 0, ReadVecComponent(toPos, 2, 'y') or 0, t),
+            Lerp(VecZ(fromPos), VecZ(toPos), t),
         }
 
         local left, right = SamplePointClearance(layer, sample, dirX, dirZ, clearance, math.max(1, clearance * 0.5))
@@ -482,10 +521,10 @@ local function BuildCardinalIngress(startPos, area)
     end
 
     local distances = {
-        left = math.abs(startPos[1] - area[1]),
-        right = math.abs(area[3] - startPos[1]),
-        bottom = math.abs(startPos[3] - area[2]),
-        top = math.abs(area[4] - startPos[3]),
+        left = math.abs(VecX(startPos) - area[1]),
+        right = math.abs(area[3] - VecX(startPos)),
+        bottom = math.abs(VecZ(startPos) - area[2]),
+        top = math.abs(area[4] - VecZ(startPos)),
     }
 
     local bestEdge = 'left'
@@ -576,7 +615,7 @@ function BuildPlatoonRoute(platoon, destination, opts)
     end
 
     local layer = ResolveLayer(platoon, opts)
-    local startPos = platoon:GetPlatoonPosition()
+    local startPos = CopyVec(platoon:GetPlatoonPosition())
     if not startPos then
         return nil
     end
