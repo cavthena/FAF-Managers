@@ -28,7 +28,8 @@ Usage
         radius           = 60,                        -- optional search radius (defaults to base radius or 60)
         rallyMarker      = 'Attack_Rally_1',          -- optional; falls back to baseMarker
         waveCooldown     = 0,                         -- optional seconds between waves (modes 1/2)
-        spawnFirstDirect = false,                     -- optional, true spawns first wave at rallyMarker
+        spawnFirstDirect = false,                     -- optional legacy alias for SpawnFirstPlatoonAtRally
+        SpawnFirstPlatoonAtRally = false,             -- optional, only first platoon is spawned directly at rallyMarker
         attackFn         = function(platoon) end,     -- optional; may also be a global function name
         attackData       = {},                        -- optional table copied to platoon.PlatoonData
         builderTag       = 'Forward_UB',              -- optional unique tag (defaults to auto-generated)
@@ -140,6 +141,7 @@ local function normalizeParams(p)
         attackFn         = p.attackFn,
         attackData       = p.attackData,
         spawnFirstDirect = p.spawnFirstDirect,
+        SpawnFirstPlatoonAtRally = (p.SpawnFirstPlatoonAtRally ~= nil) and (p.SpawnFirstPlatoonAtRally and true or false) or (p.spawnFirstDirect and true or false),
         builderTag       = p.builderTag,
         radius           = p.radius,
         baseTag          = p.baseTag,
@@ -669,6 +671,7 @@ function Builder:_HandOffPlatoon(units, label)
 
     if self.params.attackFn then
         platoon.PlatoonData = self.params.attackData or {}
+        platoon.PlatoonData.RouteSource = platoon.PlatoonData.RouteSource or 'UnitBuilder'
         _ForkAttack(platoon, self.params.attackFn, platoon.PlatoonData, self.tag)
     else
         self:Warn('No attackFn provided; platoon will idle')
@@ -900,10 +903,12 @@ function Builder:Start()
         self.cleanupTimerThread = self.brain:ForkThread(function() self:CleanupTimerLoop() end)
     end
 
-    if self.params.spawnFirstDirect then
+    local spawnFirstAtRally = (self.params and self.params.SpawnFirstPlatoonAtRally) and not self._firstPlatoonSpawnHandled
+    if spawnFirstAtRally then
         self.wave = (self.wave or 0) + 1
         self.wanted = self:GetWantedForWave(self.wave)
         local p = self:SpawnDirectAndSend(self.wave)
+        self._firstPlatoonSpawnHandled = true
 
         if (self.params.mode or 1) == 3 then
             -- Sustain the platoon we just spawned; no “new wave” bookkeeping.
