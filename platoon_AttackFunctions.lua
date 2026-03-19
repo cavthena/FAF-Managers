@@ -1531,6 +1531,17 @@ local function AttackTargetArea(platoon, target, opts)
     end
 
     local startedOutside = area and not PositionInPlayableArea(startPos, area)
+    local routeOpts = {
+        Formation = opts.Formation,
+        AggressiveMove = opts.AggressiveMove,
+        Amphibious = opts.Amphibious,
+        RouteLayer = layer,
+        RouteSource = (platoon.PlatoonData and platoon.PlatoonData.RouteSource) or opts.RouteSource,
+        StartedOutsidePlayableArea = (platoon.PlatoonData and platoon.PlatoonData.StartedOutsidePlayableArea) or startedOutside,
+        TargetPosition = targetPos,
+        TargetZone = target,
+    }
+
     local bombardRange = nil
     if opts.Bombard then
         bombardRange = MaxWeaponRange(platoon)
@@ -1539,146 +1550,81 @@ local function AttackTargetArea(platoon, target, opts)
         end
     end
 
-    local path = nil
-    local ingress = nil
-    if startedOutside then
-        local ingressReached, ingress, ingressEdge
-        ingressReached, ingress, ingressEdge = MoveToNearestPlayableIngress(platoon, layer, area, opts.Formation, targetPos)
-        if not ingressReached then
-            return 'repath'
-        end
-
-        local currentPos = GetPlatoonPosition(platoon)
-        if area and currentPos then
-            currentPos = ClampToPlayableArea(currentPos, area, 0)
-        end
-
-        local routeStart = currentPos or ingress
-
-        path = FindSafePath(platoon, layer, targetPos, routeStart, opts)
-        if not (path and table.getn(path) > 0) then
-            path = BuildPathSegment(layer, routeStart, targetPos)
-        end
-
-        if path and table.getn(path) > 1 and area and currentPos then
-            local currentEdgeDistance = DistanceToPlayableEdge(currentPos, area)
-            while table.getn(path) > 1 do
-                local first = path[1]
-                if not first then
-                    table.remove(path, 1)
-                else
-                    local firstEdgeDistance = DistanceToPlayableEdge(first, area)
-                    if firstEdgeDistance + 1 < currentEdgeDistance then
-                        table.remove(path, 1)
-                    else
-                        break
-                    end
-                end
-            end
-        end
-
-    else
-        path = FindSafePath(platoon, layer, targetPos, nil, opts)
-    end
-
-    local canPath = CanPathTo(platoon, layer, targetPos)
-    if not canPath and ingress then
-        canPath = CanPathBetween(layer, ingress, targetPos)
-    end
+    local route = Routing.BuildPlatoonRoute(platoon, targetPos, routeOpts)
+    local canPath = route and true or CanPathTo(platoon, layer, targetPos)
     if not canPath then
         if opts.Transport then
             if not TransportAndMove(platoon, targetPos, opts) then
                 return 'fail'
             end
-            path = FindSafePath(platoon, layer, targetPos, nil, opts)
+            routeOpts.ForceRepath = true
+            route = Routing.BuildPlatoonRoute(platoon, targetPos, routeOpts)
         else
             return 'fail'
         end
-    elseif not path then
-        path = FindSafePath(platoon, layer, targetPos, nil, opts)
     end
 
-    if not path then
-        return 'fail'
+    if not route then
+        return 'repath'
     end
 
+    local routeStatus = nil
     if bombardRange then
-        path = ShortenPathForBombard(path, targetPos, bombardRange)
-    end
-
-    local issued = MoveAlongPath(platoon, path, opts.Formation, false, layer, opts.AggressiveMove)
-    if not issued then
-        RoutingLog('Initial path issue failed; attempting repath')
-        path = RecomputePathWithFallback(platoon, layer, targetPos, opts)
-        if not path then
-            if opts.Transport then
-                RoutingLog('Path repath failed; attempting transport fallback')
-                if not TransportAndMove(platoon, targetPos, opts) then
-                    return 'repath'
-                end
-                path = RecomputePathWithFallback(platoon, layer, targetPos, opts)
+        local path = {}
+        for _, waypoint in ipairs(route.waypoints or {}) do
+            if waypoint and waypoint.position then
+                table.insert(path, CopyVector(waypoint.position))
             end
         end
-
-        if not path then
+        path = ShortenPathForBombard(path, targetPos, bombardRange)
+        if not (path and table.getn(path) > 0) then
             return 'repath'
         end
-
-        if bombardRange then
+        if not MoveAlongPath(platoon, path, opts.Formation, false, layer, opts.AggressiveMove) then
+            routeOpts.ForceRepath = true
+            route = Routing.BuildPlatoonRoute(platoon, targetPos, routeOpts)
+            if not (route and route.waypoints) then
+                return 'repath'
+            end
+            path = {}
+            for _, waypoint in ipairs(route.waypoints or {}) do
+                if waypoint and waypoint.position then
+                    table.insert(path, CopyVector(waypoint.position))
+                end
+            end
             path = ShortenPathForBombard(path, targetPos, bombardRange)
+            if not MoveAlongPath(platoon, path, opts.Formation, false, layer, opts.AggressiveMove) then
+                return 'repath'
+            end
+        end
+        routeStatus = 'success'
+    else
+        routeStatus = Routing.FollowStoredPlatoonRoute(platoon, targetPos, routeOpts)
+        if routeStatus == 'repath' then
+            RoutingLog('Initial route follow requested repath; rebuilding authoritative route')
+            routeOpts.ForceRepath = true
+            route = Routing.BuildPlatoonRoute(platoon, targetPos, routeOpts)
+            if not route then
+                if opts.Transport then
+                    RoutingLog('Route rebuild failed; attempting transport fallback')
+                    if not TransportAndMove(platoon, targetPos, opts) then
+                        return 'repath'
+                    end
+                    route = Routing.BuildPlatoonRoute(platoon, targetPos, routeOpts)
+                end
+            end
+            if not route then
+                return 'repath'
+            end
+            routeStatus = Routing.FollowStoredPlatoonRoute(platoon, targetPos, routeOpts)
         end
 
-        issued = MoveAlongPath(platoon, path, opts.Formation, false, layer, opts.AggressiveMove)
-        if not issued then
-            return 'repath'
+        if routeStatus ~= 'attack' and routeStatus ~= 'success' then
+            return routeStatus or 'repath'
         end
     end
 
-    local arrived = false
-    local epsilon = 5
-    local attackTransitionRadius = (target.radius or 0) + 40
     local units = platoon:GetPlatoonUnits() or {}
-    local stuckSeconds = 0
-    local lastPos = GetPlatoonPosition(platoon)
-    local lastDistSq = lastPos and DistanceSq(lastPos, targetPos) or nil
-    while PlatoonAlive(platoon) do
-        local pos = GetPlatoonPosition(platoon)
-        if not pos then break end
-        local arrivalRadius = target.radius + epsilon
-        if attackTransitionRadius > arrivalRadius then
-            arrivalRadius = attackTransitionRadius
-        end
-        if bombardRange and bombardRange > arrivalRadius then
-            arrivalRadius = bombardRange
-        end
-        if DistanceSq(pos, targetPos) < (arrivalRadius * arrivalRadius) then
-            arrived = true
-            break
-        end
-        SafeWait(1)
-        local updatedPos = GetPlatoonPosition(platoon)
-        if not updatedPos then break end
-        local distSq = DistanceSq(updatedPos, targetPos)
-        local movedSq = lastPos and DistanceSq(updatedPos, lastPos) or 0
-        if lastDistSq and (lastDistSq - distSq) > TravelProgressEpsilonSq then
-            stuckSeconds = 0
-        elseif movedSq > TravelProgressEpsilonSq then
-            stuckSeconds = 0
-        else
-            stuckSeconds = stuckSeconds + 1
-        end
-        lastDistSq = distSq
-        lastPos = CopyVector(updatedPos)
-        if stuckSeconds >= TravelStuckSeconds then
-            return 'repath'
-        end
-    end
-
-    if not arrived then
-        return 'fail'
-    end
-
-    units = platoon:GetPlatoonUnits() or {}
     if table.getn(units) == 0 then
         return 'fail'
     end
@@ -1687,28 +1633,40 @@ local function AttackTargetArea(platoon, target, opts)
     local formation = opts.Formation or 'GrowthFormation'
     if opts.Bombard and bombardRange then
         platoon:SetPlatoonFormationOverride(formation)
-        -- Hold position and engage at range
+        -- Hold position and engage at range.
     else
-        -- Final assault stage: always transition into combat movement so platoons
-        -- push through the approach ring instead of idling at the perimeter.
         if formation ~= 'NoFormation' then
             platoon:SetPlatoonFormationOverride(formation)
         else
             platoon:SetPlatoonFormationOverride('NoFormation')
         end
+
         local finalAggressive = target and target.finalAggressiveMove
         if finalAggressive == nil then
             finalAggressive = true
         end
+
+        local approachDegrees = HeadingDegrees(startPos, targetPos)
+        local storedRoute = platoon._storedRoute
+        if storedRoute and storedRoute.waypoints and table.getn(storedRoute.waypoints) > 0 then
+            local finalWaypoint = storedRoute.waypoints[table.getn(storedRoute.waypoints)]
+            if finalWaypoint and finalWaypoint.facing then
+                approachDegrees = finalWaypoint.facing
+            end
+        end
+
         if finalAggressive then
             if formation ~= 'NoFormation' then
-                local approachDegrees = HeadingDegrees(GetPlatoonPosition(platoon), targetPos)
                 IssueFormAggressiveMove(units, targetPos, formation, approachDegrees)
             else
                 IssueAggressiveMove(units, targetPos)
             end
         else
-            IssueMove(units, targetPos)
+            if formation ~= 'NoFormation' then
+                IssueFormMove(units, targetPos, formation, approachDegrees)
+            else
+                IssueMove(units, targetPos)
+            end
         end
     end
 
@@ -1729,6 +1687,7 @@ local function AttackTargetArea(platoon, target, opts)
 
     return 'success'
 end
+
 
 local function WaitForTargets(brain, delay)
     SafeWait(delay or RecheckDelay)
