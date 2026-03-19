@@ -1,6 +1,8 @@
 local ScenarioUtils = import('/lua/sim/ScenarioUtilities.lua')
 local NavUtils = import('/lua/sim/NavUtils.lua')
 
+local SegmentPassable
+
 local function ReadVecComponent(v, numericIndex, axisName)
     if v == nil then
         return nil
@@ -512,7 +514,7 @@ local function AddRouteCurves(route, layer, area)
     return RemoveDuplicateRoutePoints(curved, 2)
 end
 
-local function SegmentPassable(layer, fromPos, toPos)
+function SegmentPassable(layer, fromPos, toPos)
     if not (fromPos and toPos) then
         return false
     end
