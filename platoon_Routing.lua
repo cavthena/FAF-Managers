@@ -316,13 +316,17 @@ local function SegmentClearanceScore(layer, fromPos, toPos, desiredClearance)
         }
 
         local left, right = SamplePointClearance(layer, sample, dirX, dirZ, clearance, math.max(1, clearance * 0.5))
+        if type(left) ~= 'number' or type(right) ~= 'number' then
+            return -1
+        end
+
         local sampleClearance = math.min(left, right)
         if sampleClearance < minClearance then
             minClearance = sampleClearance
         end
     end
 
-    return minClearance
+    return minClearance == math.huge and -1 or minClearance
 end
 
 local function RemoveDuplicateRoutePoints(route, minDistanceSq)
@@ -549,10 +553,13 @@ local function BuildCurveSamples(prev, corner, nextPoint, layer, area)
         return nil
     end
 
-    local localClearance = math.min(
-        SegmentClearanceScore(layer, prev, corner, 6),
-        SegmentClearanceScore(layer, corner, nextPoint, 6)
-    )
+    local incomingClearance = SegmentClearanceScore(layer, prev, corner, 6)
+    local outgoingClearance = SegmentClearanceScore(layer, corner, nextPoint, 6)
+    if type(incomingClearance) ~= 'number' or type(outgoingClearance) ~= 'number' then
+        return nil
+    end
+
+    local localClearance = math.min(incomingClearance, outgoingClearance)
     if localClearance < 0 or localClearance >= 10 then
         return nil
     end
