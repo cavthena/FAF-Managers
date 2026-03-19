@@ -294,6 +294,37 @@ local function SegmentHasClearance(layer, fromPos, toPos, desiredClearance)
     return true
 end
 
+local function SegmentClearanceScore(layer, fromPos, toPos, desiredClearance)
+    if not SegmentPassable(layer, fromPos, toPos) then
+        return -1
+    end
+
+    local dirX, dirZ, length = DirectionBetween(fromPos, toPos)
+    if length < 0.001 then
+        return PointPassable(layer, fromPos) and (desiredClearance or 4) or -1
+    end
+
+    local clearance = desiredClearance or 4
+    local samples = math.max(2, math.floor(length / 6))
+    local minClearance = math.huge
+    for i = 0, samples do
+        local t = i / samples
+        local sample = {
+            Lerp(VecX(fromPos), VecX(toPos), t),
+            Lerp(ReadVecComponent(fromPos, 2, 'y') or 0, ReadVecComponent(toPos, 2, 'y') or 0, t),
+            Lerp(VecZ(fromPos), VecZ(toPos), t),
+        }
+
+        local left, right = SamplePointClearance(layer, sample, dirX, dirZ, clearance, math.max(1, clearance * 0.5))
+        local sampleClearance = math.min(left, right)
+        if sampleClearance < minClearance then
+            minClearance = sampleClearance
+        end
+    end
+
+    return minClearance
+end
+
 local function RemoveDuplicateRoutePoints(route, minDistanceSq)
     if not route or table.getn(route) <= 1 then
         return route
@@ -428,6 +459,79 @@ local function RefineRoute(route, layer, area)
     return refined
 end
 
+local function BuildOrthogonalCornerCandidates(fromPos, toPos)
+    return {
+        { VecX(fromPos), VecY(fromPos), VecZ(toPos) },
+        { VecX(toPos), VecY(fromPos), VecZ(fromPos) },
+    }
+end
+
+local function PickOrthogonalCorner(fromPos, toPos, layer, area, desiredClearance)
+    if not (fromPos and toPos) then
+        return nil
+    end
+
+    local candidates = BuildOrthogonalCornerCandidates(fromPos, toPos)
+    local bestCorner = nil
+    local bestScore = -1
+    local bestLength = nil
+
+    for _, candidate in ipairs(candidates) do
+        local corner = area and ClampToPlayableArea(candidate, area, 0) or candidate
+        if PointPassable(layer, corner) then
+            local firstScore = SegmentClearanceScore(layer, fromPos, corner, desiredClearance)
+            local secondScore = SegmentClearanceScore(layer, corner, toPos, desiredClearance)
+            if firstScore >= desiredClearance and secondScore >= desiredClearance then
+                local cornerScore = math.min(firstScore, secondScore)
+                local cornerLength = SegmentLength(fromPos, corner) + SegmentLength(corner, toPos)
+                if (not bestCorner)
+                    or cornerScore > bestScore
+                    or (cornerScore == bestScore and cornerLength < (bestLength or math.huge))
+                then
+                    bestCorner = corner
+                    bestScore = cornerScore
+                    bestLength = cornerLength
+                end
+            end
+        end
+    end
+
+    return bestCorner
+end
+
+local function OrthogonalizeRoute(route, layer, area)
+    if not route or table.getn(route) <= 1 then
+        return route
+    end
+
+    local orthogonal = { CopyVec(route[1]) }
+    for i = 2, table.getn(route) do
+        local fromPos = orthogonal[table.getn(orthogonal)]
+        local toPos = route[i]
+        if fromPos and toPos then
+            local dx = math.abs(VecX(toPos) - VecX(fromPos))
+            local dz = math.abs(VecZ(toPos) - VecZ(fromPos))
+
+            if dx > 6 and dz > 6 then
+                local corner = PickOrthogonalCorner(fromPos, toPos, layer, area, 6)
+                if corner and DistSq(fromPos, corner) > 4 and DistSq(corner, toPos) > 4 then
+                    if SegmentHasClearance(layer, fromPos, corner, 6)
+                        and SegmentHasClearance(layer, corner, toPos, 6)
+                    then
+                        table.insert(orthogonal, CopyVec(corner))
+                    end
+                end
+            end
+
+            table.insert(orthogonal, CopyVec(toPos))
+        end
+    end
+
+    orthogonal = RemoveDuplicateRoutePoints(orthogonal, 4)
+    orthogonal = RemoveRouteDoubleBack(orthogonal)
+    return orthogonal
+end
+
 local function BuildCurveSamples(prev, corner, nextPoint, layer, area)
     if not (prev and corner and nextPoint) then
         return nil
@@ -441,12 +545,20 @@ local function BuildCurveSamples(prev, corner, nextPoint, layer, area)
 
     local dot = math.max(-1, math.min(1, (inX * outX) + (inZ * outZ)))
     local turnAngle = math.deg(math.acos(dot))
-    if turnAngle < 25 then
+    if turnAngle < 70 then
         return nil
     end
 
-    local radius = math.min(12, inLength * 0.35, outLength * 0.35)
-    radius = math.max(radius, 4)
+    local localClearance = math.min(
+        SegmentClearanceScore(layer, prev, corner, 6),
+        SegmentClearanceScore(layer, corner, nextPoint, 6)
+    )
+    if localClearance < 0 or localClearance >= 10 then
+        return nil
+    end
+
+    local radius = math.min(8, inLength * 0.2, outLength * 0.2, math.max(3, localClearance - 1))
+    radius = math.max(radius, 3)
     local entry = OffsetPoint(corner, -inX * radius, -inZ * radius)
     local exit = OffsetPoint(corner, outX * radius, outZ * radius)
     if area then
@@ -662,6 +774,8 @@ function BuildPlatoonRoute(platoon, destination, opts)
     end
 
     route = RefineRoute(route, layer, area)
+    route = OrthogonalizeRoute(route, layer, area)
+    route = RefineRoute(route, layer, area)
     route = AddRouteCurves(route, layer, area)
     route = RefineRoute(route, layer, area)
 
@@ -694,6 +808,8 @@ function BuildPlatoonRoute(platoon, destination, opts)
         createdAt = GetGameTimeSeconds and GetGameTimeSeconds() or 0,
         destination = CopyVec(target),
         layer = layer,
+        aggressiveMove = opts and opts.AggressiveMove and true or false,
+        formation = opts and opts.Formation or nil,
         waypoints = metadata,
     }
 
@@ -711,6 +827,14 @@ function RebuildPlatoonRouteIfNeeded(platoon, destination, opts)
     end
 
     if DistSq(stored.destination, destination) > (20 * 20) then
+        return BuildPlatoonRoute(platoon, destination, opts)
+    end
+
+    if stored.aggressiveMove ~= (opts and opts.AggressiveMove and true or false) then
+        return BuildPlatoonRoute(platoon, destination, opts)
+    end
+
+    if stored.formation ~= (opts and opts.Formation or nil) then
         return BuildPlatoonRoute(platoon, destination, opts)
     end
 

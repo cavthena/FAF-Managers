@@ -1671,7 +1671,8 @@ end
 function M:_FindBaseEnemyUnits()
     if not (self.brain and self.basePos) then return {} end
     local r = self.params.radius or 60
-    local enemies = self.brain:GetUnitsAroundPoint(categories.ALLUNITS, self.basePos, r, 'Enemy') or {}
+    local responseRadius = math.max(r + 35, math.floor(r * 1.4))
+    local enemies = self.brain:GetUnitsAroundPoint(categories.ALLUNITS, self.basePos, responseRadius, 'Enemy') or {}
     local out = {}
     local i = 1
     while i <= table.getn(enemies) do
@@ -1762,7 +1763,8 @@ function M:_TickBaseDefense(u, id, enemies)
     local healthRatio = _EngineerHealthRatio(u)
     if healthRatio <= 0.25 then
         local enemyPos = best.GetPosition and best:GetPosition() or nil
-        local retreatPos = _RetreatFromEnemy(pos, enemyPos, self.basePos, 30)
+        local retreatDistance = math.max(30, math.floor((self.params.radius or 60) * 0.6))
+        local retreatPos = _RetreatFromEnemy(pos, enemyPos, self.basePos, retreatDistance)
         local rx = math.floor(retreatPos[1] + 0.5)
         local rz = math.floor(retreatPos[3] + 0.5)
         local retreatKey = ('RETREAT:%d:%d'):format(rx, rz)
