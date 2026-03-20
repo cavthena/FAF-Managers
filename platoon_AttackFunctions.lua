@@ -1601,6 +1601,9 @@ local function AttackTargetArea(platoon, target, opts)
         end
         routeStatus = 'success'
     else
+        -- Traversal stays under the routing queue so platoons do not clear and
+        -- reform between route nodes; only the final attack handoff below may
+        -- issue a fresh attack command at the destination.
         routeStatus = Routing.FollowStoredPlatoonRoute(platoon, targetPos, routeOpts)
         if routeStatus == 'repath' then
             RoutingLog('Initial route follow requested repath; rebuilding authoritative route')

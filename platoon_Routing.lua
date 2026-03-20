@@ -18,10 +18,6 @@ local CohesionStragglerDistanceSq = 54 * 54
 local CohesionWorstOutlierDistanceSq = 62 * 62
 local CohesionReformOutlierRatio = 0.40
 local CohesionReformMinMissingUnits = 2
-local CohesionPersistentSamples = 3
-local CohesionRecoverySamples = 2
-local CohesionReformCooldown = 14
-local CohesionReformGracePeriod = 6
 local PlatoonTraversalQueueWindow = 3
 local RouteStuckTimeout = 10
 local RandomizedRouteMaxCandidates = 3
@@ -1083,6 +1079,25 @@ local function DetermineWaypointType(point, index, routeCount)
     return 'transit', false
 end
 
+local function DetermineRouteStage(route, waypoint)
+    if not route then
+        return 'reroute-reset'
+    end
+
+    if not route.initialFormComplete then
+        return 'route-start-form-up'
+    end
+
+    if waypoint and waypoint.staging then
+        if waypoint.waypointType == 'pre-attack' then
+            return 'final-pre-attack-staging'
+        end
+        return 'explicit-staging'
+    end
+
+    return 'normal-traversal'
+end
+
 local function GetPlatoonMainBodyCenter(units)
     if not units then
         return nil, 0
@@ -1145,7 +1160,7 @@ local function GetPlatoonMainBodyCenter(units)
     return { sumX / mainBodyCount, sumY / mainBodyCount, sumZ / mainBodyCount }, mainBodyCount
 end
 
-local function IsPlatoonCohesionBroken(units, route)
+local function SamplePlatoonCohesion(units)
     local mainBodyCenter, mainBodyCount = GetPlatoonMainBodyCenter(units)
     if not mainBodyCenter then
         return false, nil
@@ -1198,44 +1213,15 @@ local function IsPlatoonCohesionBroken(units, route)
     return broken, details
 end
 
-local function ShouldReformPlatoon(route, units, currentTime)
+local function UpdateRouteCohesionState(route, units)
     if not route then
-        return false, nil
+        return nil
     end
 
-    local broken, details = IsPlatoonCohesionBroken(units, route)
+    local broken, details = SamplePlatoonCohesion(units)
     route.cohesionBroken = broken and true or false
     route.cohesionState = details
-
-    if broken then
-        route.cohesionBrokenSamples = (route.cohesionBrokenSamples or 0) + 1
-        route.cohesionStableSamples = 0
-        route.cohesionBrokenSince = route.cohesionBrokenSince or currentTime
-    else
-        route.cohesionBrokenSamples = 0
-        route.cohesionBrokenSince = nil
-        route.cohesionStableSamples = math.min(CohesionRecoverySamples, (route.cohesionStableSamples or 0) + 1)
-        route.needsReform = false
-        return false, details
-    end
-
-    local reformCooldown = route.reformCooldown or CohesionReformCooldown
-    local lastReformTime = route.lastReformTime or -math.huge
-    if currentTime < (lastReformTime + reformCooldown) then
-        return false, details
-    end
-
-    local firstIssueTime = route.initialFormIssuedTime or route.createdAt or 0
-    if currentTime < (firstIssueTime + CohesionReformGracePeriod) then
-        return false, details
-    end
-
-    if (route.cohesionBrokenSamples or 0) < CohesionPersistentSamples then
-        return false, details
-    end
-
-    route.needsReform = true
-    return true, details
+    return details
 end
 
 local function BuildWaypointMetadata(route, destination, opts, layer, startedOutside, ingressEdge)
@@ -1287,16 +1273,11 @@ local function BuildWaypointMetadata(route, destination, opts, layer, startedOut
         lastQueuedIndex = 0,
         lastIssuedIndex = nil,
         lastIssuedTime = nil,
-        initialFormIssued = false,
+        routeStage = 'route-start-form-up',
+        initialFormComplete = false,
         initialFormIssuedTime = nil,
-        needsReform = false,
         cohesionBroken = false,
         cohesionState = nil,
-        cohesionBrokenSamples = 0,
-        cohesionStableSamples = 0,
-        cohesionBrokenSince = nil,
-        lastReformTime = nil,
-        reformCooldown = (opts and opts.ReformCooldown) or CohesionReformCooldown,
         queueWindow = (opts and opts.QueueWindow) or PlatoonTraversalQueueWindow,
         destination = CopyVec(destination),
         targetPosition = opts and opts.TargetPosition and CopyVec(opts.TargetPosition) or CopyVec(destination),
@@ -1619,15 +1600,13 @@ local function IssueFormationOrder(platoon, units, route, waypoint, waypointInde
     end
 
     if commandMode == 'initial-form' then
-        route.initialFormIssued = true
+        route.initialFormComplete = true
         route.initialFormIssuedTime = gameTime
-    elseif commandMode == 'reform' then
-        route.lastReformTime = gameTime
-        route.needsReform = false
-        route.cohesionBroken = false
-        route.cohesionBrokenSamples = 0
-        route.cohesionStableSamples = 0
-        route.cohesionBrokenSince = nil
+        if waypoint and waypoint.staging then
+            waypoint.stagingIssued = true
+        end
+    elseif commandMode == 'staging-form' and waypoint then
+        waypoint.stagingIssued = true
     end
 
     route.lastIssuedIndex = waypointIndex or route.lastIssuedIndex
@@ -1640,8 +1619,8 @@ local function IssueInitialFormationOrder(platoon, units, route, waypoint, waypo
     return IssueFormationOrder(platoon, units, route, waypoint, waypointIndex, 'initial-form')
 end
 
-local function IssueCohesionRecoveryReform(platoon, units, route, waypoint, waypointIndex)
-    return IssueFormationOrder(platoon, units, route, waypoint, waypointIndex, 'reform')
+local function IssueDeliberateStagingOrder(platoon, units, route, waypoint, waypointIndex)
+    return IssueFormationOrder(platoon, units, route, waypoint, waypointIndex, 'staging-form')
 end
 
 function FollowStoredPlatoonRoute(platoon, destination, opts)
@@ -1677,6 +1656,7 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
         end
 
         if DistSq(platoonPos, stored.destination) <= FinalAttackDistanceSq then
+            stored.routeStage = 'final-attack'
             return 'attack'
         end
 
@@ -1684,9 +1664,11 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
             local waypoint = stored.waypoints[stored.currentIndex]
             local nextWaypoint = stored.waypoints[stored.currentIndex + 1]
             if not waypoint then
+                stored.routeStage = 'reroute-reset'
                 return 'repath'
             end
             if not (waypoint.position and PointPassable(stored.layer, waypoint.position)) then
+                stored.routeStage = 'reroute-reset'
                 return 'repath'
             end
             if not HasWaypointBeenPassed(platoonPos, waypoint, nextWaypoint) then
@@ -1697,20 +1679,27 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
 
         if stored.currentIndex > waypointCount then
             if destination and DistSq(platoonPos, destination) <= FinalAttackDistanceSq then
+                stored.routeStage = 'final-attack'
                 return 'attack'
             end
+            stored.routeStage = 'final-attack'
             return 'success'
         end
 
         local currentWaypoint = stored.waypoints[stored.currentIndex]
         if not currentWaypoint then
+            stored.routeStage = 'reroute-reset'
             return 'repath'
         end
-        if not stored.initialFormIssued then
+        stored.routeStage = DetermineRouteStage(stored, currentWaypoint)
+
+        if stored.routeStage == 'route-start-form-up' then
             if not IssueInitialFormationOrder(platoon, units, stored, currentWaypoint, stored.currentIndex) then
+                stored.routeStage = 'reroute-reset'
                 return 'repath'
             end
             if not QueueTraversalWindow(platoon, stored) then
+                stored.routeStage = 'reroute-reset'
                 return 'repath'
             end
             lastProgressTime = GetGameTimeSeconds and GetGameTimeSeconds() or lastProgressTime
@@ -1718,21 +1707,24 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
             lastProgressIndex = stored.currentIndex
             lastProgressDistanceSq = DistSq(platoonPos, currentWaypoint.position)
         else
-            local currentTime = GetGameTimeSeconds and GetGameTimeSeconds() or 0
-            local shouldReform = ShouldReformPlatoon(stored, units, currentTime)
-            if shouldReform then
-                if not IssueCohesionRecoveryReform(platoon, units, stored, currentWaypoint, stored.currentIndex) then
+            UpdateRouteCohesionState(stored, units)
+
+            if currentWaypoint.staging and not currentWaypoint.stagingIssued then
+                if not IssueDeliberateStagingOrder(platoon, units, stored, currentWaypoint, stored.currentIndex) then
+                    stored.routeStage = 'reroute-reset'
                     return 'repath'
                 end
                 if not QueueTraversalWindow(platoon, stored) then
+                    stored.routeStage = 'reroute-reset'
                     return 'repath'
                 end
-                lastProgressTime = currentTime
+                lastProgressTime = GetGameTimeSeconds and GetGameTimeSeconds() or lastProgressTime
                 lastProgressPosition = CopyVec(platoonPos)
                 lastProgressIndex = stored.currentIndex
                 lastProgressDistanceSq = DistSq(platoonPos, currentWaypoint.position)
             elseif (stored.lastQueuedIndex or 0) < math.min(waypointCount, stored.currentIndex + math.max(1, stored.queueWindow or PlatoonTraversalQueueWindow) - 1) then
                 if not QueueTraversalWindow(platoon, stored) then
+                    stored.routeStage = 'reroute-reset'
                     return 'repath'
                 end
             end
@@ -1749,7 +1741,13 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
             lastProgressPosition = CopyVec(platoonPos)
             lastProgressIndex = stored.currentIndex
             lastProgressDistanceSq = distanceToWaypointSq
+            if stored.currentIndex <= waypointCount then
+                stored.routeStage = DetermineRouteStage(stored, stored.waypoints[stored.currentIndex])
+            else
+                stored.routeStage = 'final-attack'
+            end
         elseif (GetGameTimeSeconds and GetGameTimeSeconds() or 0) >= (lastProgressTime + RouteStuckTimeout) then
+            stored.routeStage = 'reroute-reset'
             return 'repath'
         end
 
