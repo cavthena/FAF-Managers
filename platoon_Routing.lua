@@ -13,12 +13,17 @@ local ContinuousReachDistanceSq = 64
 local ContinuousQueueDistanceSq = 196
 local FinalAttackDistanceSq = 40 * 40
 
-local CohesionMainBodyRadiusSq = 26 * 26
-local CohesionStragglerDistanceSq = 46 * 46
-local CohesionReformOutlierRatio = 0.35
+local CohesionMainBodyRadiusSq = 30 * 30
+local CohesionStragglerDistanceSq = 54 * 54
+local CohesionWorstOutlierDistanceSq = 62 * 62
+local CohesionReformOutlierRatio = 0.40
 local CohesionReformMinMissingUnits = 2
+local CohesionPersistentSamples = 3
+local CohesionRecoverySamples = 2
 local CohesionReformCooldown = 14
 local CohesionReformGracePeriod = 6
+local PlatoonTraversalQueueWindow = 3
+local RouteStuckTimeout = 10
 local RandomizedRouteMaxCandidates = 3
 local RandomizedRouteLengthSlack = 1.35
 
@@ -1113,6 +1118,7 @@ local function IsPlatoonCohesionBroken(units, route)
 
     local totalUnits = 0
     local outliers = 0
+    local severeOutliers = 0
     local worstDistanceSq = 0
     for _, unit in ipairs(units or {}) do
         if unit and not unit.Dead then
@@ -1120,6 +1126,9 @@ local function IsPlatoonCohesionBroken(units, route)
             local distanceSq = UnitDistanceSqToPoint(unit, mainBodyCenter)
             if distanceSq > CohesionStragglerDistanceSq then
                 outliers = outliers + 1
+                if distanceSq > CohesionWorstOutlierDistanceSq then
+                    severeOutliers = severeOutliers + 1
+                end
                 if distanceSq > worstDistanceSq then
                     worstDistanceSq = distanceSq
                 end
@@ -1127,31 +1136,31 @@ local function IsPlatoonCohesionBroken(units, route)
         end
     end
 
-    if totalUnits <= 1 then
-        return false, {
-            center = mainBodyCenter,
-            totalUnits = totalUnits,
-            mainBodyCount = mainBodyCount,
-            outliers = outliers,
-            worstDistanceSq = worstDistanceSq,
-        }
-    end
-
-    local missingForReform = math.max(
-        totalUnits <= 3 and 1 or CohesionReformMinMissingUnits,
-        math.ceil(totalUnits * CohesionReformOutlierRatio)
-    )
-    local mainBodyStable = mainBodyCount >= math.max(1, math.ceil(totalUnits * 0.5))
-    local broken = mainBodyStable and outliers >= missingForReform
-
-    return broken, {
+    local details = {
         center = mainBodyCenter,
         totalUnits = totalUnits,
         mainBodyCount = mainBodyCount,
         outliers = outliers,
+        severeOutliers = severeOutliers,
         worstDistanceSq = worstDistanceSq,
-        missingForReform = missingForReform,
     }
+
+    if totalUnits <= 2 then
+        return false, details
+    end
+
+    local missingForReform = math.max(
+        CohesionReformMinMissingUnits,
+        math.ceil(totalUnits * CohesionReformOutlierRatio)
+    )
+    details.missingForReform = missingForReform
+
+    local mainBodyStable = mainBodyCount >= math.max(2, math.ceil(totalUnits * 0.55))
+    local enoughOutliers = outliers >= missingForReform
+    local severeBreak = severeOutliers >= math.max(1, math.floor(missingForReform * 0.5))
+    local broken = mainBodyStable and enoughOutliers and (severeBreak or outliers >= (missingForReform + 1))
+
+    return broken, details
 end
 
 local function ShouldReformPlatoon(route, units, currentTime)
@@ -1163,7 +1172,14 @@ local function ShouldReformPlatoon(route, units, currentTime)
     route.cohesionBroken = broken and true or false
     route.cohesionState = details
 
-    if not broken then
+    if broken then
+        route.cohesionBrokenSamples = (route.cohesionBrokenSamples or 0) + 1
+        route.cohesionStableSamples = 0
+        route.cohesionBrokenSince = route.cohesionBrokenSince or currentTime
+    else
+        route.cohesionBrokenSamples = 0
+        route.cohesionBrokenSince = nil
+        route.cohesionStableSamples = math.min(CohesionRecoverySamples, (route.cohesionStableSamples or 0) + 1)
         route.needsReform = false
         return false, details
     end
@@ -1179,24 +1195,12 @@ local function ShouldReformPlatoon(route, units, currentTime)
         return false, details
     end
 
+    if (route.cohesionBrokenSamples or 0) < CohesionPersistentSamples then
+        return false, details
+    end
+
     route.needsReform = true
     return true, details
-end
-
-local function DetermineQueueProgressThreshold(waypoint)
-    if not waypoint or not waypoint.continuous then
-        return 1
-    end
-
-    if waypoint.waypointType == 'corridor' then
-        return 0.15
-    elseif waypoint.waypointType == 'curve' then
-        return 0.12
-    elseif waypoint.waypointType == 'ingress' then
-        return 0.20
-    end
-
-    return 0.25
 end
 
 local function BuildWaypointMetadata(route, destination, opts, layer, startedOutside, ingressEdge)
@@ -1220,7 +1224,6 @@ local function BuildWaypointMetadata(route, destination, opts, layer, startedOut
 
         table.insert(metadata, {
             position = point,
-            useFormation = (not continuous) and formation and formation ~= 'NoFormation' and true or false,
             aggressiveMove = aggressiveMove,
             facing = commandFacing,
             arrivalFacing = arrivalFacing,
@@ -1230,7 +1233,6 @@ local function BuildWaypointMetadata(route, destination, opts, layer, startedOut
             waypointType = waypointType,
             staging = staging,
             continuous = continuous,
-            allowReform = staging,
             reachDistanceSq = reachDistanceSq,
             queueDistanceSq = continuous and DetermineWaypointQueueDistanceSq(waypointType, segmentLength, nextSegmentLength, turnAngle) or reachDistanceSq,
             segmentStart = CopyVec(prevPoint),
@@ -1247,7 +1249,7 @@ local function BuildWaypointMetadata(route, destination, opts, layer, startedOut
         stamp = RouteStamp,
         createdAt = GetGameTimeSeconds and GetGameTimeSeconds() or 0,
         currentIndex = 1,
-        queuedIndex = nil,
+        lastQueuedIndex = 0,
         lastIssuedIndex = nil,
         lastIssuedTime = nil,
         initialFormIssued = false,
@@ -1255,8 +1257,12 @@ local function BuildWaypointMetadata(route, destination, opts, layer, startedOut
         needsReform = false,
         cohesionBroken = false,
         cohesionState = nil,
+        cohesionBrokenSamples = 0,
+        cohesionStableSamples = 0,
+        cohesionBrokenSince = nil,
         lastReformTime = nil,
         reformCooldown = (opts and opts.ReformCooldown) or CohesionReformCooldown,
+        queueWindow = (opts and opts.QueueWindow) or PlatoonTraversalQueueWindow,
         destination = CopyVec(destination),
         targetPosition = opts and opts.TargetPosition and CopyVec(opts.TargetPosition) or CopyVec(destination),
         targetZone = opts and opts.TargetZone or nil,
@@ -1269,6 +1275,7 @@ local function BuildWaypointMetadata(route, destination, opts, layer, startedOut
         startedOutsidePlayableArea = startedOutside and true or false,
         ingressEdge = ingressEdge,
         waypoints = metadata,
+        queuedIndex = nil,
     }
 end
 
@@ -1301,9 +1308,11 @@ local function SyncRouteOptions(route, opts)
     if opts and opts.RouteVariant ~= nil then
         route.routeVariant = opts.RouteVariant
     end
+    if opts and opts.QueueWindow ~= nil then
+        route.queueWindow = math.max(1, opts.QueueWindow)
+    end
 
     for _, waypoint in ipairs(route.waypoints or {}) do
-        waypoint.useFormation = (not waypoint.continuous) and route.formation and route.formation ~= 'NoFormation' and true or false
         waypoint.aggressiveMove = route.aggressiveMove
         if waypoint.segmentStart and waypoint.segmentEnd then
             waypoint.arrivalFacing, waypoint.departureFacing, waypoint.flowFacing, waypoint.commandFacing = DetermineWaypointFacing(
@@ -1326,18 +1335,17 @@ local function SyncRouteOptions(route, opts)
             waypoint.nextSegmentLength = 0
         end
         waypoint.turnAngle = AngleDeltaDegrees(waypoint.arrivalFacing, waypoint.departureFacing)
-        if waypoint.continuous then
-            waypoint.queueDistanceSq = DetermineWaypointQueueDistanceSq(
+        waypoint.queueDistanceSq = waypoint.continuous
+            and DetermineWaypointQueueDistanceSq(
                 waypoint.waypointType,
                 waypoint.segmentLength or 0,
                 waypoint.nextSegmentLength or 0,
                 waypoint.turnAngle or 0
             )
-        else
-            waypoint.queueDistanceSq = waypoint.reachDistanceSq or SegmentReachDistanceSq
-        end
+            or (waypoint.reachDistanceSq or SegmentReachDistanceSq)
     end
 
+    route.queuedIndex = route.lastQueuedIndex and route.lastQueuedIndex > 0 and route.lastQueuedIndex or nil
     return route
 end
 
@@ -1477,82 +1485,101 @@ local function HasWaypointBeenPassed(platoonPos, waypoint, nextWaypoint)
     return false
 end
 
-local function ShouldQueueNextWaypoint(platoonPos, waypoint, nextWaypoint)
-    if not (platoonPos and waypoint and nextWaypoint and waypoint.continuous) then
+local function AdvanceStoredRouteIndex(stored, nextIndex)
+    stored.currentIndex = nextIndex
+    if stored.lastQueuedIndex and stored.lastQueuedIndex < nextIndex then
+        stored.lastQueuedIndex = nextIndex - 1
+    end
+    stored.queuedIndex = stored.lastQueuedIndex and stored.lastQueuedIndex > 0 and stored.lastQueuedIndex or nil
+end
+
+local function ResetQueuedTraversal(route, anchorIndex)
+    if not route then
+        return
+    end
+
+    route.lastQueuedIndex = math.max(0, (anchorIndex or route.currentIndex or 1) - 1)
+    route.queuedIndex = route.lastQueuedIndex > 0 and route.lastQueuedIndex or nil
+end
+
+local function QueuePlatoonMove(platoon, aggressiveMove, position)
+    if not (platoon and position) then
         return false
     end
 
-    local distSq = DistSq(platoonPos, waypoint.position)
-    if distSq > (waypoint.queueDistanceSq or waypoint.reachDistanceSq or SegmentReachDistanceSq) then
-        return false
-    end
-
-    local progress, segmentLength = ProjectionAlongSegment(platoonPos, waypoint.segmentStart, waypoint.segmentEnd)
-    if segmentLength > 0 then
-        local progressThreshold = DetermineQueueProgressThreshold(waypoint)
-        local absoluteLead = waypoint.waypointType == 'curve' and 12 or 10
-        local queueProgress = math.max(0, math.min(segmentLength * progressThreshold, segmentLength - absoluteLead))
-        if progress < queueProgress then
+    if aggressiveMove then
+        if not platoon.AggressiveMoveToLocation then
             return false
         end
+        local ok = pcall(platoon.AggressiveMoveToLocation, platoon, position)
+        return ok
     end
 
-    if nextWaypoint.staging or nextWaypoint.allowReform then
-        return distSq <= math.max(waypoint.reachDistanceSq or SegmentReachDistanceSq, SegmentReachDistanceSq)
+    if not platoon.MoveToLocation then
+        return false
     end
 
+    local ok = pcall(platoon.MoveToLocation, platoon, position, false)
+    return ok
+end
+
+local function QueueTraversalWindow(platoon, route)
+    if not (platoon and route and route.waypoints) then
+        return false
+    end
+
+    local waypointCount = table.getn(route.waypoints)
+    if waypointCount == 0 then
+        return false
+    end
+
+    local currentIndex = math.max(1, math.min(route.currentIndex or 1, waypointCount))
+    local queueWindow = math.max(1, route.queueWindow or PlatoonTraversalQueueWindow)
+    local queueLimit = math.min(waypointCount, currentIndex + queueWindow - 1)
+    local nextIndex = math.max(currentIndex, (route.lastQueuedIndex or 0) + 1)
+
+    for waypointIndex = nextIndex, queueLimit do
+        local waypoint = route.waypoints[waypointIndex]
+        if not (waypoint and waypoint.position and PointPassable(route.layer, waypoint.position)) then
+            return false
+        end
+
+        if not QueuePlatoonMove(platoon, waypoint.aggressiveMove, waypoint.position) then
+            return false
+        end
+
+        route.lastQueuedIndex = waypointIndex
+        route.lastIssuedIndex = waypointIndex
+        route.lastIssuedTime = GetGameTimeSeconds and GetGameTimeSeconds() or route.lastIssuedTime
+    end
+
+    route.queuedIndex = route.lastQueuedIndex and route.lastQueuedIndex > 0 and route.lastQueuedIndex or nil
     return true
 end
 
-local function AdvanceStoredRouteIndex(stored, nextIndex)
-    stored.currentIndex = nextIndex
-    if stored.queuedIndex and stored.queuedIndex <= nextIndex then
-        stored.queuedIndex = nil
-    end
-end
-
-local function IssueWaypointCommand(platoon, units, route, waypoint, waypointIndex, commandMode)
+local function IssueFormationOrder(platoon, units, route, waypoint, waypointIndex, commandMode)
     if not (platoon and units and route and waypoint and waypoint.position) then
         return false
     end
 
     local gameTime = GetGameTimeSeconds and GetGameTimeSeconds() or 0
-    local forceIssue = commandMode == 'initial-form' or commandMode == 'reform'
-    if waypointIndex and route.lastIssuedIndex and waypointIndex <= route.lastIssuedIndex and not forceIssue then
-        return true
-    end
-
     local formation = route.formation
-    local position = waypoint.position
-    local facing = waypoint.commandFacing or waypoint.flowFacing or waypoint.departureFacing or waypoint.arrivalFacing or waypoint.facing or 0
-    local useFormation = false
+    local useFormation = formation and formation ~= 'NoFormation'
+    local facing = waypoint.commandFacing or waypoint.arrivalFacing or waypoint.flowFacing or waypoint.facing or 0
 
-    if commandMode == 'initial-form' or commandMode == 'reform' then
-        useFormation = formation and formation ~= 'NoFormation' and true or false
-        facing = waypoint.commandFacing or waypoint.arrivalFacing or facing
-    elseif waypoint.continuous then
-        useFormation = false
-        facing = waypoint.flowFacing or waypoint.departureFacing or facing
-    elseif waypoint.allowReform then
-        useFormation = waypoint.useFormation and true or false
-        facing = waypoint.commandFacing or waypoint.arrivalFacing or facing
-    else
-        useFormation = waypoint.useFormation and true or false
-    end
+    IssueClearCommands(units)
 
-    if useFormation and formation and formation ~= 'NoFormation' then
+    if useFormation then
         platoon:SetPlatoonFormationOverride(formation)
-        if waypoint.aggressiveMove then
-            IssueFormAggressiveMove(units, position, formation, facing)
+        if route.aggressiveMove then
+            IssueFormAggressiveMove(units, waypoint.position, formation, facing)
         else
-            IssueFormMove(units, position, formation, facing)
+            IssueFormMove(units, waypoint.position, formation, facing)
         end
     else
         platoon:SetPlatoonFormationOverride('NoFormation')
-        if waypoint.aggressiveMove then
-            IssueAggressiveMove(units, position)
-        else
-            IssueMove(units, position)
+        if not QueuePlatoonMove(platoon, route.aggressiveMove, waypoint.position) then
+            return false
         end
     end
 
@@ -1563,23 +1590,23 @@ local function IssueWaypointCommand(platoon, units, route, waypoint, waypointInd
         route.lastReformTime = gameTime
         route.needsReform = false
         route.cohesionBroken = false
+        route.cohesionBrokenSamples = 0
+        route.cohesionStableSamples = 0
+        route.cohesionBrokenSince = nil
     end
 
     route.lastIssuedIndex = waypointIndex or route.lastIssuedIndex
     route.lastIssuedTime = gameTime
+    ResetQueuedTraversal(route, (waypointIndex or route.currentIndex or 1) + 1)
     return true
 end
 
 local function IssueInitialFormationOrder(platoon, units, route, waypoint, waypointIndex)
-    return IssueWaypointCommand(platoon, units, route, waypoint, waypointIndex, 'initial-form')
-end
-
-local function IssueContinuousWaypointOrder(platoon, units, route, waypoint, waypointIndex)
-    return IssueWaypointCommand(platoon, units, route, waypoint, waypointIndex, 'continuous')
+    return IssueFormationOrder(platoon, units, route, waypoint, waypointIndex, 'initial-form')
 end
 
 local function IssueCohesionRecoveryReform(platoon, units, route, waypoint, waypointIndex)
-    return IssueWaypointCommand(platoon, units, route, waypoint, waypointIndex, 'reform')
+    return IssueFormationOrder(platoon, units, route, waypoint, waypointIndex, 'reform')
 end
 
 function FollowStoredPlatoonRoute(platoon, destination, opts)
@@ -1598,146 +1625,103 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
     end
 
     local waypointCount = table.getn(stored.waypoints)
-    if (stored.currentIndex or 1) > waypointCount then
-        stored.queuedIndex = nil
-        if destination and DistSq(platoon:GetPlatoonPosition(), destination) <= FinalAttackDistanceSq then
-            return 'attack'
-        end
-        return 'success'
-    end
-
     stored.currentIndex = math.max(1, math.min(stored.currentIndex or 1, waypointCount))
-    if stored.queuedIndex then
-        local queuedIndex = math.min(stored.queuedIndex, waypointCount)
-        if queuedIndex > stored.currentIndex then
-            stored.queuedIndex = queuedIndex
-        else
-            stored.queuedIndex = nil
-        end
-    end
-    if stored.lastIssuedIndex then
-        stored.lastIssuedIndex = math.min(stored.lastIssuedIndex, waypointCount)
-    end
+    stored.lastQueuedIndex = math.max(0, math.min(stored.lastQueuedIndex or 0, waypointCount))
+    stored.queuedIndex = stored.lastQueuedIndex > 0 and stored.lastQueuedIndex or nil
 
-    local index = stored.currentIndex
-    while index <= waypointCount do
-        local waypoint = stored.waypoints[index]
-        if not waypoint then
-            return 'repath'
-        end
+    local lastProgressTime = GetGameTimeSeconds and GetGameTimeSeconds() or 0
+    local initialPlatoonPos = platoon:GetPlatoonPosition()
+    local lastProgressPosition = initialPlatoonPos and CopyVec(initialPlatoonPos) or nil
+    local lastProgressIndex = stored.currentIndex
+    local lastProgressDistanceSq = math.huge
 
-        local position = waypoint.position
-        if not (position and PointPassable(stored.layer, position)) then
-            return 'repath'
-        end
-
+    while PlatoonAlive(platoon) do
         local platoonPos = platoon:GetPlatoonPosition()
         if not platoonPos then
             return 'fail'
         end
 
         if DistSq(platoonPos, stored.destination) <= FinalAttackDistanceSq then
-            stored.currentIndex = index
             return 'attack'
         end
 
-        local nextWaypoint = stored.waypoints[index + 1]
-        if HasWaypointBeenPassed(platoonPos, waypoint, nextWaypoint) then
-            index = index + 1
-            AdvanceStoredRouteIndex(stored, index)
+        while stored.currentIndex <= waypointCount do
+            local waypoint = stored.waypoints[stored.currentIndex]
+            local nextWaypoint = stored.waypoints[stored.currentIndex + 1]
+            if not waypoint then
+                return 'repath'
+            end
+            if not (waypoint.position and PointPassable(stored.layer, waypoint.position)) then
+                return 'repath'
+            end
+            if not HasWaypointBeenPassed(platoonPos, waypoint, nextWaypoint) then
+                break
+            end
+            AdvanceStoredRouteIndex(stored, stored.currentIndex + 1)
+        end
+
+        if stored.currentIndex > waypointCount then
+            if destination and DistSq(platoonPos, destination) <= FinalAttackDistanceSq then
+                return 'attack'
+            end
+            return 'success'
+        end
+
+        local currentWaypoint = stored.waypoints[stored.currentIndex]
+        if not currentWaypoint then
+            return 'repath'
+        end
+        if not stored.initialFormIssued then
+            if not IssueInitialFormationOrder(platoon, units, stored, currentWaypoint, stored.currentIndex) then
+                return 'repath'
+            end
+            if not QueueTraversalWindow(platoon, stored) then
+                return 'repath'
+            end
+            lastProgressTime = GetGameTimeSeconds and GetGameTimeSeconds() or lastProgressTime
+            lastProgressPosition = CopyVec(platoonPos)
+            lastProgressIndex = stored.currentIndex
+            lastProgressDistanceSq = DistSq(platoonPos, currentWaypoint.position)
         else
-            if not SegmentPassable(stored.layer, platoonPos, position) and index > 1 then
-                return 'repath'
-            end
-
-            local issued = false
-            local gameTime = GetGameTimeSeconds and GetGameTimeSeconds() or 0
-            if not stored.initialFormIssued then
-                issued = IssueInitialFormationOrder(platoon, units, stored, waypoint, index)
-            else
-                local shouldReform = false
-                shouldReform = ShouldReformPlatoon(stored, units, gameTime)
-                if shouldReform then
-                    issued = IssueCohesionRecoveryReform(platoon, units, stored, waypoint, index)
-                else
-                    issued = IssueContinuousWaypointOrder(platoon, units, stored, waypoint, index)
-                end
-            end
-
-            if not issued then
-                return 'repath'
-            end
-
-            local segmentTimeout = math.max(10, math.min(45, math.floor(SegmentLength(platoonPos, position) * 0.75) + 8))
-            local stuckSeconds = 0
-            local lastPos = CopyVec(platoonPos)
-            local lastDistSq = DistSq(platoonPos, position)
-
-            while segmentTimeout > 0 do
-                WaitSeconds(1)
-                segmentTimeout = segmentTimeout - 1
-
-                local currentPos = platoon:GetPlatoonPosition()
-                if not currentPos then
-                    return 'fail'
-                end
-
-                if DistSq(currentPos, stored.destination) <= FinalAttackDistanceSq then
-                    stored.currentIndex = index
-                    return 'attack'
-                end
-
-                local currentTime = GetGameTimeSeconds and GetGameTimeSeconds() or gameTime
-                local shouldReform = false
-                shouldReform = stored.initialFormIssued and ShouldReformPlatoon(stored, units, currentTime)
-                if shouldReform then
-                    if not IssueCohesionRecoveryReform(platoon, units, stored, waypoint, index) then
-                        return 'repath'
-                    end
-                    stored.queuedIndex = nil
-                    stuckSeconds = 0
-                elseif nextWaypoint and stored.queuedIndex ~= (index + 1) and ShouldQueueNextWaypoint(currentPos, waypoint, nextWaypoint) then
-                    if not IssueContinuousWaypointOrder(platoon, units, stored, nextWaypoint, index + 1) then
-                        return 'repath'
-                    end
-                    stored.queuedIndex = index + 1
-                end
-
-                if HasWaypointBeenPassed(currentPos, waypoint, nextWaypoint) then
-                    index = index + 1
-                    AdvanceStoredRouteIndex(stored, index)
-                    break
-                end
-
-                local distSq = DistSq(currentPos, position)
-                local movedSq = DistSq(currentPos, lastPos)
-                if (lastDistSq - distSq) > 4 or movedSq > 4 then
-                    stuckSeconds = 0
-                else
-                    stuckSeconds = stuckSeconds + 1
-                end
-
-                if stuckSeconds >= 6 then
+            local currentTime = GetGameTimeSeconds and GetGameTimeSeconds() or 0
+            local shouldReform = ShouldReformPlatoon(stored, units, currentTime)
+            if shouldReform then
+                if not IssueCohesionRecoveryReform(platoon, units, stored, currentWaypoint, stored.currentIndex) then
                     return 'repath'
                 end
-
-                lastPos = CopyVec(currentPos)
-                lastDistSq = distSq
-            end
-
-            if segmentTimeout <= 0 and index <= waypointCount then
-                return 'repath'
+                if not QueueTraversalWindow(platoon, stored) then
+                    return 'repath'
+                end
+                lastProgressTime = currentTime
+                lastProgressPosition = CopyVec(platoonPos)
+                lastProgressIndex = stored.currentIndex
+                lastProgressDistanceSq = DistSq(platoonPos, currentWaypoint.position)
+            elseif (stored.lastQueuedIndex or 0) < math.min(waypointCount, stored.currentIndex + math.max(1, stored.queueWindow or PlatoonTraversalQueueWindow) - 1) then
+                if not QueueTraversalWindow(platoon, stored) then
+                    return 'repath'
+                end
             end
         end
+
+        local distanceToWaypointSq = DistSq(platoonPos, currentWaypoint.position)
+        local movedSq = lastProgressPosition and DistSq(platoonPos, lastProgressPosition) or math.huge
+        local routeAdvanced = stored.currentIndex > lastProgressIndex
+        local madeMovementProgress = movedSq > 9
+        local madePathProgress = routeAdvanced or (lastProgressDistanceSq - distanceToWaypointSq) > 16
+
+        if routeAdvanced or madeMovementProgress or madePathProgress then
+            lastProgressTime = GetGameTimeSeconds and GetGameTimeSeconds() or lastProgressTime
+            lastProgressPosition = CopyVec(platoonPos)
+            lastProgressIndex = stored.currentIndex
+            lastProgressDistanceSq = distanceToWaypointSq
+        elseif (GetGameTimeSeconds and GetGameTimeSeconds() or 0) >= (lastProgressTime + RouteStuckTimeout) then
+            return 'repath'
+        end
+
+        WaitSeconds(1)
     end
 
-    stored.currentIndex = waypointCount + 1
-    stored.queuedIndex = nil
-    if destination and DistSq(platoon:GetPlatoonPosition(), destination) <= FinalAttackDistanceSq then
-        return 'attack'
-    end
-
-    return 'success'
+    return 'fail'
 end
 
 function CanPathBetween(layer, fromPos, toPos)

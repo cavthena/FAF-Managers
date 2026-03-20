@@ -1510,6 +1510,21 @@ local function UpdateStructureAttacks(platoon, target, opts, brain, enemyBrains,
     return 'continue'
 end
 
+local function ExtractStoredRoutePath(route)
+    local path = {}
+    for _, waypoint in ipairs(route and route.waypoints or {}) do
+        if waypoint and waypoint.position then
+            table.insert(path, CopyVector(waypoint.position))
+        end
+    end
+    return path
+end
+
+local function RebuildAttackRoute(platoon, targetPos, routeOpts)
+    routeOpts.ForceRepath = true
+    return Routing.BuildPlatoonRoute(platoon, targetPos, routeOpts)
+end
+
 local function AttackTargetArea(platoon, target, opts)
     local brain = platoon:GetBrain()
     if not brain or not target or not target.position then
@@ -1558,8 +1573,7 @@ local function AttackTargetArea(platoon, target, opts)
             if not TransportAndMove(platoon, targetPos, opts) then
                 return 'fail'
             end
-            routeOpts.ForceRepath = true
-            route = Routing.BuildPlatoonRoute(platoon, targetPos, routeOpts)
+            route = RebuildAttackRoute(platoon, targetPos, routeOpts)
         else
             return 'fail'
         end
@@ -1571,29 +1585,16 @@ local function AttackTargetArea(platoon, target, opts)
 
     local routeStatus = nil
     if bombardRange then
-        local path = {}
-        for _, waypoint in ipairs(route.waypoints or {}) do
-            if waypoint and waypoint.position then
-                table.insert(path, CopyVector(waypoint.position))
-            end
-        end
-        path = ShortenPathForBombard(path, targetPos, bombardRange)
+        local path = ShortenPathForBombard(ExtractStoredRoutePath(route), targetPos, bombardRange)
         if not (path and table.getn(path) > 0) then
             return 'repath'
         end
         if not MoveAlongPath(platoon, path, opts.Formation, false, layer, opts.AggressiveMove) then
-            routeOpts.ForceRepath = true
-            route = Routing.BuildPlatoonRoute(platoon, targetPos, routeOpts)
+            route = RebuildAttackRoute(platoon, targetPos, routeOpts)
             if not (route and route.waypoints) then
                 return 'repath'
             end
-            path = {}
-            for _, waypoint in ipairs(route.waypoints or {}) do
-                if waypoint and waypoint.position then
-                    table.insert(path, CopyVector(waypoint.position))
-                end
-            end
-            path = ShortenPathForBombard(path, targetPos, bombardRange)
+            path = ShortenPathForBombard(ExtractStoredRoutePath(route), targetPos, bombardRange)
             if not MoveAlongPath(platoon, path, opts.Formation, false, layer, opts.AggressiveMove) then
                 return 'repath'
             end
@@ -1603,16 +1604,13 @@ local function AttackTargetArea(platoon, target, opts)
         routeStatus = Routing.FollowStoredPlatoonRoute(platoon, targetPos, routeOpts)
         if routeStatus == 'repath' then
             RoutingLog('Initial route follow requested repath; rebuilding authoritative route')
-            routeOpts.ForceRepath = true
-            route = Routing.BuildPlatoonRoute(platoon, targetPos, routeOpts)
-            if not route then
-                if opts.Transport then
-                    RoutingLog('Route rebuild failed; attempting transport fallback')
-                    if not TransportAndMove(platoon, targetPos, opts) then
-                        return 'repath'
-                    end
-                    route = Routing.BuildPlatoonRoute(platoon, targetPos, routeOpts)
+            route = RebuildAttackRoute(platoon, targetPos, routeOpts)
+            if not route and opts.Transport then
+                RoutingLog('Route rebuild failed; attempting transport fallback')
+                if not TransportAndMove(platoon, targetPos, opts) then
+                    return 'repath'
                 end
+                route = RebuildAttackRoute(platoon, targetPos, routeOpts)
             end
             if not route then
                 return 'repath'
