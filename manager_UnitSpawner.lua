@@ -70,7 +70,7 @@ local ScenarioUtils = import('/lua/sim/ScenarioUtilities.lua')
      local value = cnt or 0
      return { value, value, value }
  end
- 
+
  local function normalizeComposition(comp)
      local out = {}
      for i, entry in ipairs(comp or {}) do
@@ -155,21 +155,49 @@ local function markerPos(mark)
     end
     return nil
 end
- 
+local function GetPlayableArea()
+    if not ScenarioInfo then
+        return nil
+    end
+
+    if ScenarioInfo.PlayableArea then
+        return ScenarioInfo.PlayableArea
+    end
+
+    local size = ScenarioInfo.size or ScenarioInfo.MapSize
+    if size then
+        return { 0, 0, size[1], size[2] }
+    end
+
+    return nil
+end
+
+local function PositionInPlayableArea(position, area)
+    if not (position and area) then
+        return true
+    end
+
+    return position[1] >= area[1]
+        and position[1] <= area[3]
+        and position[3] >= area[2]
+        and position[3] <= area[4]
+end
+
+
  local function isComplete(u)
      if not u or u.Dead then return false end
      if u.GetFractionComplete and u:GetFractionComplete() < 1 then return false end
      if u.IsUnitState and u:IsUnitState('BeingBuilt') then return false end
      return true
  end
- 
+
  local function countComplete(units)
      local n = 0
      if not units then return 0 end
      for _, u in ipairs(units) do if isComplete(u) then n = n + 1 end end
      return n
  end
- 
+
 local function tableIsEmpty(tbl)
     if not tbl then return true end
     for _ in pairs(tbl) do
@@ -241,14 +269,14 @@ Spawner.__index = Spawner
 
 function Spawner:Log(msg) LOG(('[US:%s] %s'):format(self.tag, msg)) end
  function Spawner:Warn(msg) WARN(('[US:%s] %s'):format(self.tag, msg)) end
- 
+
  function Spawner:GetEntryCount(entry)
      local d = math.max(1, math.min(3, self.params.difficulty or 2))
      local want = entry.counts[d] or 0
      want = math.max(0, math.floor(want))
      return want
  end
- 
+
 function Spawner:GetEscalationFactor(waveNo)
     return escalationFactor(self.params, waveNo)
 end
@@ -403,21 +431,35 @@ function Spawner:HandOffToAttack(platoon)
                 IssueClearCommands(units)
             end
 
-            platoon.PlatoonData = self.params.attackData or platoon.PlatoonData or {}
+            local platoonData = platoon.PlatoonData or {}
+            if type(self.params.attackData) == 'table' then
+                for key, value in pairs(self.params.attackData) do
+                    platoonData[key] = value
+                end
+            end
+
+            local spawnPos = platoon._spawnerStartPosition
+            local area = GetPlayableArea()
+            platoonData.RouteSource = 'UnitSpawner'
+            platoonData.StartedOutsidePlayableArea = area and spawnPos and not PositionInPlayableArea(spawnPos, area) or false
+            platoonData.SpawnPosition = spawnPos and { spawnPos[1], spawnPos[2], spawnPos[3] } or nil
+            platoonData.Formation = platoonData.Formation or self.params.formation or 'GrowthFormation'
+            platoon.PlatoonData = platoonData
+
             platoon:ForkAIThread(function(p)
                 return attackFn(p, p.PlatoonData)
             end)
         end
     end)
 end
- 
+
 function Spawner:SpawnWave(waveNo, wanted)
     local pos = self:GetNextSpawnPos()
     if not pos then
         self:Warn('SpawnWave: invalid spawnMarker position')
         return nil, 0
      end
- 
+
     local spawned = {}
     local spread  = math.max(0, self.params.spawnSpread or 0)
     for bp, count in pairs(wanted or {}) do
@@ -436,20 +478,23 @@ function Spawner:SpawnWave(waveNo, wanted)
 
     local label = string.format('%s_Wave_%d', self.tag, waveNo or 1)
     local platoon = self:CreatePlatoon(label, spawned)
+    if platoon then
+        platoon._spawnerStartPosition = { pos[1], pos[2], pos[3] }
+    end
 
     self:HandOffToAttack(platoon)
 
     local unitCount = resolveUnitCount(spawned)
     return platoon, spawned, unitCount, wanted
 end
- 
+
  function Spawner:WaitForLossGate(platoon, expectedCount)
      local thr = math.max(0, math.min(1, self.params.mode2LossThreshold or 0.5))
      local wantTotal = expectedCount or 0
      if wantTotal <= 0 then
          return
      end
- 
+
      while not self.stopped do
         if not platoon or not self.brain:PlatoonExists(platoon) then
             local alive = countComplete((platoon and platoon.GetPlatoonUnits and platoon:GetPlatoonUnits()) or {})
@@ -466,7 +511,7 @@ end
          WaitSeconds(2)
      end
  end
- 
+
  function Spawner:GetMode3Cooldown(waveIndex, totalWaves)
      local base = math.max(0, self.params.waveCooldown or 0)
      local intervals = math.max(0, totalWaves - 1)
@@ -477,7 +522,7 @@ end
      local remaining = math.max(0, base - decrement * (waveIndex - 1))
      return remaining
  end
- 
+
 function Spawner:RunMode1()
     while not self.stopped do
         self.wave = (self.wave or 0) + 1
@@ -518,7 +563,7 @@ function Spawner:RunMode3()
          self:Warn('Mode 3 selected but mode3WaveCount <= 0; stopping spawner.')
          return
      end
- 
+
      for wave = 1, totalWaves do
          if self.stopped then break end
          self.wave = wave
@@ -573,7 +618,7 @@ function Spawner:RunMode4()
     end
     self.stopped = true
 end
- 
+
 function Spawner:MainLoop()
     local mode = self.params.mode or 1
     if mode == 2 then
@@ -587,11 +632,11 @@ function Spawner:MainLoop()
     end
     self.mainThread = nil
 end
- 
+
  function Spawner:Start()
      self.mainThread = self.brain:ForkThread(function() self:MainLoop() end)
  end
- 
+
  function Spawner:Stop()
      if self.stopped then return end
      self.stopped = true
@@ -600,7 +645,7 @@ end
          self.mainThread = nil
      end
  end
- 
+
  local function normalizeParams(p)
      return {
          brain              = p.brain,
@@ -626,7 +671,7 @@ end
         escalationFrequency= p.escalationFrequency or 0,
     }
 end
- 
+
  -- ========== Public API ==========
  function Start(params)
      assert(params and params.brain and params.spawnMarker, 'brain and spawnMarker are required')
@@ -650,8 +695,7 @@ end
     o:Start()
     return o
 end
- 
+
 function Stop(handle)
      if handle and handle.Stop then handle:Stop() end
  end
- 
