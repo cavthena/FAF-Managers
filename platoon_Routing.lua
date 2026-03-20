@@ -482,6 +482,10 @@ local function MeasurePointBufferedClearance(layer, point, tangentX, tangentZ, d
 
     local probe = math.max(desiredClearance or RoutePreferredClearance, RoutePreferredClearance)
     local left, right, nx, nz = SamplePointClearance(layer, point, tangentX, tangentZ, probe, 1.5)
+    left = tonumber(left) or 0
+    right = tonumber(right) or 0
+    nx = tonumber(nx) or 0
+    nz = tonumber(nz) or 0
     local minimum = math.min(left, right)
     local total = left + right
     local centeredness = total > 0 and (1 - (math.abs(left - right) / total)) or 0
@@ -532,10 +536,14 @@ local function AnalyzeSegmentClearance(layer, fromPos, toPos, desiredClearance)
             Lerp(VecZ(fromPos), VecZ(toPos), t),
         }
 
-        local info = MeasurePointBufferedClearance(layer, sample, dirX, dirZ, preferred)
-        minimum = math.min(minimum, info.minimum)
-        minimumTotal = math.min(minimumTotal, info.total)
-        centeredness = centeredness + info.centeredness
+        local info = MeasurePointBufferedClearance(layer, sample, dirX, dirZ, preferred) or {}
+        local sampleMinimum = tonumber(info.minimum) or 0
+        local sampleTotal = tonumber(info.total) or 0
+        local sampleCenteredness = tonumber(info.centeredness) or 0
+
+        minimum = math.min(minimum, sampleMinimum)
+        minimumTotal = math.min(minimumTotal, sampleTotal)
+        centeredness = centeredness + sampleCenteredness
         if info.preferred then
             preferredHits = preferredHits + 1
         end
