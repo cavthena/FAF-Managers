@@ -9,6 +9,8 @@ local CornerAngleThreshold = 28
 local WideCornerAngleThreshold = 55
 local CornerSampleDistance = 18
 local SegmentReachDistanceSq = 36
+local ContinuousReachDistanceSq = 64
+local ContinuousQueueDistanceSq = 196
 local FinalAttackDistanceSq = 40 * 40
 
 local function ReadVecComponent(v, numericIndex, axisName)
@@ -746,14 +748,31 @@ local function BuildWaypointMetadata(route, destination, opts, layer, startedOut
             waypointType = 'corridor'
         end
 
+        local arrivalFacing = HeadingDegrees(prevPoint, point)
+        local departureFacing = HeadingDegrees(point, nextPoint)
+        if i == table.getn(route) or DistSq(point, nextPoint) <= 1 then
+            departureFacing = arrivalFacing
+        end
+
+        local staging = waypointType == 'pre-attack' or waypointType == 'ingress' or point._anchor and true or false
+        local continuous = not staging
+
         table.insert(metadata, {
             position = point,
             useFormation = formation and formation ~= 'NoFormation' and true or false,
             aggressiveMove = aggressiveMove,
-            facing = HeadingDegrees(prevPoint, nextPoint),
+            facing = arrivalFacing,
+            arrivalFacing = arrivalFacing,
+            departureFacing = departureFacing,
             waypointType = waypointType,
+            staging = staging,
+            continuous = continuous,
+            allowReform = staging,
+            reachDistanceSq = continuous and ContinuousReachDistanceSq or SegmentReachDistanceSq,
+            queueDistanceSq = continuous and ContinuousQueueDistanceSq or SegmentReachDistanceSq,
             segmentStart = CopyVec(prevPoint),
-            segmentEnd = CopyVec(nextPoint),
+            segmentEnd = CopyVec(point),
+            nextSegmentEnd = CopyVec(nextPoint),
         })
     end
 
@@ -803,7 +822,16 @@ local function SyncRouteOptions(route, opts)
         waypoint.useFormation = route.formation and route.formation ~= 'NoFormation' and true or false
         waypoint.aggressiveMove = route.aggressiveMove
         if waypoint.segmentStart and waypoint.segmentEnd then
-            waypoint.facing = HeadingDegrees(waypoint.segmentStart, waypoint.segmentEnd)
+            waypoint.arrivalFacing = HeadingDegrees(waypoint.segmentStart, waypoint.segmentEnd)
+            waypoint.facing = waypoint.arrivalFacing
+        end
+        if waypoint.segmentEnd and waypoint.nextSegmentEnd then
+            waypoint.departureFacing = HeadingDegrees(waypoint.segmentEnd, waypoint.nextSegmentEnd)
+            if DistSq(waypoint.segmentEnd, waypoint.nextSegmentEnd) <= 1 then
+                waypoint.departureFacing = waypoint.arrivalFacing or waypoint.departureFacing
+            end
+        else
+            waypoint.departureFacing = waypoint.arrivalFacing or waypoint.facing
         end
     end
 
@@ -950,6 +978,7 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
 
     IssueClearCommands(units)
 
+    local queuedWaypointIndex = nil
     local index = math.max(1, math.min(stored.currentIndex or 1, table.getn(stored.waypoints)))
     while index <= table.getn(stored.waypoints) do
         local waypoint = stored.waypoints[index]
@@ -972,7 +1001,8 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
             return 'attack'
         end
 
-        if DistSq(platoonPos, position) <= SegmentReachDistanceSq then
+        local reachDistanceSq = waypoint.reachDistanceSq or SegmentReachDistanceSq
+        if DistSq(platoonPos, position) <= reachDistanceSq then
             index = index + 1
             stored.currentIndex = index
         else
@@ -980,7 +1010,12 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
                 return 'repath'
             end
 
-            if not IssueWaypointCommand(platoon, units, stored, waypoint) then
+            local commandQueued = queuedWaypointIndex == index
+            if commandQueued then
+                queuedWaypointIndex = nil
+            end
+
+            if not commandQueued and not IssueWaypointCommand(platoon, units, stored, waypoint) then
                 return 'repath'
             end
 
@@ -988,6 +1023,8 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
             local stuckSeconds = 0
             local lastPos = CopyVec(platoonPos)
             local lastDistSq = DistSq(platoonPos, position)
+            local nextWaypoint = stored.waypoints[index + 1]
+            local queuedNextWaypoint = false
 
             while segmentTimeout > 0 do
                 WaitSeconds(1)
@@ -1004,7 +1041,15 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
                 end
 
                 local distSq = DistSq(currentPos, position)
-                if distSq <= SegmentReachDistanceSq then
+                if waypoint.continuous and not queuedNextWaypoint and nextWaypoint and distSq <= (waypoint.queueDistanceSq or reachDistanceSq) then
+                    if not IssueWaypointCommand(platoon, units, stored, nextWaypoint) then
+                        return 'repath'
+                    end
+                    queuedWaypointIndex = index + 1
+                    queuedNextWaypoint = true
+                end
+
+                if distSq <= reachDistanceSq then
                     index = index + 1
                     stored.currentIndex = index
                     break

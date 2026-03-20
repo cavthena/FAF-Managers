@@ -1650,8 +1650,12 @@ local function AttackTargetArea(platoon, target, opts)
         local storedRoute = platoon._storedRoute
         if storedRoute and storedRoute.waypoints and table.getn(storedRoute.waypoints) > 0 then
             local finalWaypoint = storedRoute.waypoints[table.getn(storedRoute.waypoints)]
-            if finalWaypoint and finalWaypoint.facing then
-                approachDegrees = finalWaypoint.facing
+            if finalWaypoint then
+                if finalWaypoint.arrivalFacing then
+                    approachDegrees = finalWaypoint.arrivalFacing
+                elseif finalWaypoint.facing then
+                    approachDegrees = finalWaypoint.facing
+                end
             end
         end
 
