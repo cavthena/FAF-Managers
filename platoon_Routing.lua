@@ -164,7 +164,7 @@ local function ProjectionAlongSegment(point, segmentStart, segmentEnd)
     return (fromStartX * dirX) + (fromStartZ * dirZ), length
 end
 
-local function DetermineWaypointFacing(prevPoint, point, nextPoint, waypointType)
+local function DetermineWaypointFacing(prevPoint, point, nextPoint, waypointType, continuous)
     local arrivalFacing = HeadingDegrees(prevPoint, point)
     local departureFacing = HeadingDegrees(point, nextPoint)
     local nextDistanceSq = DistSq(point, nextPoint)
@@ -179,27 +179,35 @@ local function DetermineWaypointFacing(prevPoint, point, nextPoint, waypointType
     end
 
     local commandFacing = arrivalFacing
-    if waypointType == 'transit' or waypointType == 'corridor' then
-        commandFacing = flowFacing
+    if continuous then
+        if waypointType == 'curve' then
+            commandFacing = departureFacing
+        else
+            commandFacing = flowFacing
+        end
+    elseif waypointType == 'pre-attack' or waypointType == 'staging' then
+        commandFacing = arrivalFacing
     elseif waypointType == 'curve' then
         commandFacing = departureFacing
-    elseif waypointType == 'pre-attack' or waypointType == 'ingress' or waypointType == 'staging' then
-        commandFacing = arrivalFacing
+    elseif waypointType == 'transit' or waypointType == 'corridor' or waypointType == 'ingress' then
+        commandFacing = flowFacing
     end
 
     return arrivalFacing, departureFacing, flowFacing, commandFacing
 end
 
 local function DetermineWaypointQueueDistanceSq(waypointType, segmentLength, nextSegmentLength, turnAngle)
-    if waypointType == 'pre-attack' or waypointType == 'ingress' or waypointType == 'staging' then
+    if waypointType == 'pre-attack' or waypointType == 'staging' then
         return SegmentReachDistanceSq
     end
 
     local lookahead = math.max(10, math.min(segmentLength * 0.45, 24))
     if waypointType == 'corridor' then
-        lookahead = math.max(9, math.min(segmentLength * 0.35, 16))
+        lookahead = math.max(12, math.min(segmentLength * 0.50, 20))
     elseif waypointType == 'curve' then
-        lookahead = math.max(8, math.min(segmentLength * 0.30, 14))
+        lookahead = math.max(10, math.min(segmentLength * 0.40, 16))
+    elseif waypointType == 'ingress' then
+        lookahead = math.max(11, math.min(segmentLength * 0.45, 18))
     end
 
     if nextSegmentLength and nextSegmentLength > 0 then
@@ -811,6 +819,46 @@ local function SimplifyRoutePreservingSafety(route, layer)
     return simplified
 end
 
+local function DetermineWaypointType(point, index, routeCount)
+    if index == routeCount then
+        return 'pre-attack', true
+    end
+
+    if point._corridor then
+        return 'corridor', false
+    end
+
+    if point._curve then
+        return 'curve', false
+    end
+
+    if point._ingress then
+        return 'ingress', false
+    end
+
+    if point._anchor then
+        return 'staging', true
+    end
+
+    return 'transit', false
+end
+
+local function DetermineQueueProgressThreshold(waypoint)
+    if not waypoint or not waypoint.continuous then
+        return 1
+    end
+
+    if waypoint.waypointType == 'corridor' then
+        return 0.15
+    elseif waypoint.waypointType == 'curve' then
+        return 0.12
+    elseif waypoint.waypointType == 'ingress' then
+        return 0.20
+    end
+
+    return 0.25
+end
+
 local function BuildWaypointMetadata(route, destination, opts, layer, startedOutside, ingressEdge)
     local metadata = {}
     local formation = opts and opts.Formation or nil
@@ -821,29 +869,13 @@ local function BuildWaypointMetadata(route, destination, opts, layer, startedOut
         SetPointSurface(point, layer)
         local prevPoint = route[i - 1] or point
         local nextPoint = route[i + 1] or point
-        local waypointType = 'transit'
-        local staging = false
+        local waypointType, staging = DetermineWaypointType(point, i, table.getn(route))
+        local continuous = not staging
 
-        if point._ingress then
-            waypointType = 'ingress'
-            staging = true
-        elseif i == table.getn(route) then
-            waypointType = 'pre-attack'
-            staging = true
-        elseif point._anchor then
-            waypointType = 'staging'
-            staging = true
-        elseif point._curve then
-            waypointType = 'curve'
-        elseif point._corridor then
-            waypointType = 'corridor'
-        end
-
-        local arrivalFacing, departureFacing, flowFacing, commandFacing = DetermineWaypointFacing(prevPoint, point, nextPoint, waypointType)
+        local arrivalFacing, departureFacing, flowFacing, commandFacing = DetermineWaypointFacing(prevPoint, point, nextPoint, waypointType, continuous)
         local segmentLength = SegmentLength(prevPoint, point)
         local nextSegmentLength = SegmentLength(point, nextPoint)
         local turnAngle = AngleDeltaDegrees(arrivalFacing, departureFacing)
-        local continuous = not staging
         local reachDistanceSq = continuous and ContinuousReachDistanceSq or SegmentReachDistanceSq
 
         table.insert(metadata, {
@@ -923,7 +955,8 @@ local function SyncRouteOptions(route, opts)
                 waypoint.segmentStart,
                 waypoint.segmentEnd,
                 waypoint.nextSegmentEnd,
-                waypoint.waypointType
+                waypoint.waypointType,
+                waypoint.continuous
             )
             waypoint.facing = waypoint.commandFacing
             waypoint.segmentLength = SegmentLength(waypoint.segmentStart, waypoint.segmentEnd)
@@ -935,7 +968,7 @@ local function SyncRouteOptions(route, opts)
             end
         else
             waypoint.departureFacing = waypoint.arrivalFacing or waypoint.facing
-                        waypoint.nextSegmentLength = 0
+            waypoint.nextSegmentLength = 0
         end
         waypoint.turnAngle = AngleDeltaDegrees(waypoint.arrivalFacing, waypoint.departureFacing)
         if waypoint.continuous then
@@ -1086,13 +1119,18 @@ local function ShouldQueueNextWaypoint(platoonPos, waypoint, nextWaypoint)
         return false
     end
 
-    if nextWaypoint.staging or nextWaypoint.allowReform then
-        return distSq <= math.max(waypoint.reachDistanceSq or SegmentReachDistanceSq, SegmentReachDistanceSq)
+    local progress, segmentLength = ProjectionAlongSegment(platoonPos, waypoint.segmentStart, waypoint.segmentEnd)
+    if segmentLength > 0 then
+        local progressThreshold = DetermineQueueProgressThreshold(waypoint)
+        local absoluteLead = waypoint.waypointType == 'curve' and 12 or 10
+        local queueProgress = math.max(0, math.min(segmentLength * progressThreshold, segmentLength - absoluteLead))
+        if progress < queueProgress then
+            return false
+        end
     end
 
-    local progress, segmentLength = ProjectionAlongSegment(platoonPos, waypoint.segmentStart, waypoint.segmentEnd)
-    if segmentLength > 0 and progress < math.max(segmentLength * 0.45, segmentLength - 10) then
-        return false
+    if nextWaypoint.staging or nextWaypoint.allowReform then
+        return distSq <= math.max(waypoint.reachDistanceSq or SegmentReachDistanceSq, SegmentReachDistanceSq)
     end
 
     return true
@@ -1118,6 +1156,13 @@ local function IssueWaypointCommand(platoon, units, route, waypoint, waypointInd
     local formation = route.formation
     local position = waypoint.position
     local facing = waypoint.commandFacing or waypoint.flowFacing or waypoint.departureFacing or waypoint.arrivalFacing or waypoint.facing or 0
+
+    if waypoint.continuous then
+        facing = waypoint.flowFacing or waypoint.departureFacing or facing
+    elseif waypoint.allowReform then
+        facing = waypoint.commandFacing or waypoint.arrivalFacing or facing
+    end
+
     if waypoint.useFormation and formation and formation ~= 'NoFormation' then
         platoon:SetPlatoonFormationOverride(formation)
         if waypoint.aggressiveMove then
@@ -1174,10 +1219,6 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
     end
     if stored.lastIssuedIndex then
         stored.lastIssuedIndex = math.min(stored.lastIssuedIndex, waypointCount)
-    end
-
-    if not stored.lastIssuedIndex or stored.lastIssuedIndex < stored.currentIndex then
-        IssueClearCommands(units)
     end
 
     local index = stored.currentIndex
