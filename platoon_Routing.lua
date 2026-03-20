@@ -3,11 +3,15 @@ local NavUtils = import('/lua/sim/NavUtils.lua')
 local SegmentPassable
 local RouteStamp = 0
 
-local DirectClearance = 6
-local SimplifyClearance = 5
+local DirectClearance = 9
+local SimplifyClearance = 8
+local RoutePreferredClearance = 11
+local RouteMinimumBalancedClearance = 4
+local CorridorBalanceProbeDistance = 26
+local CorridorBalanceStep = 1.5
 local CornerAngleThreshold = 28
 local WideCornerAngleThreshold = 55
-local CornerSampleDistance = 18
+local CornerSampleDistance = 22
 local SegmentReachDistanceSq = 36
 local ContinuousReachDistanceSq = 64
 local ContinuousQueueDistanceSq = 196
@@ -20,8 +24,8 @@ local CohesionReformOutlierRatio = 0.40
 local CohesionReformMinMissingUnits = 2
 local PlatoonTraversalQueueWindow = 3
 local RouteStuckTimeout = 10
-local RandomizedRouteMaxCandidates = 3
-local RandomizedRouteLengthSlack = 1.35
+local RandomizedRouteMaxCandidates = 4
+local RandomizedRouteLengthSlack = 1.55
 
 local function ReadVecComponent(v, numericIndex, axisName)
     if v == nil then
@@ -69,6 +73,9 @@ local function CopyMetadata(fromPos, toPos)
     toPos._ingress = rawget(fromPos, '_ingress')
     toPos._ingressEdge = rawget(fromPos, '_ingressEdge')
     toPos._anchor = rawget(fromPos, '_anchor')
+    toPos._transitAnchor = rawget(fromPos, '_transitAnchor')
+    toPos._forceStaging = rawget(fromPos, '_forceStaging')
+    toPos._preAttack = rawget(fromPos, '_preAttack')
 end
 
 local function CopyVec(v)
@@ -458,18 +465,65 @@ local function SamplePointClearance(layer, point, tangentX, tangentZ, maxDistanc
     return leftClearance, rightClearance, nx, nz
 end
 
-local function SegmentHasClearance(layer, fromPos, toPos, desiredClearance)
+local function MeasurePointBufferedClearance(layer, point, tangentX, tangentZ, desiredClearance)
+    if not point then
+        return {
+            left = 0,
+            right = 0,
+            minimum = 0,
+            total = 0,
+            centeredness = 0,
+            balanced = false,
+            preferred = false,
+            nx = 0,
+            nz = 0,
+        }
+    end
+
+    local probe = math.max(desiredClearance or RoutePreferredClearance, RoutePreferredClearance)
+    local left, right, nx, nz = SamplePointClearance(layer, point, tangentX, tangentZ, probe, 1.5)
+    local minimum = math.min(left, right)
+    local total = left + right
+    local centeredness = total > 0 and (1 - (math.abs(left - right) / total)) or 0
+    return {
+        left = left,
+        right = right,
+        minimum = minimum,
+        total = total,
+        centeredness = centeredness,
+        balanced = minimum >= math.max(RouteMinimumBalancedClearance, probe * 0.45),
+        preferred = minimum >= probe * 0.70,
+        nx = nx,
+        nz = nz,
+    }
+end
+
+local function AnalyzeSegmentClearance(layer, fromPos, toPos, desiredClearance)
+    if not (fromPos and toPos) then
+        return nil
+    end
+
     if not SegmentPassable(layer, fromPos, toPos) then
-        return false
+        return nil
     end
 
     local dirX, dirZ, length = DirectionBetween(fromPos, toPos)
     if length < 0.001 then
-        return PointPassable(layer, fromPos)
+        if not PointPassable(layer, fromPos) then
+            return nil
+        end
+        local pointClearance = MeasurePointBufferedClearance(layer, fromPos, 0, 1, desiredClearance)
+        pointClearance.length = 0
+        return pointClearance
     end
 
-    local clearance = desiredClearance or SimplifyClearance
-    local samples = math.max(2, math.floor(length / 6))
+    local preferred = desiredClearance or SimplifyClearance
+    local samples = math.max(3, math.floor(length / 5))
+    local minimum = math.huge
+    local minimumTotal = math.huge
+    local centeredness = 0
+    local preferredHits = 0
+
     for i = 0, samples do
         local t = i / samples
         local sample = {
@@ -478,13 +532,107 @@ local function SegmentHasClearance(layer, fromPos, toPos, desiredClearance)
             Lerp(VecZ(fromPos), VecZ(toPos), t),
         }
 
-        local left, right = SamplePointClearance(layer, sample, dirX, dirZ, clearance, math.max(1, clearance * 0.5))
-        if left < clearance and right < clearance then
-            return false
+        local info = MeasurePointBufferedClearance(layer, sample, dirX, dirZ, preferred)
+        minimum = math.min(minimum, info.minimum)
+        minimumTotal = math.min(minimumTotal, info.total)
+        centeredness = centeredness + info.centeredness
+        if info.preferred then
+            preferredHits = preferredHits + 1
         end
     end
 
-    return true
+    return {
+        length = length,
+        minimum = minimum,
+        total = minimumTotal,
+        centeredness = centeredness / (samples + 1),
+        preferredFraction = preferredHits / (samples + 1),
+    }
+end
+
+local function SegmentHasClearance(layer, fromPos, toPos, desiredClearance)
+    local analysis = AnalyzeSegmentClearance(layer, fromPos, toPos, desiredClearance)
+    if not analysis then
+        return false
+    end
+
+    local preferred = desiredClearance or SimplifyClearance
+    if analysis.minimum >= preferred then
+        return true
+    end
+
+    local relaxedMinimum = math.max(RouteMinimumBalancedClearance, preferred * 0.55)
+    if analysis.minimum < relaxedMinimum then
+        return false
+    end
+
+    if analysis.total < math.max(preferred * 1.5, relaxedMinimum * 2.1) then
+        return false
+    end
+
+    return analysis.centeredness >= 0.48 or analysis.preferredFraction >= 0.35
+end
+
+local function ScoreCandidatePointInCorridor(layer, candidate, tangentX, tangentZ, desiredClearance)
+    local info = MeasurePointBufferedClearance(layer, candidate, tangentX, tangentZ, desiredClearance)
+    local score = (info.minimum * 5) + (info.total * 0.6) + (info.centeredness * 10)
+    if info.preferred then
+        score = score + 12
+    elseif info.balanced then
+        score = score + 5
+    end
+    return score, info
+end
+
+local function FindBestBufferedPoint(layer, point, tangentX, tangentZ, area, prev, nextPoint, desiredClearance, maxProbeDistance, stepSize)
+    if not point then
+        return nil, nil
+    end
+
+    local baselineScore, baselineInfo = ScoreCandidatePointInCorridor(layer, point, tangentX, tangentZ, desiredClearance)
+    local bestPoint = CopyVec(point)
+    local bestInfo = baselineInfo
+    local bestScore = baselineScore
+
+    local nx = baselineInfo.nx
+    local nz = baselineInfo.nz
+    if math.abs(nx) < 0.001 and math.abs(nz) < 0.001 then
+        return bestPoint, bestInfo
+    end
+
+    local limit = maxProbeDistance or CorridorBalanceProbeDistance
+    local stride = stepSize or CorridorBalanceStep
+    local distance = -limit
+    while distance <= limit do
+        if math.abs(distance) > 0.05 then
+            local candidate = OffsetPoint(point, nx * distance, nz * distance)
+            if area then
+                candidate = ClampToPlayableArea(candidate, area, 0)
+            end
+            SetPointSurface(candidate, layer)
+
+            local valid = PointPassable(layer, candidate)
+            if valid and prev then
+                valid = SegmentHasClearance(layer, prev, candidate, math.max(RouteMinimumBalancedClearance, (desiredClearance or RoutePreferredClearance) * 0.55))
+            end
+            if valid and nextPoint then
+                valid = SegmentHasClearance(layer, candidate, nextPoint, math.max(RouteMinimumBalancedClearance, (desiredClearance or RoutePreferredClearance) * 0.55))
+            end
+
+            if valid then
+                local score, info = ScoreCandidatePointInCorridor(layer, candidate, tangentX, tangentZ, desiredClearance)
+                score = score - (math.abs(distance) * 0.08)
+                if score > bestScore + 0.15 then
+                    bestPoint = candidate
+                    bestInfo = info
+                    bestScore = score
+                end
+            end
+        end
+        distance = distance + stride
+    end
+
+    return bestPoint, bestInfo
 end
 
 local function RemoveDuplicateRoutePoints(route, minDistanceSq)
@@ -521,7 +669,7 @@ local function RemoveRouteDoubleBack(route)
             local offsetDx = VecX(point) - ((VecX(prev) + VecX(nextPoint)) * 0.5)
             local offsetDz = VecZ(point) - ((VecZ(prev) + VecZ(nextPoint)) * 0.5)
             local offsetSq = (offsetDx * offsetDx) + (offsetDz * offsetDz)
-            if rawget(point, '_anchor') or rawget(point, '_ingress') or rawget(point, '_corridor') then
+            if rawget(point, '_anchor') or rawget(point, '_ingress') or rawget(point, '_corridor') or rawget(point, '_curve') or rawget(point, '_transitAnchor') then
                 table.insert(cleaned, CopyVec(point))
             elseif dot < -0.35 and offsetSq < 36 then
                 -- Skip hard reversals that do not materially contribute to the route.
@@ -588,7 +736,7 @@ local function BuildCardinalIngress(startPos, area, layer)
         return nil, nil
     end
 
-    local safeBuffer = 6
+    local safeBuffer = 10
     local sx = VecX(startPos)
     local sz = VecZ(startPos)
     local candidates = {}
@@ -622,7 +770,7 @@ local function BuildCardinalIngress(startPos, area, layer)
     for _, candidate in ipairs(candidates) do
         local ingress = ClampToPlayableArea(candidate.point, area, safeBuffer)
         ingress._ingress = true
-        ingress._anchor = true
+        ingress._transitAnchor = true
         ingress._ingressEdge = candidate.edge
         SetPointSurface(ingress, layer)
         if PointPassable(layer, ingress) then
@@ -632,7 +780,7 @@ local function BuildCardinalIngress(startPos, area, layer)
 
     local fallback = ClampToPlayableArea(candidates[1].point, area, safeBuffer)
     fallback._ingress = true
-    fallback._anchor = true
+    fallback._transitAnchor = true
     fallback._ingressEdge = candidates[1].edge
     return SetPointSurface(fallback, layer), candidates[1].edge
 end
@@ -724,8 +872,44 @@ local function BuildPathViaAnchors(layer, startPos, target, anchors)
     return route
 end
 
-local function BuildRandomizedRouteVariant(layer, startPos, target, area, sideSign)
-    if not (startPos and target and sideSign and sideSign ~= 0) then
+local function BuildApproachAnchor(target, dirX, dirZ, normalX, normalZ, alongDistance, lateralOffset, layer, area)
+    local anchor = {
+        VecX(target) - (dirX * alongDistance) + (normalX * lateralOffset),
+        0,
+        VecZ(target) - (dirZ * alongDistance) + (normalZ * lateralOffset),
+    }
+    if area then
+        anchor = ClampToPlayableArea(anchor, area, 8)
+    end
+    SetPointSurface(anchor, layer)
+    if not PointPassable(layer, anchor) then
+        return nil
+    end
+    anchor._anchor = true
+    anchor._transitAnchor = true
+    return anchor
+end
+
+local function BuildOffsetAnchor(startPos, dirX, dirZ, normalX, normalZ, alongDistance, lateralOffset, layer, area)
+    local anchor = {
+        VecX(startPos) + (dirX * alongDistance) + (normalX * lateralOffset),
+        0,
+        VecZ(startPos) + (dirZ * alongDistance) + (normalZ * lateralOffset),
+    }
+    if area then
+        anchor = ClampToPlayableArea(anchor, area, 8)
+    end
+    SetPointSurface(anchor, layer)
+    if not PointPassable(layer, anchor) then
+        return nil
+    end
+    anchor._anchor = true
+    anchor._transitAnchor = true
+    return anchor
+end
+
+local function BuildRandomizedRouteVariant(layer, startPos, target, area, variant)
+    if not (startPos and target and variant) then
         return nil
     end
 
@@ -734,29 +918,40 @@ local function BuildRandomizedRouteVariant(layer, startPos, target, area, sideSi
         return nil
     end
 
+    local sideSign = variant.sideSign or 0
+    if sideSign == 0 then
+        return nil
+    end
+
     local normalX = -dirZ * sideSign
     local normalZ = dirX * sideSign
-    local offsetDistance = math.max(18, math.min(totalLength * 0.22, 56))
-    local leadDistance = math.max(10, math.min(totalLength * 0.18, 28))
-    local fractions = { 0.35, 0.65 }
+    local lateralScale = variant.lateralScale or 0.24
+    local offsetDistance = math.max(20, math.min(totalLength * lateralScale, variant.maxOffset or 88))
     local anchors = {}
 
-    for _, fraction in ipairs(fractions) do
-        local alongDistance = totalLength * fraction
-        local anchor = {
-            VecX(startPos) + (dirX * alongDistance) + (normalX * offsetDistance),
-            0,
-            VecZ(startPos) + (dirZ * alongDistance) + (normalZ * offsetDistance),
-        }
-        anchor = OffsetPoint(anchor, dirX * leadDistance, dirZ * leadDistance)
-        if area then
-            anchor = ClampToPlayableArea(anchor, area, 8)
-        end
-        SetPointSurface(anchor, layer)
-
-        if PointPassable(layer, anchor) then
-            anchor._anchor = true
+    for _, fraction in ipairs(variant.fractions or {}) do
+        local lateralMultiplier = fraction[2] or 1
+        local alongDistance = totalLength * (fraction[1] or fraction)
+        local anchor = BuildOffsetAnchor(startPos, dirX, dirZ, normalX, normalZ, alongDistance, offsetDistance * lateralMultiplier, layer, area)
+        if anchor then
             table.insert(anchors, anchor)
+        end
+    end
+
+    if variant.approachOffset then
+        local approach = BuildApproachAnchor(
+            target,
+            dirX,
+            dirZ,
+            normalX,
+            normalZ,
+            math.max(14, math.min(totalLength * (variant.approachBackoff or 0.18), 44)),
+            offsetDistance * variant.approachOffset,
+            layer,
+            area
+        )
+        if approach then
+            table.insert(anchors, approach)
         end
     end
 
@@ -767,26 +962,111 @@ local function BuildRandomizedRouteVariant(layer, startPos, target, area, sideSi
     return BuildPathViaAnchors(layer, startPos, target, anchors)
 end
 
+local function MeasureRouteClearance(route, layer)
+    if not route or table.getn(route) <= 1 then
+        return nil
+    end
+
+    local minClearance = math.huge
+    local totalClearance = 0
+    local totalCenteredness = 0
+    local segmentCount = 0
+
+    for i = 2, table.getn(route) do
+        local analysis = AnalyzeSegmentClearance(layer, route[i - 1], route[i], RoutePreferredClearance)
+        if not analysis then
+            return nil
+        end
+        minClearance = math.min(minClearance, analysis.minimum)
+        totalClearance = totalClearance + analysis.minimum
+        totalCenteredness = totalCenteredness + analysis.centeredness
+        segmentCount = segmentCount + 1
+    end
+
+    return {
+        minimum = minClearance,
+        average = segmentCount > 0 and (totalClearance / segmentCount) or 0,
+        centeredness = segmentCount > 0 and (totalCenteredness / segmentCount) or 0,
+    }
+end
+
+local function RoutePathSeparation(route, reference)
+    if not (route and reference and table.getn(route) > 0 and table.getn(reference) > 0) then
+        return 0
+    end
+
+    local total = 0
+    local samples = 0
+    for i = 2, math.max(2, table.getn(route) - 1) do
+        local point = route[i]
+        if point then
+            local nearestSq = math.huge
+            for _, other in ipairs(reference) do
+                local distanceSq = DistSq(point, other)
+                if distanceSq < nearestSq then
+                    nearestSq = distanceSq
+                end
+            end
+            total = total + math.sqrt(nearestSq)
+            samples = samples + 1
+        end
+    end
+
+    return samples > 0 and (total / samples) or 0
+end
+
+local function MeasureTerminalFlank(route, target)
+    if not (route and target and table.getn(route) >= 2) then
+        return 0
+    end
+
+    local finalPoint = route[table.getn(route)]
+    local prevPoint = route[table.getn(route) - 1] or finalPoint
+    local approachHeading = HeadingDegrees(prevPoint, finalPoint)
+    local directHeading = HeadingDegrees(route[1], target)
+    return AngleDeltaDegrees(directHeading, approachHeading)
+end
+
 local function CollectRouteCandidates(layer, startPos, target, opts, area)
     local candidates = {}
     local baseRoute = BuildBasePath(layer, startPos, target)
     if baseRoute then
-        table.insert(candidates, {
-            path = baseRoute,
-            routeType = 'default',
-            quality = ComputeRouteLength(baseRoute),
-        })
+        local clearance = MeasureRouteClearance(baseRoute, layer)
+        if clearance then
+            table.insert(candidates, {
+                path = baseRoute,
+                routeType = 'default',
+                length = ComputeRouteLength(baseRoute),
+                clearance = clearance,
+                flankAngle = MeasureTerminalFlank(baseRoute, target),
+            })
+        end
     end
 
     if opts and opts.RandomizeRoute then
-        for _, sideSign in ipairs({ -1, 1 }) do
-            local variant = BuildRandomizedRouteVariant(layer, startPos, target, area, sideSign)
+        local variants = {
+            { routeType = 'left-wide', sideSign = -1, lateralScale = 0.30, fractions = { { 0.22, 0.65 }, { 0.48, 1.0 }, { 0.74, 0.85 } }, approachOffset = 0.95, approachBackoff = 0.20, maxOffset = 96 },
+            { routeType = 'left-deep', sideSign = -1, lateralScale = 0.38, fractions = { { 0.18, 0.75 }, { 0.42, 1.10 }, { 0.68, 1.0 } }, approachOffset = 1.15, approachBackoff = 0.24, maxOffset = 112 },
+            { routeType = 'right-wide', sideSign = 1, lateralScale = 0.30, fractions = { { 0.22, 0.65 }, { 0.48, 1.0 }, { 0.74, 0.85 } }, approachOffset = 0.95, approachBackoff = 0.20, maxOffset = 96 },
+            { routeType = 'right-deep', sideSign = 1, lateralScale = 0.38, fractions = { { 0.18, 0.75 }, { 0.42, 1.10 }, { 0.68, 1.0 } }, approachOffset = 1.15, approachBackoff = 0.24, maxOffset = 112 },
+            { routeType = 'left-late', sideSign = -1, lateralScale = 0.25, fractions = { { 0.34, 0.45 }, { 0.60, 0.90 } }, approachOffset = 1.20, approachBackoff = 0.28, maxOffset = 84 },
+            { routeType = 'right-late', sideSign = 1, lateralScale = 0.25, fractions = { { 0.34, 0.45 }, { 0.60, 0.90 } }, approachOffset = 1.20, approachBackoff = 0.28, maxOffset = 84 },
+        }
+
+        for _, variantSpec in ipairs(variants) do
+            local variant = BuildRandomizedRouteVariant(layer, startPos, target, area, variantSpec)
             if variant and table.getn(variant) > 1 then
-                table.insert(candidates, {
-                    path = variant,
-                    routeType = sideSign < 0 and 'left-flank' or 'right-flank',
-                    quality = ComputeRouteLength(variant),
-                })
+                local clearance = MeasureRouteClearance(variant, layer)
+                if clearance then
+                    table.insert(candidates, {
+                        path = variant,
+                        routeType = variantSpec.routeType,
+                        length = ComputeRouteLength(variant),
+                        clearance = clearance,
+                        flankAngle = MeasureTerminalFlank(variant, target),
+                        sideSign = variantSpec.sideSign,
+                    })
+                end
             end
         end
     end
@@ -795,9 +1075,24 @@ local function CollectRouteCandidates(layer, startPos, target, opts, area)
         return nil
     end
 
+    local reference = candidates[1] and candidates[1].path or nil
+    for _, candidate in ipairs(candidates) do
+        candidate.separation = reference and RoutePathSeparation(candidate.path, reference) or 0
+        local clearanceScore = (candidate.clearance.minimum * 10) + (candidate.clearance.average * 3) + (candidate.clearance.centeredness * 14)
+        local lengthPenalty = candidate.length * 0.75
+        candidate.selectionScore = clearanceScore - lengthPenalty
+        if candidate.routeType ~= 'default' then
+            candidate.selectionScore = candidate.selectionScore + (candidate.separation * 1.5) + (candidate.flankAngle * 0.14)
+        end
+    end
+
     table.sort(candidates, function(a, b)
-        return (a.quality or math.huge) < (b.quality or math.huge)
+        if math.abs((a.selectionScore or 0) - (b.selectionScore or 0)) > 0.05 then
+            return (a.selectionScore or 0) > (b.selectionScore or 0)
+        end
+        return (a.length or math.huge) < (b.length or math.huge)
     end)
+
     return candidates
 end
 
@@ -811,11 +1106,21 @@ local function SelectRouteCandidate(candidates, opts)
         return best
     end
 
-    local bestLength = best.quality or math.huge
     local viable = {}
+    local bestLength = best.length or math.huge
+    local bestMinimumClearance = best.clearance and best.clearance.minimum or 0
+
     for _, candidate in ipairs(candidates) do
-        local quality = candidate.quality or math.huge
-        if quality <= (bestLength * RandomizedRouteLengthSlack) then
+        local length = candidate.length or math.huge
+        local minClearance = candidate.clearance and candidate.clearance.minimum or 0
+        local sufficientlyDistinct = candidate.routeType == 'default'
+            or candidate.separation >= 10
+            or candidate.flankAngle >= 22
+
+        if length <= (bestLength * RandomizedRouteLengthSlack)
+            and minClearance >= math.max(RouteMinimumBalancedClearance, bestMinimumClearance - 2)
+            and sufficientlyDistinct
+        then
             table.insert(viable, candidate)
         end
         if table.getn(viable) >= RandomizedRouteMaxCandidates then
@@ -827,7 +1132,30 @@ local function SelectRouteCandidate(candidates, opts)
         return best
     end
 
-    return viable[GetRandomInt(1, table.getn(viable))]
+    local weighted = {}
+    local totalWeight = 0
+    for _, candidate in ipairs(viable) do
+        local weight = 1
+        if candidate.routeType ~= 'default' then
+            weight = weight + math.max(1, math.floor(candidate.separation / 6)) + math.max(0, math.floor(candidate.flankAngle / 20))
+        else
+            local weakestViable = viable[table.getn(viable)]
+            weight = math.max(1, weight + math.floor((candidate.selectionScore - ((weakestViable and weakestViable.selectionScore) or 0)) / 8))
+        end
+        totalWeight = totalWeight + weight
+        table.insert(weighted, { candidate = candidate, weight = weight })
+    end
+
+    local roll = GetRandomInt(1, totalWeight)
+    local running = 0
+    for _, entry in ipairs(weighted) do
+        running = running + entry.weight
+        if roll <= running then
+            return entry.candidate
+        end
+    end
+
+    return viable[table.getn(viable)] or best
 end
 
 local function BalancePointInCorridor(route, index, layer, area)
@@ -850,50 +1178,33 @@ local function BalancePointInCorridor(route, index, layer, area)
         return CopyVec(point)
     end
 
-    local left, right, nx, nz = SamplePointClearance(layer, point, tangentX, tangentZ, CornerSampleDistance, 1.5)
-    local corridorWidth = left + right
-    if corridorWidth <= 0 then
-        return CopyVec(point)
-    end
+    local desiredClearance = RoutePreferredClearance
+    local bestPoint, info = FindBestBufferedPoint(
+        layer,
+        point,
+        tangentX,
+        tangentZ,
+        area,
+        prev,
+        nextPoint,
+        desiredClearance,
+        CorridorBalanceProbeDistance,
+        CorridorBalanceStep
+    )
 
-    local targetShift = (right - left) * 0.5
-    if math.abs(targetShift) < 0.35 then
-        local stable = CopyVec(point)
-        if math.min(left, right) <= 5 then
-            stable._corridor = true
-            stable._centered = true
-            stable._anchor = true
-        end
-        return stable
-    end
-
-    local maxShift = math.min(7, math.max(left, right) * 0.7)
-    targetShift = math.max(-maxShift, math.min(maxShift, targetShift))
-    local candidate = OffsetPoint(point, -nx * targetShift, -nz * targetShift)
-    if area then
-        candidate = ClampToPlayableArea(candidate, area, 0)
-    end
-    SetPointSurface(candidate, layer)
-
-    if PointPassable(layer, candidate)
-        and SegmentPassable(layer, prev, candidate)
-        and SegmentPassable(layer, candidate, nextPoint)
+    local balanced = bestPoint and CopyVec(bestPoint) or CopyVec(point)
+    local minClearance = info and info.minimum or 0
+    local widened = bestPoint and DistSq(bestPoint, point) > 1 or false
+    if (info and info.total <= (desiredClearance * 3.4))
+        or minClearance <= (desiredClearance * 1.15)
+        or widened
     then
-        candidate._centered = true
-        if math.min(left, right) <= 6 or math.abs(targetShift) >= 1 then
-            candidate._corridor = true
-            candidate._anchor = true
-        end
-        return candidate
+        balanced._corridor = true
+        balanced._centered = true
+        balanced._transitAnchor = true
     end
 
-    local fallback = CopyVec(point)
-    if math.min(left, right) <= 5 then
-        fallback._corridor = true
-        fallback._centered = true
-        fallback._anchor = true
-    end
-    return fallback
+    return balanced
 end
 
 local function CenterRouteThroughCorridors(route, layer, area)
@@ -932,16 +1243,36 @@ local function BuildCornerCurve(prev, corner, nextPoint, layer, area)
         return nil
     end
 
-    local left, right = SamplePointClearance(layer, corner, inX + outX, inZ + outZ, CornerSampleDistance, 1.5)
-    local localClearance = math.min(left, right)
-    local radius = math.min(inLength * 0.35, outLength * 0.35, math.max(3, localClearance))
-    if turnAngle >= WideCornerAngleThreshold then
-        radius = math.min(inLength * 0.42, outLength * 0.42, math.max(4, localClearance + 1))
+    local bisectorX, bisectorZ = Normalize2D(inX + outX, inZ + outZ)
+    if math.abs(bisectorX) < 0.001 and math.abs(bisectorZ) < 0.001 then
+        bisectorX, bisectorZ = DirectionBetween(prev, nextPoint)
     end
-    radius = math.max(2.5, radius)
 
-    local entry = OffsetPoint(corner, -inX * radius, -inZ * radius)
-    local exit = OffsetPoint(corner, outX * radius, outZ * radius)
+    local cornerPoint, cornerInfo = FindBestBufferedPoint(
+        layer,
+        corner,
+        bisectorX,
+        bisectorZ,
+        area,
+        prev,
+        nextPoint,
+        RoutePreferredClearance,
+        math.max(8, math.min(18, CornerSampleDistance * 0.8)),
+        1
+    )
+    if not cornerPoint then
+        return nil
+    end
+
+    local localClearance = cornerInfo and cornerInfo.minimum or 0
+    local radius = math.min(inLength * 0.34, outLength * 0.34, math.max(4, localClearance + 1.5))
+    if turnAngle >= WideCornerAngleThreshold then
+        radius = math.min(inLength * 0.46, outLength * 0.46, math.max(5, localClearance + 3))
+    end
+    radius = math.max(3.5, radius)
+
+    local entry = OffsetPoint(cornerPoint, -inX * radius, -inZ * radius)
+    local exit = OffsetPoint(cornerPoint, outX * radius, outZ * radius)
     if area then
         entry = ClampToPlayableArea(entry, area, 0)
         exit = ClampToPlayableArea(exit, area, 0)
@@ -953,43 +1284,47 @@ local function BuildCornerCurve(prev, corner, nextPoint, layer, area)
         return nil
     end
 
-    local curve = { entry }
-    local blendWeights = { 0.2, 0.4, 0.6, 0.8 }
+    local curve = {}
+    local previous = prev
+    local blendWeights = { 0, 0.18, 0.38, 0.62, 0.82, 1 }
     for _, t in ipairs(blendWeights) do
         local oneMinus = 1 - t
-        local x = (oneMinus * oneMinus * VecX(entry)) + (2 * oneMinus * t * VecX(corner)) + (t * t * VecX(exit))
-        local z = (oneMinus * oneMinus * VecZ(entry)) + (2 * oneMinus * t * VecZ(corner)) + (t * t * VecZ(exit))
+        local x = (oneMinus * oneMinus * VecX(entry)) + (2 * oneMinus * t * VecX(cornerPoint)) + (t * t * VecX(exit))
+        local z = (oneMinus * oneMinus * VecZ(entry)) + (2 * oneMinus * t * VecZ(cornerPoint)) + (t * t * VecZ(exit))
         local sample = BuildPoint(x, 0, z)
         if area then
             sample = ClampToPlayableArea(sample, area, 0)
         end
         SetPointSurface(sample, layer)
-        if not PointPassable(layer, sample) then
+        sample, cornerInfo = FindBestBufferedPoint(
+            layer,
+            sample,
+            bisectorX,
+            bisectorZ,
+            area,
+            previous,
+            nextPoint,
+            RoutePreferredClearance,
+            6,
+            1
+        )
+        if not (sample and PointPassable(layer, sample)) then
+            return nil
+        end
+        if not SegmentHasClearance(layer, previous, sample, math.max(RouteMinimumBalancedClearance, SimplifyClearance)) then
             return nil
         end
         sample._curve = true
-        sample._anchor = true
+        sample._transitAnchor = true
         table.insert(curve, sample)
-    end
-    table.insert(curve, exit)
-
-    curve[1]._curve = true
-    curve[1]._anchor = true
-    curve[table.getn(curve)]._curve = true
-    curve[table.getn(curve)]._anchor = true
-
-    local previous = prev
-    for _, sample in ipairs(curve) do
-        if not SegmentPassable(layer, previous, sample) then
-            return nil
-        end
         previous = sample
     end
-    if not SegmentPassable(layer, previous, nextPoint) then
+
+    if not SegmentHasClearance(layer, previous, nextPoint, math.max(RouteMinimumBalancedClearance, SimplifyClearance)) then
         return nil
     end
 
-    return curve
+    return RemoveDuplicateRoutePoints(curve, 2)
 end
 
 local function SmoothRouteCorners(route, layer, area)
@@ -1021,11 +1356,35 @@ local function CanSkipWaypoint(route, fromIndex, toIndex, layer)
         return false
     end
 
+    local preservedMinimum = math.huge
     for index = fromIndex + 1, toIndex - 1 do
         local point = route[index]
-        if point and (point._anchor or point._ingress or point._corridor or point._curve) then
+        if point and (point._anchor or point._ingress or point._corridor or point._curve or point._transitAnchor) then
             return false
         end
+
+        local segment = AnalyzeSegmentClearance(layer, route[index - 1], route[index], SimplifyClearance)
+        if segment then
+            preservedMinimum = math.min(preservedMinimum, segment.minimum)
+        end
+    end
+
+    local finalSegment = AnalyzeSegmentClearance(layer, route[toIndex - 1], route[toIndex], SimplifyClearance)
+    if finalSegment then
+        preservedMinimum = math.min(preservedMinimum, finalSegment.minimum)
+    end
+
+    local shortcut = AnalyzeSegmentClearance(layer, route[fromIndex], route[toIndex], SimplifyClearance)
+    if not shortcut then
+        return false
+    end
+
+    if preservedMinimum < math.huge and shortcut.minimum + 1.25 < preservedMinimum then
+        return false
+    end
+
+    if shortcut.centeredness < 0.42 and shortcut.minimum < SimplifyClearance then
+        return false
     end
 
     return SegmentHasClearance(layer, route[fromIndex], route[toIndex], SimplifyClearance)
@@ -1055,9 +1414,9 @@ local function SimplifyRoutePreservingSafety(route, layer)
     return simplified
 end
 
-local function DetermineWaypointType(point, index, routeCount)
-    if index == routeCount then
-        return 'pre-attack', true
+local function DetermineWaypointType(point, index, routeCount, allowFinalStaging)
+    if point._ingress then
+        return 'ingress', false
     end
 
     if point._corridor then
@@ -1068,12 +1427,19 @@ local function DetermineWaypointType(point, index, routeCount)
         return 'curve', false
     end
 
-    if point._ingress then
-        return 'ingress', false
+    if point._forceStaging then
+        return index == routeCount and 'pre-attack' or 'staging', true
     end
 
-    if point._anchor then
-        return 'staging', true
+    if index == routeCount then
+        if allowFinalStaging or point._preAttack then
+            return 'pre-attack', true
+        end
+        return 'transit', false
+    end
+
+    if point._anchor or point._transitAnchor then
+        return 'transit', false
     end
 
     return 'transit', false
@@ -1234,7 +1600,7 @@ local function BuildWaypointMetadata(route, destination, opts, layer, startedOut
         SetPointSurface(point, layer)
         local prevPoint = route[i - 1] or point
         local nextPoint = route[i + 1] or point
-        local waypointType, staging = DetermineWaypointType(point, i, table.getn(route))
+        local waypointType, staging = DetermineWaypointType(point, i, table.getn(route), opts and opts.RequireFinalStaging)
         local continuous = not staging
 
         local arrivalFacing, departureFacing, flowFacing, commandFacing = DetermineWaypointFacing(prevPoint, point, nextPoint, waypointType, continuous)
