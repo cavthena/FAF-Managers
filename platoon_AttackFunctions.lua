@@ -1535,6 +1535,7 @@ local function AttackTargetArea(platoon, target, opts)
         Formation = opts.Formation,
         AggressiveMove = opts.AggressiveMove,
         Amphibious = opts.Amphibious,
+        RandomizeRoute = opts.RandomizeRoute and true or false,
         RouteLayer = layer,
         RouteSource = (platoon.PlatoonData and platoon.PlatoonData.RouteSource) or opts.RouteSource,
         StartedOutsidePlayableArea = (platoon.PlatoonData and platoon.PlatoonData.StartedOutsidePlayableArea) or startedOutside,
