@@ -16,6 +16,7 @@ local SegmentReachDistanceSq = 36
 local ContinuousReachDistanceSq = 64
 local ContinuousQueueDistanceSq = 196
 local FinalAttackDistanceSq = 40 * 40
+local HugeNumber = math.huge or 1e9
 
 local CohesionMainBodyRadiusSq = 30 * 30
 local CohesionStragglerDistanceSq = 54 * 54
@@ -98,7 +99,7 @@ end
 
 local function DistSq(a, b)
     if not (a and b) then
-        return math.huge
+        return HugeNumber
     end
 
     local dx = VecX(a) - VecX(b)
@@ -108,12 +109,12 @@ end
 
 local function UnitDistanceSqToPoint(unit, point)
     if not (unit and point and unit.GetPosition) then
-        return math.huge
+        return HugeNumber
     end
 
     local pos = unit:GetPosition()
     if not pos then
-        return math.huge
+        return HugeNumber
     end
 
     local dx = (pos[1] or 0) - VecX(point)
@@ -541,8 +542,8 @@ local function AnalyzeSegmentClearance(layer, fromPos, toPos, desiredClearance)
 
     local preferred = desiredClearance or SimplifyClearance
     local samples = math.max(3, math.floor(length / 5))
-    local minimum = math.huge
-    local minimumTotal = math.huge
+    local minimum = HugeNumber
+    local minimumTotal = HugeNumber
     local centeredness = 0
     local preferredHits = 0
 
@@ -993,7 +994,7 @@ local function MeasureRouteClearance(route, layer)
         return nil
     end
 
-    local minClearance = math.huge
+    local minClearance = HugeNumber
     local totalClearance = 0
     local totalCenteredness = 0
     local segmentCount = 0
@@ -1026,7 +1027,7 @@ local function RoutePathSeparation(route, reference)
     for i = 2, math.max(2, table.getn(route) - 1) do
         local point = route[i]
         if point then
-            local nearestSq = math.huge
+            local nearestSq = HugeNumber
             for _, other in ipairs(reference) do
                 local distanceSq = DistSq(point, other)
                 if distanceSq < nearestSq then
@@ -1116,7 +1117,7 @@ local function CollectRouteCandidates(layer, startPos, target, opts, area)
         if math.abs((a.selectionScore or 0) - (b.selectionScore or 0)) > 0.05 then
             return (a.selectionScore or 0) > (b.selectionScore or 0)
         end
-        return (a.length or math.huge) < (b.length or math.huge)
+        return (a.length or HugeNumber) < (b.length or HugeNumber)
     end)
 
     return candidates
@@ -1133,11 +1134,11 @@ local function SelectRouteCandidate(candidates, opts)
     end
 
     local viable = {}
-    local bestLength = best.length or math.huge
+    local bestLength = best.length or HugeNumber
     local bestMinimumClearance = best.clearance and best.clearance.minimum or 0
 
     for _, candidate in ipairs(candidates) do
-        local length = candidate.length or math.huge
+        local length = candidate.length or HugeNumber
         local minClearance = candidate.clearance and candidate.clearance.minimum or 0
         local sufficientlyDistinct = candidate.routeType == 'default'
             or candidate.separation >= 10
@@ -1382,7 +1383,7 @@ local function CanSkipWaypoint(route, fromIndex, toIndex, layer)
         return false
     end
 
-    local preservedMinimum = math.huge
+    local preservedMinimum = HugeNumber
     for index = fromIndex + 1, toIndex - 1 do
         local point = route[index]
         if point and (point._anchor or point._ingress or point._corridor or point._curve or point._transitAnchor) then
@@ -1405,7 +1406,7 @@ local function CanSkipWaypoint(route, fromIndex, toIndex, layer)
         return false
     end
 
-    if preservedMinimum < math.huge and shortcut.minimum + 1.25 < preservedMinimum then
+    if preservedMinimum < HugeNumber and shortcut.minimum + 1.25 < preservedMinimum then
         return false
     end
 
@@ -1512,7 +1513,7 @@ local function GetPlatoonMainBodyCenter(units)
 
     local bestCenter = positions[1]
     local bestCount = 0
-    local bestScore = math.huge
+    local bestScore = HugeNumber
 
     for _, candidate in ipairs(positions) do
         local clusterCount = 0
@@ -2039,7 +2040,7 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
     local initialPlatoonPos = platoon:GetPlatoonPosition()
     local lastProgressPosition = initialPlatoonPos and CopyVec(initialPlatoonPos) or nil
     local lastProgressIndex = stored.currentIndex
-    local lastProgressDistanceSq = math.huge
+    local lastProgressDistanceSq = HugeNumber
 
     while PlatoonAlive(platoon) do
         local platoonPos = platoon:GetPlatoonPosition()
@@ -2123,7 +2124,7 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
         end
 
         local distanceToWaypointSq = DistSq(platoonPos, currentWaypoint.position)
-        local movedSq = lastProgressPosition and DistSq(platoonPos, lastProgressPosition) or math.huge
+        local movedSq = lastProgressPosition and DistSq(platoonPos, lastProgressPosition) or HugeNumber
         local routeAdvanced = stored.currentIndex > lastProgressIndex
         local madeMovementProgress = movedSq > 9
         local madePathProgress = routeAdvanced or (lastProgressDistanceSq - distanceToWaypointSq) > 16
