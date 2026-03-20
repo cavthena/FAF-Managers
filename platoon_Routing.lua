@@ -465,41 +465,59 @@ local function SamplePointClearance(layer, point, tangentX, tangentZ, maxDistanc
     return leftClearance, rightClearance, nx, nz
 end
 
-local function MeasurePointBufferedClearance(layer, point, tangentX, tangentZ, desiredClearance)
-    if not point then
-        return {
-            left = 0,
-            right = 0,
-            minimum = 0,
-            total = 0,
-            centeredness = 0,
-            balanced = false,
-            preferred = false,
-            nx = 0,
-            nz = 0,
-        }
+local function NormalizeClearanceInfo(info)
+    info = info or {}
+
+    local left = tonumber(info.left) or 0
+    local right = tonumber(info.right) or 0
+    local minimum = tonumber(info.minimum)
+    if minimum == nil then
+        minimum = math.min(left, right)
     end
 
-    local probe = math.max(desiredClearance or RoutePreferredClearance, RoutePreferredClearance)
-    local left, right, nx, nz = SamplePointClearance(layer, point, tangentX, tangentZ, probe, 1.5)
-    left = tonumber(left) or 0
-    right = tonumber(right) or 0
-    nx = tonumber(nx) or 0
-    nz = tonumber(nz) or 0
-    local minimum = math.min(left, right)
-    local total = left + right
-    local centeredness = total > 0 and (1 - (math.abs(left - right) / total)) or 0
+    local total = tonumber(info.total)
+    if total == nil then
+        total = left + right
+    end
+
+    local centeredness = tonumber(info.centeredness)
+    if centeredness == nil then
+        centeredness = total > 0 and (1 - (math.abs(left - right) / total)) or 0
+    end
+
+    local nx = tonumber(info.nx) or 0
+    local nz = tonumber(info.nz) or 0
+
     return {
         left = left,
         right = right,
         minimum = minimum,
         total = total,
         centeredness = centeredness,
-        balanced = minimum >= math.max(RouteMinimumBalancedClearance, probe * 0.45),
-        preferred = minimum >= probe * 0.70,
+        balanced = info.balanced and true or false,
+        preferred = info.preferred and true or false,
         nx = nx,
         nz = nz,
     }
+end
+
+local function MeasurePointBufferedClearance(layer, point, tangentX, tangentZ, desiredClearance)
+    if not point then
+        return NormalizeClearanceInfo()
+    end
+
+    local probe = math.max(desiredClearance or RoutePreferredClearance, RoutePreferredClearance)
+    local left, right, nx, nz = SamplePointClearance(layer, point, tangentX, tangentZ, probe, 1.5)
+    local info = NormalizeClearanceInfo({
+        left = left,
+        right = right,
+        nx = nx,
+        nz = nz,
+    })
+
+    info.balanced = info.minimum >= math.max(RouteMinimumBalancedClearance, probe * 0.45)
+    info.preferred = info.minimum >= probe * 0.70
+    return info
 end
 
 local function AnalyzeSegmentClearance(layer, fromPos, toPos, desiredClearance)
@@ -536,10 +554,10 @@ local function AnalyzeSegmentClearance(layer, fromPos, toPos, desiredClearance)
             Lerp(VecZ(fromPos), VecZ(toPos), t),
         }
 
-        local info = MeasurePointBufferedClearance(layer, sample, dirX, dirZ, preferred) or {}
-        local sampleMinimum = tonumber(info.minimum) or 0
-        local sampleTotal = tonumber(info.total) or 0
-        local sampleCenteredness = tonumber(info.centeredness) or 0
+        local info = NormalizeClearanceInfo(MeasurePointBufferedClearance(layer, sample, dirX, dirZ, preferred))
+        local sampleMinimum = info.minimum
+        local sampleTotal = info.total
+        local sampleCenteredness = info.centeredness
 
         minimum = math.min(minimum, sampleMinimum)
         minimumTotal = math.min(minimumTotal, sampleTotal)
@@ -582,7 +600,7 @@ local function SegmentHasClearance(layer, fromPos, toPos, desiredClearance)
 end
 
 local function ScoreCandidatePointInCorridor(layer, candidate, tangentX, tangentZ, desiredClearance)
-    local info = MeasurePointBufferedClearance(layer, candidate, tangentX, tangentZ, desiredClearance)
+    local info = NormalizeClearanceInfo(MeasurePointBufferedClearance(layer, candidate, tangentX, tangentZ, desiredClearance))
     local score = (info.minimum * 5) + (info.total * 0.6) + (info.centeredness * 10)
     if info.preferred then
         score = score + 12
