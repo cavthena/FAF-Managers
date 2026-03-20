@@ -134,7 +134,9 @@ local function HeadingDegrees(a, b)
 end
 
 local function NormalizeAngleDegrees(angle)
-    local normalized = math.fmod(angle or 0, 360)
+    local value = angle or 0
+    local turns = value >= 0 and math.floor(value / 360) or math.ceil(value / 360)
+    local normalized = value - (turns * 360)
     if normalized > 180 then
         normalized = normalized - 360
     elseif normalized < -180 then
