@@ -118,6 +118,41 @@ local function UnitDistanceSqToPoint(unit, point)
     return (dx * dx) + (dz * dz)
 end
 
+local function SafeGetBrain(platoon)
+    if not platoon then
+        return nil
+    end
+
+    if platoon.BeenDestroyed and platoon:BeenDestroyed() then
+        return nil
+    end
+
+    local ok, brain = pcall(platoon.GetBrain, platoon)
+    if not ok then
+        return nil
+    end
+
+    return brain
+end
+
+local function PlatoonAlive(platoon)
+    if not platoon then
+        return false
+    end
+
+    local brain = SafeGetBrain(platoon)
+    if not brain then
+        return false
+    end
+
+    if not brain:PlatoonExists(platoon) then
+        return false
+    end
+
+    local units = platoon:GetPlatoonUnits()
+    return units and table.getn(units) > 0
+end
+
 local function GetRandomInt(minValue, maxValue)
     if maxValue <= minValue then
         return minValue
