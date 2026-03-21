@@ -568,6 +568,24 @@ local function CopyOptions(data)
     return opts
 end
 
+local function MergeAttackData(platoon, data)
+    local merged = {}
+
+    if platoon and type(platoon.PlatoonData) == 'table' then
+        for key, value in pairs(platoon.PlatoonData) do
+            merged[key] = value
+        end
+    end
+
+    if type(data) == 'table' then
+        for key, value in pairs(data) do
+            merged[key] = value
+        end
+    end
+
+    return merged
+end
+
 local function GetPlatoonPosition(platoon)
     local pos = platoon:GetPlatoonPosition()
     if pos then
@@ -2450,6 +2468,7 @@ local function TrackHuntTarget(platoon, targetInfo, opts, layer)
 end
 
 function WaveAttack(platoon, data)
+    data = MergeAttackData(platoon, data)
     local opts = CopyOptions(data)
     opts.AggressiveMove = opts.AggressiveMove and true or false
     if not data or data.RandomizeRoute == nil then
@@ -2463,6 +2482,7 @@ function WaveAttack(platoon, data)
 end
 
 function RaidAttack(platoon, data)
+    data = MergeAttackData(platoon, data)
     local opts = CopyOptions(data)
     opts.AggressiveMove = opts.AggressiveMove and true or false
     if not data or data.RandomizeRoute == nil then
@@ -2476,6 +2496,7 @@ function RaidAttack(platoon, data)
 end
 
 function ScoutAttack(platoon, data)
+    data = MergeAttackData(platoon, data)
     local opts = CopyOptions(data)
     local brain = platoon:GetBrain()
     if not brain then return end
@@ -2513,6 +2534,7 @@ function ScoutAttack(platoon, data)
 end
 
 function AreaPatrol(platoon, data)
+    data = MergeAttackData(platoon, data)
     local opts = CopyOptions(data)
     opts.AggressiveMove = true
     local layer = DetermineLayer(platoon, opts.Amphibious)
@@ -2596,6 +2618,7 @@ function AreaPatrol(platoon, data)
 end
 
 function Firebase(platoon, data)
+    data = MergeAttackData(platoon, data)
     local opts = CopyOptions(data)
     local brain = platoon:GetBrain()
     if not brain then return end
@@ -2645,6 +2668,7 @@ function Firebase(platoon, data)
 end
 
 function Supportbase(platoon, data)
+    data = MergeAttackData(platoon, data)
     local opts = CopyOptions(data)
     local brain = platoon:GetBrain()
     if not brain then return end
@@ -2708,6 +2732,7 @@ function Supportbase(platoon, data)
 end
 
 function HuntAttack(platoon, data)
+    data = MergeAttackData(platoon, data)
     local opts = CopyOptions(data)
     opts.AggressiveMove = opts.AggressiveMove and true or false
     opts.Vulnerable = opts.Vulnerable and true or false
@@ -2768,6 +2793,7 @@ function HuntAttack(platoon, data)
 end
 
 function DefensePatrol(platoon, data)
+    data = MergeAttackData(platoon, data)
     local opts = CopyOptions(data)
     opts.AggressiveMove = true
     local brain = platoon:GetBrain()

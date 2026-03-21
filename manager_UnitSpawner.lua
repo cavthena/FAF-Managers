@@ -15,8 +15,59 @@
 --   • Safe to run multiple spawners in parallel (unique tag per instance; no shared state)
 --
 -- Public API
---   local Spawner = import('/maps/.../manager_UnitSpawner.lua')
---   local handle = Spawner.Start{
+--   local SpawnMgr = import('/maps/.../manager_UnitSpawner.lua')
+--
+--   -- Existing spawner usage -------------------------------------------------
+--   local handle = SpawnMgr.Start{
+--     brain = ArmyBrains[ScenarioInfo.Cybran],
+--     spawnMarker = 'AREA3_SPAWNER_CENTER',
+--     composition = {
+--         {'url0107', 8},
+--     },
+--     attackFn = plaAtk.WaveAttack,
+--     attackData = {
+--         Type = 'cluster',
+--         TargetArmy = {ScenarioInfo.Player1},
+--         Formation = 'AttackFormation',
+--         AggressiveMove = true,
+--     },
+--   }
+--
+--   -- Manual platoon from an existing unit list ------------------------------
+--   local platoon = SpawnMgr.StartManualPlatoon{
+--     brain = ArmyBrains[ScenarioInfo.Cybran],
+--     units = units,
+--     formation = 'GrowthFormation',
+--     attackFn = plaAtk.WaveAttack,
+--     attackData = {
+--         Type = 'cluster',
+--         TargetArmy = {ScenarioInfo.Player1},
+--         Formation = 'AttackFormation',
+--         AggressiveMove = true,
+--     },
+--     routeSource = 'Manual',
+--   }
+--
+--   -- Manual platoon from a one-off composition ------------------------------
+--   local platoon = SpawnMgr.StartManualPlatoon{
+--     brain = ArmyBrains[ScenarioInfo.Cybran],
+--     spawnMarker = 'AREA1_SPAWN_EAST_3',
+--     composition = {
+--         {'url0106', 6},
+--         {'url0107', 6},
+--     },
+--     formation = 'GrowthFormation',
+--     attackFn = plaAtk.WaveAttack,
+--     attackData = {
+--         Type = 'cluster',
+--         TargetArmy = {ScenarioInfo.Player1},
+--         Formation = 'AttackFormation',
+--         AggressiveMove = true,
+--     },
+--   }
+--
+--  --------------------------------------------------------------------------
+--   local handle = SpawnMgr.Start{
 --     brain              = ArmyBrains[ScenarioInfo.Cybran],
 --     spawnMarker        = 'AREA2_NORTHATTACK_SPAWNER',
 --     composition        = {
@@ -263,6 +314,155 @@ local function _PickIndex(n, avoid)
     return i
 end
 
+local function CopyPosition(pos)
+    if not pos then
+        return nil
+    end
+    return { pos[1], pos[2], pos[3] }
+end
+
+local function ResolveEntryCount(entry, difficulty)
+    local d = math.max(1, math.min(3, difficulty or 2))
+    local want = entry and entry.counts and entry.counts[d] or 0
+    return math.max(0, math.floor(want or 0))
+end
+
+local function ResolveStartedOutsidePlayableArea(position, override)
+    if override ~= nil then
+        return override and true or false
+    end
+
+    local area = GetPlayableArea()
+    if area and position then
+        return not PositionInPlayableArea(position, area)
+    end
+
+    return false
+end
+
+local function ApplyPlatoonMetadata(platoon, params, context)
+    if not platoon then
+        return nil
+    end
+
+    local platoonData = platoon.PlatoonData or {}
+    local attackData = type(params and params.attackData) == 'table' and params.attackData or nil
+    if attackData then
+        for key, value in pairs(attackData) do
+            if platoonData[key] == nil then
+                platoonData[key] = value
+            end
+        end
+    end
+
+    local spawnPos = context and context.spawnPos or platoon._spawnerStartPosition
+    if not spawnPos and platoon.GetPlatoonPosition then
+        spawnPos = platoon:GetPlatoonPosition()
+    end
+    local routeSource = (params and params.routeSource) or platoonData.RouteSource or 'UnitSpawner'
+    local startedOutside = ResolveStartedOutsidePlayableArea(spawnPos, params and params.startedOutsidePlayableArea)
+
+    platoonData.RouteSource = routeSource
+    platoonData.StartedOutsidePlayableArea = startedOutside
+    platoonData.Formation = platoonData.Formation or (params and params.formation) or 'GrowthFormation'
+
+    if params and params.spawnerTag and platoonData.SpawnerTag == nil then
+        platoonData.SpawnerTag = params.spawnerTag
+    end
+    if params and params.label and platoonData.PlatoonLabel == nil then
+        platoonData.PlatoonLabel = params.label
+    end
+    if params and params.spawnMarker ~= nil and platoonData.SpawnMarker == nil then
+        platoonData.SpawnMarker = params.spawnMarker
+    end
+    if spawnPos and platoonData.SpawnPosition == nil then
+        platoonData.SpawnPosition = CopyPosition(spawnPos)
+    end
+    if attackData and platoonData.AttackData == nil then
+        platoonData.AttackData = attackData
+    end
+
+    platoon.PlatoonData = platoonData
+    return platoonData
+end
+
+local function ResolveAttackFunction(attackFn)
+    if type(attackFn) == 'string' and attackFn ~= '' then
+        return _G and rawget(_G, attackFn)
+    end
+    return attackFn
+end
+
+local function LaunchAttackThread(platoon, attackFn, attackData, warnFn)
+    local resolvedAttackFn = ResolveAttackFunction(attackFn)
+    if type(resolvedAttackFn) ~= 'function' then
+        if warnFn then
+            warnFn('AttackWrapper: attackFn is not callable: ' .. tostring(attackFn))
+        end
+        return false
+    end
+
+    local brain = platoon and platoon.GetBrain and platoon:GetBrain()
+    if not (brain and brain.PlatoonExists and brain:PlatoonExists(platoon)) then
+        if warnFn then
+            warnFn('AttackWrapper: platoon missing at handoff')
+        end
+        return false
+    end
+
+    brain:ForkThread(function()
+        WaitTicks(2)
+        if brain:PlatoonExists(platoon) then
+            local units = platoon:GetPlatoonUnits() or {}
+            if table.getn(units) > 0 then
+                IssueClearCommands(units)
+            end
+
+            platoon:ForkAIThread(function(p)
+                if type(attackFn) == 'string' and attackFn ~= '' then
+                    local namedFn = _G and rawget(_G, attackFn)
+                    if type(namedFn) == 'function' then
+                        return namedFn(p, attackData)
+                    end
+                    return
+                end
+                return resolvedAttackFn(p, attackData)
+            end)
+        end
+    end)
+
+    return true
+end
+
+local function BuildUnitsFromComposition(params, tag, spawnPos)
+    local brain = params and params.brain
+    if not (brain and spawnPos) then
+        return {}
+    end
+
+    local spawned = {}
+    local spread = math.max(0, params.spawnSpread or 0)
+    local difficulty = params.difficulty or 2
+    local composition = normalizeComposition(params.composition)
+
+    for _, entry in ipairs(composition) do
+        local count = ResolveEntryCount(entry, difficulty)
+        for _ = 1, count do
+            local ox = (spread > 0) and (Random() * 2 - 1) * spread or 0
+            local oz = (spread > 0) and (Random() * 2 - 1) * spread or 0
+            local unit = CreateUnitHPR(entry.blueprint, brain:GetArmyIndex(), spawnPos[1] + ox, spawnPos[2], spawnPos[3] + oz, 0, 0, 0)
+            if unit then
+                unit.us_tag = tag
+                table.insert(spawned, unit)
+            else
+                WARN(('[US:%s] StartManualPlatoon: failed to create unit bp=%s'):format(tag or '?', tostring(entry.blueprint)))
+            end
+        end
+    end
+
+    return spawned
+end
+
 -- ========== class ==========
 local Spawner = {}
 Spawner.__index = Spawner
@@ -271,10 +471,7 @@ function Spawner:Log(msg) LOG(('[US:%s] %s'):format(self.tag, msg)) end
  function Spawner:Warn(msg) WARN(('[US:%s] %s'):format(self.tag, msg)) end
 
  function Spawner:GetEntryCount(entry)
-     local d = math.max(1, math.min(3, self.params.difficulty or 2))
-     local want = entry.counts[d] or 0
-     want = math.max(0, math.floor(want))
-     return want
+     return ResolveEntryCount(entry, self.params.difficulty)
  end
 
 function Spawner:GetEscalationFactor(waveNo)
@@ -408,48 +605,12 @@ function Spawner:HandOffToAttack(platoon)
         return
     end
 
-    if type(attackFn) == 'string' and attackFn ~= '' then
-        attackFn = _G and rawget(_G, attackFn)
-    end
+    ApplyPlatoonMetadata(platoon, self.params, {
+        spawnPos = platoon and platoon._spawnerStartPosition,
+    })
 
-    if type(attackFn) ~= 'function' then
-        self:Warn('AttackWrapper: attackFn is not callable: '.. tostring(self.params.attackFn))
-        return
-    end
-
-    local brain = platoon and platoon.GetBrain and platoon:GetBrain()
-    if not (brain and brain.PlatoonExists and brain:PlatoonExists(platoon)) then
-        self:Warn('AttackWrapper: platoon missing at handoff')
-        return
-    end
-
-    brain:ForkThread(function()
-        WaitTicks(2)
-        if brain:PlatoonExists(platoon) then
-            local units = platoon:GetPlatoonUnits() or {}
-            if table.getn(units) > 0 then
-                IssueClearCommands(units)
-            end
-
-            local platoonData = platoon.PlatoonData or {}
-            if type(self.params.attackData) == 'table' then
-                for key, value in pairs(self.params.attackData) do
-                    platoonData[key] = value
-                end
-            end
-
-            local spawnPos = platoon._spawnerStartPosition
-            local area = GetPlayableArea()
-            platoonData.RouteSource = 'UnitSpawner'
-            platoonData.StartedOutsidePlayableArea = area and spawnPos and not PositionInPlayableArea(spawnPos, area) or false
-            platoonData.SpawnPosition = spawnPos and { spawnPos[1], spawnPos[2], spawnPos[3] } or nil
-            platoonData.Formation = platoonData.Formation or self.params.formation or 'GrowthFormation'
-            platoon.PlatoonData = platoonData
-
-            platoon:ForkAIThread(function(p)
-                return attackFn(p, p.PlatoonData)
-            end)
-        end
+    LaunchAttackThread(platoon, attackFn, self.params.attackData, function(msg)
+        self:Warn(msg)
     end)
 end
 
@@ -699,3 +860,58 @@ end
 function Stop(handle)
      if handle and handle.Stop then handle:Stop() end
  end
+
+-- Supported manual entry path for prebuilt units or one-off composition spawns.
+function StartManualPlatoon(params)
+    assert(params and params.brain, 'brain is required')
+    assert(params.units or params.composition, 'units or composition are required')
+
+    local normalized = normalizeParams(params)
+    normalized.routeSource = params.routeSource or 'Manual'
+    normalized.label = params.label or params.platoonLabel or normalized.spawnerTag or 'ManualPlatoon'
+    normalized.startedOutsidePlayableArea = params.startedOutsidePlayableArea
+    normalized.spawnMarker = params.spawnMarker or params.position
+    normalized.spawnSpread = (params.spawnSpread ~= nil) and params.spawnSpread or 0
+
+    local spawnPos = markerPos(params.position) or markerPos(params.spawnMarker)
+    local tag = normalized.spawnerTag or ('USM_' .. math.floor(100000 * Random()))
+    normalized.spawnerTag = tag
+
+    local units = params.units or {}
+    if params.composition then
+        assert(spawnPos, 'spawnMarker or position is required when composition is provided')
+        units = BuildUnitsFromComposition(normalized, tag, spawnPos)
+    end
+
+    local platoon = normalized.brain:MakePlatoon(normalized.label, '')
+    if units and table.getn(units) > 0 then
+        normalized.brain:AssignUnitsToPlatoon(platoon, units, 'Attack', normalized.formation or 'GrowthFormation')
+    end
+
+    if spawnPos then
+        platoon._spawnerStartPosition = CopyPosition(spawnPos)
+    end
+
+    ApplyPlatoonMetadata(platoon, normalized, {
+        spawnPos = spawnPos,
+    })
+
+    if normalized.attackFn then
+        LaunchAttackThread(platoon, normalized.attackFn, normalized.attackData, function(msg)
+            WARN(('[US:%s] %s'):format(tag, msg))
+        end)
+    end
+
+    return platoon
+end
+
+function LaunchPlatoon(params)
+    return StartManualPlatoon(params)
+end
+
+return {
+    Start = Start,
+    Stop = Stop,
+    StartManualPlatoon = StartManualPlatoon,
+    LaunchPlatoon = LaunchPlatoon,
+}
