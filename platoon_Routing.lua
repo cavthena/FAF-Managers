@@ -1,5 +1,42 @@
 local NavUtils = import('/lua/sim/NavUtils.lua')
 
+local function ResolveSiblingModule(fileName, fallbackPath)
+    local ok, info = pcall(debug.getinfo, 1, 'S')
+    if ok and info and info.source then
+        local src = info.source
+        if type(src) == 'string' and string.sub(src, 1, 1) == '@' then
+            local dir = string.match(src, '^@(.*/)[^/]*$')
+            if dir then
+                local okImport, mod = pcall(import, dir .. fileName)
+                if okImport and mod then
+                    return mod
+                end
+            end
+        end
+    end
+
+    if ScenarioInfo and ScenarioInfo.MapPath then
+        local mp = ScenarioInfo.MapPath
+        if type(mp) == 'string' then
+            local dir = string.match(mp, '^(.-)/[^/]*$') or mp
+            if dir then
+                if string.sub(dir, 1, 1) ~= '/' then
+                    dir = '/' .. dir
+                end
+                local okImport, mod = pcall(import, dir .. '/' .. fileName)
+                if okImport and mod then
+                    return mod
+                end
+            end
+        end
+    end
+
+    return import(fallbackPath)
+end
+
+local RoutingUtils = ResolveSiblingModule('platoon_RoutingUtils.lua', '/maps/faf_coop_U01.v0001/platoon_RoutingUtils.lua')
+local RoutingGraph = ResolveSiblingModule('platoon_RoutingGraph.lua', '/maps/faf_coop_U01.v0001/platoon_RoutingGraph.lua')
+
 local SegmentPassable
 local RouteStamp = 0
 
@@ -1065,20 +1102,14 @@ local function CollectRouteCandidates(layer, startPos, target, opts, area)
                 routeType = 'default',
                 length = ComputeRouteLength(baseRoute),
                 clearance = clearance,
-                flankAngle = MeasureTerminalFlank(baseRoute, target),
+                flankAngle = RoutingGraph.MeasureTerminalFlank(baseRoute, target),
+                target = target,
             })
         end
     end
 
     if opts and opts.RandomizeRoute then
-        local variants = {
-            { routeType = 'left-wide', sideSign = -1, lateralScale = 0.30, fractions = { { 0.22, 0.65 }, { 0.48, 1.0 }, { 0.74, 0.85 } }, approachOffset = 0.95, approachBackoff = 0.20, maxOffset = 96 },
-            { routeType = 'left-deep', sideSign = -1, lateralScale = 0.38, fractions = { { 0.18, 0.75 }, { 0.42, 1.10 }, { 0.68, 1.0 } }, approachOffset = 1.15, approachBackoff = 0.24, maxOffset = 112 },
-            { routeType = 'right-wide', sideSign = 1, lateralScale = 0.30, fractions = { { 0.22, 0.65 }, { 0.48, 1.0 }, { 0.74, 0.85 } }, approachOffset = 0.95, approachBackoff = 0.20, maxOffset = 96 },
-            { routeType = 'right-deep', sideSign = 1, lateralScale = 0.38, fractions = { { 0.18, 0.75 }, { 0.42, 1.10 }, { 0.68, 1.0 } }, approachOffset = 1.15, approachBackoff = 0.24, maxOffset = 112 },
-            { routeType = 'left-late', sideSign = -1, lateralScale = 0.25, fractions = { { 0.34, 0.45 }, { 0.60, 0.90 } }, approachOffset = 1.20, approachBackoff = 0.28, maxOffset = 84 },
-            { routeType = 'right-late', sideSign = 1, lateralScale = 0.25, fractions = { { 0.34, 0.45 }, { 0.60, 0.90 } }, approachOffset = 1.20, approachBackoff = 0.28, maxOffset = 84 },
-        }
+        local variants = RoutingGraph.GetVariantSpecs(area, opts)
 
         for _, variantSpec in ipairs(variants) do
             local variant = BuildRandomizedRouteVariant(layer, startPos, target, area, variantSpec)
@@ -1090,8 +1121,10 @@ local function CollectRouteCandidates(layer, startPos, target, opts, area)
                         routeType = variantSpec.routeType,
                         length = ComputeRouteLength(variant),
                         clearance = clearance,
-                        flankAngle = MeasureTerminalFlank(variant, target),
+                        flankAngle = RoutingGraph.MeasureTerminalFlank(variant, target),
                         sideSign = variantSpec.sideSign,
+                        bias = variantSpec.bias,
+                        target = target,
                     })
                 end
             end
@@ -1102,87 +1135,11 @@ local function CollectRouteCandidates(layer, startPos, target, opts, area)
         return nil
     end
 
-    local reference = candidates[1] and candidates[1].path or nil
-    for _, candidate in ipairs(candidates) do
-        candidate.separation = reference and RoutePathSeparation(candidate.path, reference) or 0
-        local clearanceScore = (candidate.clearance.minimum * 10) + (candidate.clearance.average * 3) + (candidate.clearance.centeredness * 14)
-        local lengthPenalty = candidate.length * 0.75
-        candidate.selectionScore = clearanceScore - lengthPenalty
-        if candidate.routeType ~= 'default' then
-            candidate.selectionScore = candidate.selectionScore + (candidate.separation * 1.5) + (candidate.flankAngle * 0.14)
-        end
-    end
-
-    table.sort(candidates, function(a, b)
-        if math.abs((a.selectionScore or 0) - (b.selectionScore or 0)) > 0.05 then
-            return (a.selectionScore or 0) > (b.selectionScore or 0)
-        end
-        return (a.length or HugeNumber) < (b.length or HugeNumber)
-    end)
-
-    return candidates
+    return RoutingGraph.ScoreCandidates(candidates)
 end
 
 local function SelectRouteCandidate(candidates, opts)
-    if not (candidates and table.getn(candidates) > 0) then
-        return nil
-    end
-
-    local best = candidates[1]
-    if not (opts and opts.RandomizeRoute) then
-        return best
-    end
-
-    local viable = {}
-    local bestLength = best.length or HugeNumber
-    local bestMinimumClearance = best.clearance and best.clearance.minimum or 0
-
-    for _, candidate in ipairs(candidates) do
-        local length = candidate.length or HugeNumber
-        local minClearance = candidate.clearance and candidate.clearance.minimum or 0
-        local sufficientlyDistinct = candidate.routeType == 'default'
-            or candidate.separation >= 10
-            or candidate.flankAngle >= 22
-
-        if length <= (bestLength * RandomizedRouteLengthSlack)
-            and minClearance >= math.max(RouteMinimumBalancedClearance, bestMinimumClearance - 2)
-            and sufficientlyDistinct
-        then
-            table.insert(viable, candidate)
-        end
-        if table.getn(viable) >= RandomizedRouteMaxCandidates then
-            break
-        end
-    end
-
-    if table.getn(viable) == 0 then
-        return best
-    end
-
-    local weighted = {}
-    local totalWeight = 0
-    for _, candidate in ipairs(viable) do
-        local weight = 1
-        if candidate.routeType ~= 'default' then
-            weight = weight + math.max(1, math.floor(candidate.separation / 6)) + math.max(0, math.floor(candidate.flankAngle / 20))
-        else
-            local weakestViable = viable[table.getn(viable)]
-            weight = math.max(1, weight + math.floor((candidate.selectionScore - ((weakestViable and weakestViable.selectionScore) or 0)) / 8))
-        end
-        totalWeight = totalWeight + weight
-        table.insert(weighted, { candidate = candidate, weight = weight })
-    end
-
-    local roll = GetRandomInt(1, totalWeight)
-    local running = 0
-    for _, entry in ipairs(weighted) do
-        running = running + entry.weight
-        if roll <= running then
-            return entry.candidate
-        end
-    end
-
-    return viable[table.getn(viable)] or best
+    return RoutingGraph.SelectCandidate(candidates, opts)
 end
 
 local function BalancePointInCorridor(route, index, layer, area)
@@ -1474,21 +1431,29 @@ end
 
 local function DetermineRouteStage(route, waypoint)
     if not route then
-        return 'reroute-reset'
+        return 'REPATH'
     end
 
     if not route.initialFormComplete then
-        return 'route-start-form-up'
+        if route.isIngressRoute and route.currentIndex == 1 then
+            return 'INGRESS'
+        end
+        return 'MARCH'
     end
 
     if waypoint and waypoint.staging then
-        if waypoint.waypointType == 'pre-attack' then
-            return 'final-pre-attack-staging'
-        end
-        return 'explicit-staging'
+        return 'STAGING'
     end
 
-    return 'normal-traversal'
+    if waypoint and waypoint.waypointType == 'ingress' then
+        return 'INGRESS'
+    end
+
+    if waypoint and waypoint.aggressiveMove then
+        return 'ASSAULT'
+    end
+
+    return 'MARCH'
 end
 
 local function GetPlatoonMainBodyCenter(units)
@@ -1617,10 +1582,11 @@ local function UpdateRouteCohesionState(route, units)
     return details
 end
 
-local function BuildWaypointMetadata(route, destination, opts, layer, startedOutside, ingressEdge)
+local function BuildWaypointMetadata(platoon, route, destination, opts, layer, startedOutside, ingressEdge, debugSummary)
     local metadata = {}
     local formation = opts and opts.Formation or nil
-    local aggressiveMove = opts and opts.AggressiveMove and true or false
+    local assaultRadius = math.max(20, opts and opts.AssaultRadius or 40)
+    local stagingRadius = math.max(assaultRadius + 10, opts and opts.StagingRadius or 72)
 
     for i = 2, table.getn(route) do
         local point = CopyVec(route[i])
@@ -1635,10 +1601,12 @@ local function BuildWaypointMetadata(route, destination, opts, layer, startedOut
         local nextSegmentLength = SegmentLength(point, nextPoint)
         local turnAngle = AngleDeltaDegrees(arrivalFacing, departureFacing)
         local reachDistanceSq = continuous and ContinuousReachDistanceSq or SegmentReachDistanceSq
+        local corridorInfo = AnalyzeSegmentClearance(layer, prevPoint, point, RoutePreferredClearance)
 
-        table.insert(metadata, {
+        local waypoint = {
             position = point,
-            aggressiveMove = aggressiveMove,
+            aggressiveMove = false,
+            moveMode = 'move',
             facing = commandFacing,
             arrivalFacing = arrivalFacing,
             departureFacing = departureFacing,
@@ -1646,6 +1614,7 @@ local function BuildWaypointMetadata(route, destination, opts, layer, startedOut
             commandFacing = commandFacing,
             waypointType = waypointType,
             staging = staging,
+            allowReform = staging and waypointType ~= 'ingress' and true or false,
             continuous = continuous,
             reachDistanceSq = reachDistanceSq,
             queueDistanceSq = continuous and DetermineWaypointQueueDistanceSq(waypointType, segmentLength, nextSegmentLength, turnAngle) or reachDistanceSq,
@@ -1655,37 +1624,75 @@ local function BuildWaypointMetadata(route, destination, opts, layer, startedOut
             segmentLength = segmentLength,
             nextSegmentLength = nextSegmentLength,
             turnAngle = turnAngle,
-        })
+            corridorWidth = corridorInfo and corridorInfo.total or 0,
+            localClearance = corridorInfo and corridorInfo.minimum or 0,
+        }
+
+        waypoint.aggressiveMove, waypoint.moveMode = RoutingUtils.DetermineSegmentAggression({
+            targetPosition = opts and opts.TargetPosition or destination,
+            assaultRadius = assaultRadius,
+            stagingRadius = stagingRadius,
+        }, waypoint, i - 1, math.max(1, table.getn(route) - 1), opts)
+
+        table.insert(metadata, waypoint)
     end
 
     RouteStamp = RouteStamp + 1
-    return {
+    local stored = {
         stamp = RouteStamp,
         createdAt = GetGameTimeSeconds and GetGameTimeSeconds() or 0,
         currentIndex = 1,
         lastQueuedIndex = 0,
         lastIssuedIndex = nil,
         lastIssuedTime = nil,
-        routeStage = 'route-start-form-up',
+        routeStage = 'INGRESS',
+        routeState = 'INGRESS',
         initialFormComplete = false,
         initialFormIssuedTime = nil,
         cohesionBroken = false,
         cohesionState = nil,
         queueWindow = (opts and opts.QueueWindow) or PlatoonTraversalQueueWindow,
         destination = CopyVec(destination),
+        startPosition = route and route[1] and CopyVec(route[1]) or nil,
         targetPosition = opts and opts.TargetPosition and CopyVec(opts.TargetPosition) or CopyVec(destination),
         targetZone = opts and opts.TargetZone or nil,
         layer = layer,
-        aggressiveMove = aggressiveMove,
+        aggressiveMove = opts and opts.AggressiveMove and true or false,
         formation = formation,
         routeSource = opts and opts.RouteSource or nil,
         randomizeRoute = opts and opts.RandomizeRoute and true or false,
         routeVariant = opts and opts.RouteVariant or 'default',
         startedOutsidePlayableArea = startedOutside and true or false,
         ingressEdge = ingressEdge,
+        isIngressRoute = ingressEdge ~= nil,
+        assaultRadius = assaultRadius,
+        stagingRadius = stagingRadius,
+        debugEnabled = opts and opts.Debug and true or false,
+        debugSummary = debugSummary,
         waypoints = metadata,
         queuedIndex = nil,
+        squadPlan = nil,
+        formationFootprint = RoutingUtils.EstimatePlatoonFootprint(platoon, formation, opts),
     }
+
+    stored.squadPlan = RoutingGraph.BuildSquadPlan(stored, stored.formationFootprint)
+    if stored.squadPlan and stored.squadPlan.requiresSplit then
+        for _, splitIndex in ipairs(stored.squadPlan.splitIndices or {}) do
+            local waypoint = stored.waypoints[splitIndex]
+            if waypoint then
+                waypoint.splitRequired = true
+            end
+        end
+        for _, rejoinIndex in ipairs(stored.squadPlan.rejoinIndices or {}) do
+            local waypoint = stored.waypoints[rejoinIndex]
+            if waypoint then
+                waypoint.rejoinSuggested = true
+                waypoint.allowReform = true
+            end
+        end
+    end
+
+    return stored
 end
 
 local function SyncRouteOptions(route, opts)
@@ -1720,9 +1727,19 @@ local function SyncRouteOptions(route, opts)
     if opts and opts.QueueWindow ~= nil then
         route.queueWindow = math.max(1, opts.QueueWindow)
     end
+    if opts and opts.AssaultRadius ~= nil then
+        route.assaultRadius = math.max(20, opts.AssaultRadius)
+    end
+    if opts and opts.StagingRadius ~= nil then
+        route.stagingRadius = math.max(route.assaultRadius or 40, opts.StagingRadius)
+    end
+    if opts and opts.Debug ~= nil then
+        route.debugEnabled = opts.Debug and true or false
+    end
 
-    for _, waypoint in ipairs(route.waypoints or {}) do
-        waypoint.aggressiveMove = route.aggressiveMove
+    local waypointCount = table.getn(route.waypoints or {})
+    for index, waypoint in ipairs(route.waypoints or {}) do
+        waypoint.aggressiveMove, waypoint.moveMode = RoutingUtils.DetermineSegmentAggression(route, waypoint, index, waypointCount, opts or route)
         if waypoint.segmentStart and waypoint.segmentEnd then
             waypoint.arrivalFacing, waypoint.departureFacing, waypoint.flowFacing, waypoint.commandFacing = DetermineWaypointFacing(
                 waypoint.segmentStart,
@@ -1791,7 +1808,7 @@ function BuildPlatoonRoute(platoon, destination, opts)
     end
 
     local candidates = CollectRouteCandidates(layer, routingStart, target, opts, area)
-    local selected = SelectRouteCandidate(candidates, opts)
+    local selected, debugSummary = SelectRouteCandidate(candidates, opts)
     if not (selected and selected.path) then
         return nil
     end
@@ -1815,7 +1832,11 @@ function BuildPlatoonRoute(platoon, destination, opts)
     end
     buildOpts.RouteVariant = selected.routeType or 'default'
 
-    local stored = BuildWaypointMetadata(route, target, buildOpts, layer, startedOutside, ingressEdge)
+    buildOpts.AssaultRadius = buildOpts.AssaultRadius or 40
+    buildOpts.StagingRadius = buildOpts.StagingRadius or 72
+    buildOpts.Debug = buildOpts.Debug and true or false
+
+    local stored = BuildWaypointMetadata(platoon, route, target, buildOpts, layer, startedOutside, ingressEdge, debugSummary)
     SyncRouteOptions(stored, buildOpts)
     platoon._storedRoute = stored
     return stored
@@ -1911,29 +1932,40 @@ local function ResetQueuedTraversal(route, anchorIndex)
     route.queuedIndex = route.lastQueuedIndex > 0 and route.lastQueuedIndex or nil
 end
 
-local function QueuePlatoonMove(platoon, aggressiveMove, position)
-    if not (platoon and position) then
+local function QueueWaypointOrder(platoon, units, route, waypoint, clearQueue)
+    if not (platoon and units and route and waypoint and waypoint.position) then
         return false
     end
 
-    if aggressiveMove then
-        if not platoon.AggressiveMoveToLocation then
-            return false
+    if clearQueue then
+        IssueClearCommands(units)
+    end
+
+    local formation = route.formation
+    local useFormation = formation and formation ~= 'NoFormation'
+    local facing = waypoint.commandFacing or waypoint.arrivalFacing or waypoint.flowFacing or waypoint.facing or 0
+
+    if useFormation then
+        platoon:SetPlatoonFormationOverride(formation)
+        if waypoint.aggressiveMove then
+            IssueFormAggressiveMove(units, waypoint.position, formation, facing)
+        else
+            IssueFormMove(units, waypoint.position, formation, facing)
         end
-        local ok = pcall(platoon.AggressiveMoveToLocation, platoon, position)
-        return ok
+        return true
     end
 
-    if not platoon.MoveToLocation then
-        return false
+    platoon:SetPlatoonFormationOverride('NoFormation')
+    if waypoint.aggressiveMove then
+        IssueAggressiveMove(units, waypoint.position)
+    else
+        IssueMove(units, waypoint.position)
     end
-
-    local ok = pcall(platoon.MoveToLocation, platoon, position, false)
-    return ok
+    return true
 end
 
-local function QueueTraversalWindow(platoon, route)
-    if not (platoon and route and route.waypoints) then
+local function QueueTraversalWindow(platoon, units, route)
+    if not (platoon and units and route and route.waypoints) then
         return false
     end
 
@@ -1953,7 +1985,7 @@ local function QueueTraversalWindow(platoon, route)
             return false
         end
 
-        if not QueuePlatoonMove(platoon, waypoint.aggressiveMove, waypoint.position) then
+        if not QueueWaypointOrder(platoon, units, route, waypoint, false) then
             return false
         end
 
@@ -1972,24 +2004,9 @@ local function IssueFormationOrder(platoon, units, route, waypoint, waypointInde
     end
 
     local gameTime = GetGameTimeSeconds and GetGameTimeSeconds() or 0
-    local formation = route.formation
-    local useFormation = formation and formation ~= 'NoFormation'
-    local facing = waypoint.commandFacing or waypoint.arrivalFacing or waypoint.flowFacing or waypoint.facing or 0
 
-    IssueClearCommands(units)
-
-    if useFormation then
-        platoon:SetPlatoonFormationOverride(formation)
-        if route.aggressiveMove then
-            IssueFormAggressiveMove(units, waypoint.position, formation, facing)
-        else
-            IssueFormMove(units, waypoint.position, formation, facing)
-        end
-    else
-        platoon:SetPlatoonFormationOverride('NoFormation')
-        if not QueuePlatoonMove(platoon, route.aggressiveMove, waypoint.position) then
-            return false
-        end
+    if not QueueWaypointOrder(platoon, units, route, waypoint, true) then
+        return false
     end
 
     if commandMode == 'initial-form' then
@@ -2016,6 +2033,49 @@ local function IssueDeliberateStagingOrder(platoon, units, route, waypoint, wayp
     return IssueFormationOrder(platoon, units, route, waypoint, waypointIndex, 'staging-form')
 end
 
+local function ShouldRepath(platoon, route, opts)
+    if not platoon then
+        return true, 'missing-platoon'
+    end
+
+    local stored = route or platoon._storedRoute
+    if not (stored and stored.waypoints and table.getn(stored.waypoints) > 0) then
+        return true, 'missing-route'
+    end
+
+    local platoonPos = platoon.GetPlatoonPosition and platoon:GetPlatoonPosition()
+    if not platoonPos then
+        return true, 'missing-position'
+    end
+
+    local targetPos = opts and opts.TargetPosition or stored.targetPosition or stored.destination
+    if not targetPos then
+        return true, 'missing-target'
+    end
+
+    if opts and opts.ForceRepath then
+        return true, 'forced'
+    end
+
+    if DistSq(stored.destination, targetPos) > 24 * 24 then
+        return true, 'target-shifted'
+    end
+
+    local currentWaypoint = stored.waypoints[stored.currentIndex or 1]
+    if currentWaypoint and currentWaypoint.position and not PointPassable(stored.layer, currentWaypoint.position) then
+        return true, 'segment-invalid'
+    end
+
+    if stored.startedOutsidePlayableArea and stored.isIngressRoute and stored.ingressEdge then
+        local area = GetPlayableArea()
+        if area and PositionInPlayableArea(platoonPos, area) and (stored.routeState == 'INGRESS' or stored.routeStage == 'INGRESS') then
+            return true, 'ingress-complete'
+        end
+    end
+
+    return false, nil
+end
+
 function FollowStoredPlatoonRoute(platoon, destination, opts)
     if not platoon then
         return 'fail'
@@ -2028,6 +2088,12 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
 
     local stored = RebuildPlatoonRouteIfNeeded(platoon, destination, opts)
     if not (stored and stored.waypoints and table.getn(stored.waypoints) > 0) then
+        return 'repath'
+    end
+
+    local needsRepath, reason = ShouldRepath(platoon, stored, opts)
+    if needsRepath and reason ~= 'ingress-complete' then
+        stored.repathReason = reason
         return 'repath'
     end
 
@@ -2048,20 +2114,31 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
             return 'fail'
         end
 
-        if DistSq(platoonPos, stored.destination) <= FinalAttackDistanceSq then
-            stored.routeStage = 'final-attack'
+        if DistSq(platoonPos, stored.destination) <= ((stored.assaultRadius or 40) * (stored.assaultRadius or 40)) then
+            stored.routeStage = 'ASSAULT'
+            stored.routeState = 'ASSAULT'
             return 'attack'
+        end
+
+        local repath, repathReason = ShouldRepath(platoon, stored, opts)
+        if repath then
+            stored.routeStage = 'REPATH'
+            stored.routeState = 'REPATH'
+            stored.repathReason = repathReason
+            return 'repath'
         end
 
         while stored.currentIndex <= waypointCount do
             local waypoint = stored.waypoints[stored.currentIndex]
             local nextWaypoint = stored.waypoints[stored.currentIndex + 1]
             if not waypoint then
-                stored.routeStage = 'reroute-reset'
+                stored.routeStage = 'REPATH'
+                stored.routeState = 'REPATH'
                 return 'repath'
             end
             if not (waypoint.position and PointPassable(stored.layer, waypoint.position)) then
-                stored.routeStage = 'reroute-reset'
+                stored.routeStage = 'REPATH'
+                stored.routeState = 'REPATH'
                 return 'repath'
             end
             if not HasWaypointBeenPassed(platoonPos, waypoint, nextWaypoint) then
@@ -2071,28 +2148,32 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
         end
 
         if stored.currentIndex > waypointCount then
-            if destination and DistSq(platoonPos, destination) <= FinalAttackDistanceSq then
-                stored.routeStage = 'final-attack'
+            stored.routeStage = 'ASSAULT'
+            stored.routeState = 'ASSAULT'
+            if destination and DistSq(platoonPos, destination) <= ((stored.assaultRadius or 40) * (stored.assaultRadius or 40)) then
                 return 'attack'
             end
-            stored.routeStage = 'final-attack'
             return 'success'
         end
 
         local currentWaypoint = stored.waypoints[stored.currentIndex]
         if not currentWaypoint then
-            stored.routeStage = 'reroute-reset'
+            stored.routeStage = 'REPATH'
+            stored.routeState = 'REPATH'
             return 'repath'
         end
         stored.routeStage = DetermineRouteStage(stored, currentWaypoint)
+        stored.routeState = stored.routeStage
 
-        if stored.routeStage == 'route-start-form-up' then
+        if not stored.initialFormComplete then
             if not IssueInitialFormationOrder(platoon, units, stored, currentWaypoint, stored.currentIndex) then
-                stored.routeStage = 'reroute-reset'
+                stored.routeStage = 'REPATH'
+                stored.routeState = 'REPATH'
                 return 'repath'
             end
-            if not QueueTraversalWindow(platoon, stored) then
-                stored.routeStage = 'reroute-reset'
+            if not QueueTraversalWindow(platoon, units, stored) then
+                stored.routeStage = 'REPATH'
+                stored.routeState = 'REPATH'
                 return 'repath'
             end
             lastProgressTime = GetGameTimeSeconds and GetGameTimeSeconds() or lastProgressTime
@@ -2102,13 +2183,15 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
         else
             UpdateRouteCohesionState(stored, units)
 
-            if currentWaypoint.staging and not currentWaypoint.stagingIssued then
+            if currentWaypoint.staging and currentWaypoint.allowReform and not currentWaypoint.stagingIssued then
                 if not IssueDeliberateStagingOrder(platoon, units, stored, currentWaypoint, stored.currentIndex) then
-                    stored.routeStage = 'reroute-reset'
+                    stored.routeStage = 'REPATH'
+                    stored.routeState = 'REPATH'
                     return 'repath'
                 end
-                if not QueueTraversalWindow(platoon, stored) then
-                    stored.routeStage = 'reroute-reset'
+                if not QueueTraversalWindow(platoon, units, stored) then
+                    stored.routeStage = 'REPATH'
+                    stored.routeState = 'REPATH'
                     return 'repath'
                 end
                 lastProgressTime = GetGameTimeSeconds and GetGameTimeSeconds() or lastProgressTime
@@ -2116,8 +2199,9 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
                 lastProgressIndex = stored.currentIndex
                 lastProgressDistanceSq = DistSq(platoonPos, currentWaypoint.position)
             elseif (stored.lastQueuedIndex or 0) < math.min(waypointCount, stored.currentIndex + math.max(1, stored.queueWindow or PlatoonTraversalQueueWindow) - 1) then
-                if not QueueTraversalWindow(platoon, stored) then
-                    stored.routeStage = 'reroute-reset'
+                if not QueueTraversalWindow(platoon, units, stored) then
+                    stored.routeStage = 'REPATH'
+                    stored.routeState = 'REPATH'
                     return 'repath'
                 end
             end
@@ -2136,11 +2220,15 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
             lastProgressDistanceSq = distanceToWaypointSq
             if stored.currentIndex <= waypointCount then
                 stored.routeStage = DetermineRouteStage(stored, stored.waypoints[stored.currentIndex])
+                stored.routeState = stored.routeStage
             else
-                stored.routeStage = 'final-attack'
+                stored.routeStage = 'ASSAULT'
+                stored.routeState = 'ASSAULT'
             end
         elseif (GetGameTimeSeconds and GetGameTimeSeconds() or 0) >= (lastProgressTime + RouteStuckTimeout) then
-            stored.routeStage = 'reroute-reset'
+            stored.routeStage = 'REPATH'
+            stored.routeState = 'REPATH'
+            stored.repathReason = 'stuck'
             return 'repath'
         end
 
@@ -2247,6 +2335,28 @@ function RecomputePathWithFallback(platoon, layer, destination, opts)
     return path
 end
 
+
+function BuildRoute(platoon, startPos, targetPos, opts)
+    local buildOpts = {}
+    if type(opts) == 'table' then
+        for key, value in pairs(opts) do
+            buildOpts[key] = value
+        end
+    end
+    if startPos then
+        buildOpts.RouteStart = CopyVec(startPos)
+    end
+    return BuildPlatoonRoute(platoon, targetPos, buildOpts)
+end
+
+function FollowRoute(platoon, route, opts)
+    if route then
+        platoon._storedRoute = route
+    end
+    local destination = route and route.destination or route and route.targetPosition or opts and opts.TargetPosition
+    return FollowStoredPlatoonRoute(platoon, destination, opts)
+end
+
 function MoveAlongPath(platoon, path, formation, aggressiveFinal, layer, aggressiveRoute)
     if not (platoon and path and table.getn(path) > 0) then
         return false
@@ -2267,7 +2377,7 @@ function MoveAlongPath(platoon, path, formation, aggressiveFinal, layer, aggress
         table.insert(routePoints, CopyVec(waypoint))
     end
 
-    local metadata = BuildWaypointMetadata(routePoints, destination, {
+    local metadata = BuildWaypointMetadata(platoon, routePoints, destination, {
         Formation = formation,
         AggressiveMove = aggressiveRoute and true or false,
     }, layer or ResolveLayer(platoon, nil), false, nil)
@@ -2318,6 +2428,9 @@ function MoveToNearestPlayableIngress(platoon, layer, area, formation, destinati
 end
 
 return {
+    BuildRoute = BuildRoute,
+    FollowRoute = FollowRoute,
+    ShouldRepath = ShouldRepath,
     BuildPlatoonRoute = BuildPlatoonRoute,
     FollowStoredPlatoonRoute = FollowStoredPlatoonRoute,
     RebuildPlatoonRouteIfNeeded = RebuildPlatoonRouteIfNeeded,

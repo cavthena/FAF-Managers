@@ -1520,9 +1520,9 @@ local function ExtractStoredRoutePath(route)
     return path
 end
 
-local function RebuildAttackRoute(platoon, targetPos, routeOpts)
+local function RebuildAttackRoute(platoon, startPos, targetPos, routeOpts)
     routeOpts.ForceRepath = true
-    return Routing.BuildPlatoonRoute(platoon, targetPos, routeOpts)
+    return Routing.BuildRoute(platoon, startPos, targetPos, routeOpts)
 end
 
 local function AttackTargetArea(platoon, target, opts)
@@ -1567,14 +1567,14 @@ local function AttackTargetArea(platoon, target, opts)
         end
     end
 
-    local route = Routing.BuildPlatoonRoute(platoon, targetPos, routeOpts)
+    local route = Routing.BuildRoute(platoon, startPos, targetPos, routeOpts)
     local canPath = route and true or CanPathTo(platoon, layer, targetPos)
     if not canPath then
         if opts.Transport then
             if not TransportAndMove(platoon, targetPos, opts) then
                 return 'fail'
             end
-            route = RebuildAttackRoute(platoon, targetPos, routeOpts)
+            route = RebuildAttackRoute(platoon, startPos, targetPos, routeOpts)
         else
             return 'fail'
         end
@@ -1591,7 +1591,7 @@ local function AttackTargetArea(platoon, target, opts)
             return 'repath'
         end
         if not MoveAlongPath(platoon, path, opts.Formation, false, layer, opts.AggressiveMove) then
-            route = RebuildAttackRoute(platoon, targetPos, routeOpts)
+            route = RebuildAttackRoute(platoon, startPos, targetPos, routeOpts)
             if not (route and route.waypoints) then
                 return 'repath'
             end
@@ -1605,21 +1605,26 @@ local function AttackTargetArea(platoon, target, opts)
         -- Traversal stays under the routing queue so platoons do not clear and
         -- reform between route nodes; only the final attack handoff below may
         -- issue a fresh attack command at the destination.
-        routeStatus = Routing.FollowStoredPlatoonRoute(platoon, targetPos, routeOpts)
+        local repathRequired = Routing.ShouldRepath and select(1, Routing.ShouldRepath(platoon, route, routeOpts)) or false
+        if repathRequired then
+            route = RebuildAttackRoute(platoon, startPos, targetPos, routeOpts)
+        end
+
+        routeStatus = Routing.FollowRoute(platoon, route, routeOpts)
         if routeStatus == 'repath' then
             RoutingLog('Initial route follow requested repath; rebuilding authoritative route')
-            route = RebuildAttackRoute(platoon, targetPos, routeOpts)
+            route = RebuildAttackRoute(platoon, startPos, targetPos, routeOpts)
             if not route and opts.Transport then
                 RoutingLog('Route rebuild failed; attempting transport fallback')
                 if not TransportAndMove(platoon, targetPos, opts) then
                     return 'repath'
                 end
-                route = RebuildAttackRoute(platoon, targetPos, routeOpts)
+                route = RebuildAttackRoute(platoon, startPos, targetPos, routeOpts)
             end
             if not route then
                 return 'repath'
             end
-            routeStatus = Routing.FollowStoredPlatoonRoute(platoon, targetPos, routeOpts)
+            routeStatus = Routing.FollowRoute(platoon, route, routeOpts)
         end
 
         if routeStatus ~= 'attack' and routeStatus ~= 'success' then
