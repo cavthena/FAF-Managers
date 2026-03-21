@@ -62,12 +62,83 @@ local function ResolveSiblingModule(fileName, fallbackPath)
 end
 
 local Utils = ResolveSiblingModule('platoon_RoutingUtils.lua', '/maps/faf_coop_U01.v0001/platoon_RoutingUtils.lua')
-
-local DistSq = Utils.DistSq
-local HeadingDegrees = Utils.HeadingDegrees
-local AngleDeltaDegrees = Utils.AngleDeltaDegrees
-
 local HugeNumber = math.huge or 1e9
+
+local function ReadVecComponent(v, numericIndex, axisName)
+    if v == nil then
+        return nil
+    end
+
+    if type(v) == 'table' then
+        local value = rawget(v, numericIndex)
+        if value == nil then
+            value = rawget(v, axisName)
+        end
+        return value
+    end
+
+    local ok, value = pcall(function()
+        return v[axisName]
+    end)
+    if ok then
+        return value
+    end
+
+    return nil
+end
+
+local function VecX(v)
+    return ReadVecComponent(v, 1, 'x') or 0
+end
+
+local function VecZ(v)
+    return ReadVecComponent(v, 3, 'z') or 0
+end
+
+local function FallbackDistSq(a, b)
+    if not (a and b) then
+        return HugeNumber
+    end
+
+    local dx = VecX(a) - VecX(b)
+    local dz = VecZ(a) - VecZ(b)
+    return dx * dx + dz * dz
+end
+
+local function FallbackHeadingDegrees(a, b)
+    if not (a and b) then
+        return 0
+    end
+
+    local dx = VecX(b) - VecX(a)
+    local dz = VecZ(b) - VecZ(a)
+    if math.abs(dx) < 0.001 and math.abs(dz) < 0.001 then
+        return 0
+    end
+
+    return math.deg((math.atan2 or math.atan)(dz, dx))
+end
+
+local function NormalizeAngleDegrees(angle)
+    local value = angle or 0
+    local turns = value >= 0 and math.floor(value / 360) or math.ceil(value / 360)
+    local normalized = value - (turns * 360)
+    if normalized > 180 then
+        normalized = normalized - 360
+    elseif normalized < -180 then
+        normalized = normalized + 360
+    end
+    return normalized
+end
+
+local function FallbackAngleDeltaDegrees(a, b)
+    return math.abs(NormalizeAngleDegrees((b or 0) - (a or 0)))
+end
+
+local DistSq = Utils and Utils.DistSq or FallbackDistSq
+local HeadingDegrees = Utils and Utils.HeadingDegrees or FallbackHeadingDegrees
+local AngleDeltaDegrees = Utils and Utils.AngleDeltaDegrees or FallbackAngleDeltaDegrees
+
 local RandomizedRouteMaxCandidates = 4
 local RandomizedRouteLengthSlack = 1.55
 
