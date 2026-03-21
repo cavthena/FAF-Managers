@@ -72,6 +72,11 @@ local DirectClearance = 9
 local SimplifyClearance = 8
 local RoutePreferredClearance = 11
 local RouteMinimumBalancedClearance = 4
+local SegmentTraversalSampleStep = 3.5
+local SegmentTraversalOffsetStep = 0.45
+local SegmentTraversalMaxOffsetFraction = 0.7
+local SegmentLengthClearanceScale = 0.08
+local SegmentLengthClearanceMaxBonus = 9
 local CorridorBalanceProbeDistance = 26
 local CorridorBalanceStep = 1.5
 local CornerAngleThreshold = 28
@@ -586,6 +591,85 @@ local function MeasurePointBufferedClearance(layer, point, tangentX, tangentZ, d
     return info
 end
 
+local function DetermineDesiredSegmentClearance(length, desiredClearance)
+    local preferred = desiredClearance or SimplifyClearance
+    if not length or length <= 18 then
+        return preferred
+    end
+
+    local bonus = math.min(SegmentLengthClearanceMaxBonus, math.max(0, (length - 18) * SegmentLengthClearanceScale))
+    return preferred + bonus
+end
+
+local function BuildSegmentSamplePoint(fromPos, toPos, t)
+    return {
+        Lerp(VecX(fromPos), VecX(toPos), t),
+        Lerp(VecY(fromPos), VecY(toPos), t),
+        Lerp(VecZ(fromPos), VecZ(toPos), t),
+    }
+end
+
+local function SegmentTraversesPassableSpace(layer, fromPos, toPos, tangentX, tangentZ, desiredClearance)
+    if not (fromPos and toPos) then
+        return false
+    end
+
+    local segmentLength = SegmentLength(fromPos, toPos)
+    if segmentLength < 0.001 then
+        return PointPassable(layer, fromPos)
+    end
+
+    local nx, nz = -tangentZ, tangentX
+    local normalLength = Length2D(nx, nz)
+    if normalLength < 0.001 then
+        nx, nz = 0, 1
+    else
+        nx = nx / normalLength
+        nz = nz / normalLength
+    end
+
+    local preferred = DetermineDesiredSegmentClearance(segmentLength, desiredClearance)
+    local lateralLimit = math.max(0, preferred * SegmentTraversalMaxOffsetFraction)
+    local steps = math.max(2, math.ceil(segmentLength / SegmentTraversalSampleStep))
+    local rails = { 0 }
+    local offset = SegmentTraversalOffsetStep
+    while offset <= lateralLimit do
+        table.insert(rails, offset)
+        table.insert(rails, -offset)
+        offset = offset + SegmentTraversalOffsetStep
+    end
+
+    local previousSamples = {}
+    for _, lateral in ipairs(rails) do
+        local initial = OffsetPoint(fromPos, nx * lateral, nz * lateral)
+        SetPointSurface(initial, layer)
+        if not PointPassable(layer, initial) then
+            return false
+        end
+        table.insert(previousSamples, initial)
+    end
+
+    for stepIndex = 1, steps do
+        local t = stepIndex / steps
+        local center = BuildSegmentSamplePoint(fromPos, toPos, t)
+        SetPointSurface(center, layer)
+
+        for railIndex, lateral in ipairs(rails) do
+            local sample = lateral == 0 and center or OffsetPoint(center, nx * lateral, nz * lateral)
+            SetPointSurface(sample, layer)
+            if not PointPassable(layer, sample) then
+                return false
+            end
+            if not SegmentPassable(layer, previousSamples[railIndex], sample) then
+                return false
+            end
+            previousSamples[railIndex] = sample
+        end
+    end
+
+    return true
+end
+
 local function AnalyzeSegmentClearance(layer, fromPos, toPos, desiredClearance)
     if not (fromPos and toPos) then
         return nil
@@ -605,7 +689,11 @@ local function AnalyzeSegmentClearance(layer, fromPos, toPos, desiredClearance)
         return pointClearance
     end
 
-    local preferred = desiredClearance or SimplifyClearance
+    local preferred = DetermineDesiredSegmentClearance(length, desiredClearance)
+    if not SegmentTraversesPassableSpace(layer, fromPos, toPos, dirX, dirZ, preferred) then
+        return nil
+    end
+
     local samples = math.max(3, math.floor(length / 5))
     local minimum = HugeNumber
     local minimumTotal = HugeNumber
@@ -614,11 +702,7 @@ local function AnalyzeSegmentClearance(layer, fromPos, toPos, desiredClearance)
 
     for i = 0, samples do
         local t = i / samples
-        local sample = {
-            Lerp(VecX(fromPos), VecX(toPos), t),
-            Lerp(VecY(fromPos), VecY(toPos), t),
-            Lerp(VecZ(fromPos), VecZ(toPos), t),
-        }
+        local sample = BuildSegmentSamplePoint(fromPos, toPos, t)
 
         local info = NormalizeClearanceInfo(MeasurePointBufferedClearance(layer, sample, dirX, dirZ, preferred))
         local sampleMinimum = info.minimum
@@ -635,6 +719,7 @@ local function AnalyzeSegmentClearance(layer, fromPos, toPos, desiredClearance)
 
     return {
         length = length,
+        desired = preferred,
         minimum = minimum,
         total = minimumTotal,
         centeredness = centeredness / (samples + 1),
@@ -648,7 +733,7 @@ local function SegmentHasClearance(layer, fromPos, toPos, desiredClearance)
         return false
     end
 
-    local preferred = desiredClearance or SimplifyClearance
+    local preferred = analysis.desired or desiredClearance or SimplifyClearance
     if analysis.minimum >= preferred then
         return true
     end
