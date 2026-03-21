@@ -1,16 +1,40 @@
 local NavUtils = import('/lua/sim/NavUtils.lua')
 
+local function ImportFirstAvailable(paths)
+    for _, path in ipairs(paths or {}) do
+        if type(path) == 'string' and path ~= '' then
+            local okImport, mod = pcall(import, path)
+            if okImport and mod then
+                return mod
+            end
+        end
+    end
+    return nil
+end
+
+local function AppendCaseVariants(paths, path)
+    if type(path) ~= 'string' or path == '' then
+        return
+    end
+
+    table.insert(paths, path)
+
+    local lower = string.lower(path)
+    if lower ~= path then
+        table.insert(paths, lower)
+    end
+end
+
 local function ResolveSiblingModule(fileName, fallbackPath)
+    local candidates = {}
+
     local ok, info = pcall(debug.getinfo, 1, 'S')
     if ok and info and info.source then
         local src = info.source
         if type(src) == 'string' and string.sub(src, 1, 1) == '@' then
             local dir = string.match(src, '^@(.*/)[^/]*$')
             if dir then
-                local okImport, mod = pcall(import, dir .. fileName)
-                if okImport and mod then
-                    return mod
-                end
+                AppendCaseVariants(candidates, dir .. fileName)
             end
         end
     end
@@ -23,12 +47,16 @@ local function ResolveSiblingModule(fileName, fallbackPath)
                 if string.sub(dir, 1, 1) ~= '/' then
                     dir = '/' .. dir
                 end
-                local okImport, mod = pcall(import, dir .. '/' .. fileName)
-                if okImport and mod then
-                    return mod
-                end
+                AppendCaseVariants(candidates, dir .. '/' .. fileName)
             end
         end
+    end
+
+    AppendCaseVariants(candidates, fallbackPath)
+
+    local mod = ImportFirstAvailable(candidates)
+    if mod then
+        return mod
     end
 
     return import(fallbackPath)

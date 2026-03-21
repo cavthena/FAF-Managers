@@ -224,18 +224,41 @@ DefensePatrol specifics
 local ScenarioFramework = import('/lua/ScenarioFramework.lua')
 local ScenarioUtils     = import('/lua/sim/ScenarioUtilities.lua')
 
+local function ImportFirstAvailable(paths)
+    for _, path in ipairs(paths or {}) do
+        if type(path) == 'string' and path ~= '' then
+            local okImport, mod = pcall(import, path)
+            if okImport and mod then
+                return mod
+            end
+        end
+    end
+    return nil
+end
+
+local function AppendCaseVariants(paths, path)
+    if type(path) ~= 'string' or path == '' then
+        return
+    end
+
+    table.insert(paths, path)
+
+    local lower = string.lower(path)
+    if lower ~= path then
+        table.insert(paths, lower)
+    end
+end
+
 local function ResolveBaseManagerModule()
+    local candidates = {}
+
     local ok, info = pcall(debug.getinfo, 1, 'S')
     if ok and info and info.source then
         local src = info.source
         if type(src) == 'string' and string.sub(src, 1, 1) == '@' then
             local dir = string.match(src, '^@(.*/)[^/]*$')
             if dir then
-                local path = dir .. 'manager_BaseEngineer.lua'
-                local okImport, mod = pcall(import, path)
-                if okImport and mod then
-                    return mod
-                end
+                AppendCaseVariants(candidates, dir .. 'manager_BaseEngineer.lua')
             end
         end
     end
@@ -248,13 +271,16 @@ local function ResolveBaseManagerModule()
                 if string.sub(dir, 1, 1) ~= '/' then
                     dir = '/' .. dir
                 end
-                local path = dir .. '/manager_BaseEngineer.lua'
-                local okImport, mod = pcall(import, path)
-                if okImport and mod then
-                    return mod
-                end
+                AppendCaseVariants(candidates, dir .. '/manager_BaseEngineer.lua')
             end
         end
+    end
+
+    AppendCaseVariants(candidates, '/maps/faf_coop_U01.v0001/manager_BaseEngineer.lua')
+
+    local mod = ImportFirstAvailable(candidates)
+    if mod then
+        return mod
     end
 
     return import('/maps/faf_coop_U01.v0001/manager_BaseEngineer.lua')
@@ -263,17 +289,15 @@ end
 local BaseManager = ResolveBaseManagerModule()
 
 local function ResolveRoutingModule()
+    local candidates = {}
+
     local ok, info = pcall(debug.getinfo, 1, 'S')
     if ok and info and info.source then
         local src = info.source
         if type(src) == 'string' and string.sub(src, 1, 1) == '@' then
             local dir = string.match(src, '^@(.*/)[^/]*$')
             if dir then
-                local path = dir .. 'platoon_Routing.lua'
-                local okImport, mod = pcall(import, path)
-                if okImport and mod then
-                    return mod
-                end
+                AppendCaseVariants(candidates, dir .. 'platoon_Routing.lua')
             end
         end
     end
@@ -286,13 +310,16 @@ local function ResolveRoutingModule()
                 if string.sub(dir, 1, 1) ~= '/' then
                     dir = '/' .. dir
                 end
-                local path = dir .. '/platoon_Routing.lua'
-                local okImport, mod = pcall(import, path)
-                if okImport and mod then
-                    return mod
-                end
+                AppendCaseVariants(candidates, dir .. '/platoon_Routing.lua')
             end
         end
+    end
+
+    AppendCaseVariants(candidates, '/maps/faf_coop_U01.v0001/platoon_Routing.lua')
+
+    local mod = ImportFirstAvailable(candidates)
+    if mod then
+        return mod
     end
 
     return import('/maps/faf_coop_U01.v0001/platoon_Routing.lua')
