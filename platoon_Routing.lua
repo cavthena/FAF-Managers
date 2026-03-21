@@ -103,10 +103,7 @@ local RouteStuckTimeout = 10
 local ActiveRouteBuildContext = false
 
 local function RouteBuildClock()
-    if os and os.clock then
-        return os.clock()
-    end
-    return GetGameTimeSeconds and GetGameTimeSeconds() or 0
+    return GetGameTimeSeconds()
 end
 
 local function RouteBuildDebugEnabled(context)
