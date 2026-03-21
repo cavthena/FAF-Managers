@@ -326,6 +326,7 @@ local function ResolveRoutingModule()
 end
 
 local Routing = ResolveRoutingModule()
+local RoutingShouldRepath = type(Routing) == 'table' and rawget(Routing, 'ShouldRepath') or nil
 GetTerrainHeight  = GetTerrainHeight
 GetSurfaceHeight  = GetSurfaceHeight
 
@@ -1632,7 +1633,9 @@ local function AttackTargetArea(platoon, target, opts)
         -- Traversal stays under the routing queue so platoons do not clear and
         -- reform between route nodes; only the final attack handoff below may
         -- issue a fresh attack command at the destination.
-        local repathRequired = Routing.ShouldRepath and select(1, Routing.ShouldRepath(platoon, route, routeOpts)) or false
+        local repathRequired = type(RoutingShouldRepath) == 'function'
+            and select(1, RoutingShouldRepath(platoon, route, routeOpts))
+            or false
         if repathRequired then
             route = RebuildAttackRoute(platoon, startPos, targetPos, routeOpts)
         end
