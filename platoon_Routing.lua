@@ -2111,6 +2111,19 @@ local function QueueTraversalWindow(platoon, units, route)
     return true
 end
 
+local function ShouldExtendTraversalQueue(route, waypoint, platoonPos)
+    if not (route and waypoint and platoonPos) then
+        return false
+    end
+
+    if waypoint.staging or waypoint.allowReform or not waypoint.continuous then
+        return false
+    end
+
+    local queueDistanceSq = waypoint.queueDistanceSq or waypoint.reachDistanceSq or ContinuousQueueDistanceSq
+    return DistSq(platoonPos, waypoint.position) <= queueDistanceSq
+end
+
 local function IssueFormationOrder(platoon, units, route, waypoint, waypointIndex, commandMode)
     if not (platoon and units and route and waypoint and waypoint.position) then
         return false
@@ -2284,7 +2297,9 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
                 stored.routeState = 'REPATH'
                 return 'repath'
             end
-            if not QueueTraversalWindow(platoon, units, stored) then
+            if ShouldExtendTraversalQueue(stored, currentWaypoint, platoonPos)
+                and not QueueTraversalWindow(platoon, units, stored)
+            then
                 stored.routeStage = 'REPATH'
                 stored.routeState = 'REPATH'
                 return 'repath'
@@ -2302,7 +2317,9 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
                     stored.routeState = 'REPATH'
                     return 'repath'
                 end
-                if not QueueTraversalWindow(platoon, units, stored) then
+                if ShouldExtendTraversalQueue(stored, currentWaypoint, platoonPos)
+                    and not QueueTraversalWindow(platoon, units, stored)
+                then
                     stored.routeStage = 'REPATH'
                     stored.routeState = 'REPATH'
                     return 'repath'
@@ -2312,7 +2329,9 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
                 lastProgressIndex = stored.currentIndex
                 lastProgressDistanceSq = DistSq(platoonPos, currentWaypoint.position)
             elseif (stored.lastQueuedIndex or 0) < math.min(waypointCount, stored.currentIndex + math.max(1, stored.queueWindow or PlatoonTraversalQueueWindow) - 1) then
-                if not QueueTraversalWindow(platoon, units, stored) then
+                if ShouldExtendTraversalQueue(stored, currentWaypoint, platoonPos)
+                    and not QueueTraversalWindow(platoon, units, stored)
+                then
                     stored.routeStage = 'REPATH'
                     stored.routeState = 'REPATH'
                     return 'repath'
