@@ -1,7 +1,7 @@
 -- Shared routing math / heuristic helpers used by the coarse platoon router.
 local HugeNumber = math.huge or 1e9
 
-local function ReadVecComponent(v, numericIndex, axisName)
+function ReadVecComponent(v, numericIndex, axisName)
     if v == nil then
         return nil
     end
@@ -24,19 +24,19 @@ local function ReadVecComponent(v, numericIndex, axisName)
     return nil
 end
 
-local function VecX(v)
+function VecX(v)
     return ReadVecComponent(v, 1, 'x') or 0
 end
 
-local function VecY(v)
+function VecY(v)
     return ReadVecComponent(v, 2, 'y') or 0
 end
 
-local function VecZ(v)
+function VecZ(v)
     return ReadVecComponent(v, 3, 'z') or 0
 end
 
-local function CopyMetadata(fromPos, toPos)
+function CopyMetadata(fromPos, toPos)
     if type(fromPos) ~= 'table' or type(toPos) ~= 'table' then
         return
     end
@@ -52,7 +52,7 @@ local function CopyMetadata(fromPos, toPos)
     toPos._preAttack = rawget(fromPos, '_preAttack')
 end
 
-local function CopyVec(v)
+function CopyVec(v)
     if not v then
         return nil
     end
@@ -66,11 +66,11 @@ local function CopyVec(v)
     return copy
 end
 
-local function BuildPoint(x, y, z)
+function BuildPoint(x, y, z)
     return { x, y or 0, z }
 end
 
-local function DistSq(a, b)
+function DistSq(a, b)
     if not (a and b) then
         return HugeNumber
     end
@@ -80,15 +80,15 @@ local function DistSq(a, b)
     return dx * dx + dz * dz
 end
 
-local function Lerp(a, b, t)
+function Lerp(a, b, t)
     return a + (b - a) * t
 end
 
-local function Length2D(x, z)
+function Length2D(x, z)
     return math.sqrt((x * x) + (z * z))
 end
 
-local function Normalize2D(x, z)
+function Normalize2D(x, z)
     local length = Length2D(x, z)
     if length < 0.001 then
         return 0, 0, 0
@@ -97,7 +97,7 @@ local function Normalize2D(x, z)
     return x / length, z / length, length
 end
 
-local function DirectionBetween(a, b)
+function DirectionBetween(a, b)
     if not (a and b) then
         return 0, 0, 0
     end
@@ -105,12 +105,12 @@ local function DirectionBetween(a, b)
     return Normalize2D(VecX(b) - VecX(a), VecZ(b) - VecZ(a))
 end
 
-local function SegmentLength(a, b)
+function SegmentLength(a, b)
     local _, _, length = DirectionBetween(a, b)
     return length
 end
 
-local function HeadingDegrees(a, b)
+function HeadingDegrees(a, b)
     if not (a and b) then
         return 0
     end
@@ -124,7 +124,7 @@ local function HeadingDegrees(a, b)
     return math.deg((math.atan2 or math.atan)(dz, dx))
 end
 
-local function NormalizeAngleDegrees(angle)
+function NormalizeAngleDegrees(angle)
     local value = angle or 0
     local turns = value >= 0 and math.floor(value / 360) or math.ceil(value / 360)
     local normalized = value - (turns * 360)
@@ -136,11 +136,11 @@ local function NormalizeAngleDegrees(angle)
     return normalized
 end
 
-local function AngleDeltaDegrees(a, b)
+function AngleDeltaDegrees(a, b)
     return math.abs(NormalizeAngleDegrees((b or 0) - (a or 0)))
 end
 
-local function ProjectionAlongSegment(point, segmentStart, segmentEnd)
+function ProjectionAlongSegment(point, segmentStart, segmentEnd)
     if not (point and segmentStart and segmentEnd) then
         return 0, 0
     end
@@ -155,7 +155,7 @@ local function ProjectionAlongSegment(point, segmentStart, segmentEnd)
     return (fromStartX * dirX) + (fromStartZ * dirZ), length
 end
 
-local function CopyOptions(opts)
+function CopyOptions(opts)
     local copy = {}
     if type(opts) ~= 'table' then
         return copy
@@ -167,7 +167,7 @@ local function CopyOptions(opts)
     return copy
 end
 
-local function EstimatePlatoonFootprint(platoon, formation, opts)
+function EstimatePlatoonFootprint(platoon, formation, opts)
     local units = platoon and platoon.GetPlatoonUnits and platoon:GetPlatoonUnits() or {}
     local count = table.getn(units or {})
     local unitScale = math.max(1, math.sqrt(math.max(1, count)))
@@ -188,7 +188,7 @@ local function EstimatePlatoonFootprint(platoon, formation, opts)
     return math.max(8, unitScale * 4.5 * formationFactor)
 end
 
-local function DetermineSegmentAggression(route, waypoint, waypointIndex, waypointCount, opts)
+function DetermineSegmentAggression(route, waypoint, waypointIndex, waypointCount, opts)
     if not (opts and opts.AggressiveMove) then
         return false, 'move'
     end

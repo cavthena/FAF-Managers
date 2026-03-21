@@ -201,7 +201,7 @@ local function BuildGraphCache(area)
     }
 end
 
-local function GetScenarioGraph(area)
+function GetScenarioGraph(area)
     local key = ResolveMapKey(area)
     if not GraphCache or GraphCache.key ~= key then
         GraphCache = BuildGraphCache(area)
@@ -209,7 +209,7 @@ local function GetScenarioGraph(area)
     return GraphCache
 end
 
-local function GetVariantSpecs(area, opts)
+function GetVariantSpecs(area, opts)
     local cache = GetScenarioGraph(area)
     local specs = DeepCopyVariantSpecs(cache.variantSpecs)
     if opts and opts.FlankPreference == 'left' then
@@ -224,7 +224,7 @@ local function GetVariantSpecs(area, opts)
     return specs
 end
 
-local function RoutePathSeparation(route, reference)
+function RoutePathSeparation(route, reference)
     if not (route and reference and table.getn(route) > 0 and table.getn(reference) > 0) then
         return 0
     end
@@ -249,7 +249,7 @@ local function RoutePathSeparation(route, reference)
     return samples > 0 and (total / samples) or 0
 end
 
-local function MeasureTerminalFlank(route, target)
+function MeasureTerminalFlank(route, target)
     if not (route and target and table.getn(route) >= 2) then
         return 0
     end
@@ -261,7 +261,7 @@ local function MeasureTerminalFlank(route, target)
     return AngleDeltaDegrees(directHeading, approachHeading)
 end
 
-local function ScoreCandidates(candidates)
+function ScoreCandidates(candidates)
     if not (candidates and table.getn(candidates) > 0) then
         return candidates
     end
@@ -291,7 +291,7 @@ local function ScoreCandidates(candidates)
     return candidates
 end
 
-local function SelectCandidate(candidates, opts)
+function SelectCandidate(candidates, opts)
     if not (candidates and table.getn(candidates) > 0) then
         return nil, nil
     end
@@ -372,7 +372,7 @@ local function SelectCandidate(candidates, opts)
     }
 end
 
-local function BuildSquadPlan(route, footprintWidth)
+function BuildSquadPlan(route, footprintWidth)
     local plan = {
         requiresSplit = false,
         splitIndices = {},
