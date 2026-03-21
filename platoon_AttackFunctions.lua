@@ -154,10 +154,13 @@ WaveAttack specifics
             When true, the platoon halts at its longest weapon range and
             attacks from distance instead of pushing into direct fire.
         RandomizeRoute (boolean, default = false)
-            Chooses from multiple distinct valid corridors (including flank
-            routes) instead of always taking the shortest route.
+            Chooses uniformly from all viable valid corridors instead of
+            always taking the shortest route.
         AggressiveMove (boolean, default = false)
             Optional. Uses aggressive move while routing to each target area.
+        AssaultLeadDistance (number, default = 24)
+            Starts the final assault transition earlier to keep larger
+            formations from waiting until they are too close to the target.
 
 RaidAttack specifics
         Category (string, default = 'ECO')
@@ -165,10 +168,13 @@ RaidAttack specifics
             Areas are 25 units wide.  The priority chain is always
             Requested > ECO > BLD > INT > DEF.
         RandomizeRoute (boolean, default = false)
-            Chooses from multiple distinct valid corridors (including flank
-            routes) instead of always taking the shortest route.
+            Chooses uniformly from all viable valid corridors instead of
+            always taking the shortest route.
         AggressiveMove (boolean, default = false)
             Optional. Uses aggressive move while routing to each target area.
+        AssaultLeadDistance (number, default = 24)
+            Starts the final assault transition earlier to keep larger
+            formations from waiting until they are too close to the target.
 
 ScoutAttack specifics
         Designed for AIR platoons.  Each unit continuously receives move
@@ -1603,6 +1609,7 @@ local function AttackTargetArea(platoon, target, opts)
         StartedOutsidePlayableArea = (platoon.PlatoonData and platoon.PlatoonData.StartedOutsidePlayableArea) or startedOutside,
         TargetPosition = targetPos,
         TargetZone = target,
+        AssaultLeadDistance = opts.AssaultLeadDistance,
     }
 
     local bombardRange = nil

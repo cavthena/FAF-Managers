@@ -85,8 +85,13 @@ local CornerSampleDistance = 22
 local SegmentReachDistanceSq = 36
 local ContinuousReachDistanceSq = 64
 local ContinuousQueueDistanceSq = 196
-local FinalAttackDistanceSq = 40 * 40
 local HugeNumber = math.huge or 1e9
+local DefaultAssaultRadius = 40
+local DefaultStagingRadius = 72
+local DefaultAssaultLeadDistance = 24
+local RouteBuildYieldInterval = 18
+local StrictSegmentSampleStep = 1.25
+local StrictSegmentRepairMaxDepth = 6
 
 local CohesionMainBodyRadiusSq = 30 * 30
 local CohesionStragglerDistanceSq = 54 * 54
@@ -95,8 +100,91 @@ local CohesionReformOutlierRatio = 0.40
 local CohesionReformMinMissingUnits = 2
 local PlatoonTraversalQueueWindow = 3
 local RouteStuckTimeout = 10
-local RandomizedRouteMaxCandidates = 4
-local RandomizedRouteLengthSlack = 1.55
+local ActiveRouteBuildContext = false
+
+local function RouteBuildClock()
+    if os and os.clock then
+        return os.clock()
+    end
+    return GetGameTimeSeconds and GetGameTimeSeconds() or 0
+end
+
+local function RouteBuildDebugEnabled(context)
+    return context and context.debugEnabled and LOG
+end
+
+local function RouteBuildLog(context, message)
+    if RouteBuildDebugEnabled(context) then
+        LOG(('[PlatoonRouting] %s'):format(message))
+    end
+end
+
+local function CreateRouteBuildContext(opts)
+    return {
+        debugEnabled = opts and opts.Debug and true or false,
+        startedAt = RouteBuildClock(),
+        stageStartedAt = RouteBuildClock(),
+        stageName = 'init',
+        stageTimings = {},
+        yieldCount = 0,
+        yieldReasons = {},
+        iterationBudget = 0,
+        repairedAfterShaping = false,
+        strictFailures = {},
+    }
+end
+
+local function RouteBuildSetStage(context, stageName)
+    if not context then
+        return
+    end
+
+    local now = RouteBuildClock()
+    local previous = context.stageName
+    if previous then
+        context.stageTimings[previous] = (context.stageTimings[previous] or 0) + (now - (context.stageStartedAt or now))
+    end
+
+    context.stageName = stageName
+    context.stageStartedAt = now
+end
+
+local function FinalizeRouteBuildContext(context)
+    if not context then
+        return nil
+    end
+
+    RouteBuildSetStage(context, 'complete')
+    context.totalTime = RouteBuildClock() - (context.startedAt or RouteBuildClock())
+    return context
+end
+
+local function MaybeYieldRouteBuild(reason)
+    local context = ActiveRouteBuildContext
+    if not context then
+        return false
+    end
+
+    context.iterationBudget = (context.iterationBudget or 0) + 1
+    if context.iterationBudget < RouteBuildYieldInterval then
+        return false
+    end
+    context.iterationBudget = 0
+
+    if not (WaitTicks and coroutine and coroutine.running and coroutine.running()) then
+        return false
+    end
+
+    context.yieldCount = (context.yieldCount or 0) + 1
+    if reason then
+        context.yieldReasons[reason] = (context.yieldReasons[reason] or 0) + 1
+    end
+
+    -- Route building can run inside the platoon AI coroutine. Yielding here
+    -- keeps long candidate/validation/shaping passes from monopolizing sim time.
+    WaitTicks(1)
+    return true
+end
 
 local function ReadVecComponent(v, numericIndex, axisName)
     if v == nil then
@@ -609,6 +697,35 @@ local function BuildSegmentSamplePoint(fromPos, toPos, t)
     }
 end
 
+local function SegmentPassableStrict(layer, fromPos, toPos)
+    if not (fromPos and toPos) then
+        return false
+    end
+
+    if not SegmentPassable(layer, fromPos, toPos) then
+        return false
+    end
+
+    local segmentLength = SegmentLength(fromPos, toPos)
+    if segmentLength < 0.001 then
+        return PointPassable(layer, fromPos)
+    end
+
+    local steps = math.max(2, math.ceil(segmentLength / StrictSegmentSampleStep))
+    local previous = CopyVec(fromPos)
+    for stepIndex = 1, steps do
+        local sample = BuildSegmentSamplePoint(fromPos, toPos, stepIndex / steps)
+        SetPointSurface(sample, layer)
+        if not PointPassable(layer, sample) or not SegmentPassable(layer, previous, sample) then
+            return false
+        end
+        previous = sample
+        MaybeYieldRouteBuild('strict-segment-validation')
+    end
+
+    return true
+end
+
 local function SegmentTraversesPassableSpace(layer, fromPos, toPos, tangentX, tangentZ, desiredClearance)
     if not (fromPos and toPos) then
         return false
@@ -665,6 +782,7 @@ local function SegmentTraversesPassableSpace(layer, fromPos, toPos, tangentX, ta
             end
             previousSamples[railIndex] = sample
         end
+        MaybeYieldRouteBuild('segment-clearance-sampling')
     end
 
     return true
@@ -715,6 +833,7 @@ local function AnalyzeSegmentClearance(layer, fromPos, toPos, desiredClearance)
         if info.preferred then
             preferredHits = preferredHits + 1
         end
+        MaybeYieldRouteBuild('segment-analysis')
     end
 
     return {
@@ -806,6 +925,7 @@ local function FindBestBufferedPoint(layer, point, tangentX, tangentZ, area, pre
                 end
             end
         end
+        MaybeYieldRouteBuild('corridor-probe')
         distance = distance + stride
     end
 
@@ -824,6 +944,7 @@ local function RemoveDuplicateRoutePoints(route, minDistanceSq)
         if point and DistSq(cleaned[table.getn(cleaned)], point) > minSq then
             table.insert(cleaned, CopyVec(point))
         end
+        MaybeYieldRouteBuild('route-deduplicate')
     end
 
     return cleaned
@@ -854,6 +975,7 @@ local function RemoveRouteDoubleBack(route)
                 table.insert(cleaned, CopyVec(point))
             end
         end
+        MaybeYieldRouteBuild('route-doubleback-cleanup')
     end
 
     table.insert(cleaned, CopyVec(route[table.getn(route)]))
@@ -1039,6 +1161,7 @@ local function BuildPathViaAnchors(layer, startPos, target, anchors)
         end
         AppendRouteSegment(route, segment)
         current = anchor
+        MaybeYieldRouteBuild('anchor-segment-build')
     end
 
     local finalSegment = BuildBasePath(layer, current, target)
@@ -1113,6 +1236,7 @@ local function BuildRandomizedRouteVariant(layer, startPos, target, area, varian
         if anchor then
             table.insert(anchors, anchor)
         end
+        MaybeYieldRouteBuild('variant-anchor-generation')
     end
 
     if variant.approachOffset then
@@ -1158,6 +1282,7 @@ local function MeasureRouteClearance(route, layer)
         totalClearance = totalClearance + analysis.minimum
         totalCenteredness = totalCenteredness + analysis.centeredness
         segmentCount = segmentCount + 1
+        MaybeYieldRouteBuild('route-clearance-measure')
     end
 
     return {
@@ -1241,6 +1366,7 @@ local function CollectRouteCandidates(layer, startPos, target, opts, area)
                     })
                 end
             end
+            MaybeYieldRouteBuild('candidate-generation')
         end
     end
 
@@ -1314,6 +1440,7 @@ local function CenterRouteThroughCorridors(route, layer, area)
         local balanced = { CopyVec(current[1]) }
         for i = 2, table.getn(current) - 1 do
             table.insert(balanced, BalancePointInCorridor(current, i, layer, area))
+            MaybeYieldRouteBuild('corridor-centering')
         end
         table.insert(balanced, CopyVec(current[table.getn(current)]))
         current = RemoveDuplicateRoutePoints(balanced, 2)
@@ -1415,6 +1542,7 @@ local function BuildCornerCurve(prev, corner, nextPoint, layer, area)
         sample._transitAnchor = true
         table.insert(curve, sample)
         previous = sample
+        MaybeYieldRouteBuild('corner-smoothing')
     end
 
     if not SegmentHasClearance(layer, previous, nextPoint, math.max(RouteMinimumBalancedClearance, SimplifyClearance)) then
@@ -1442,6 +1570,7 @@ local function SmoothRouteCorners(route, layer, area)
         else
             table.insert(smoothed, CopyVec(corner))
         end
+        MaybeYieldRouteBuild('route-smoothing')
     end
     table.insert(smoothed, CopyVec(route[table.getn(route)]))
 
@@ -1501,9 +1630,11 @@ local function SimplifyRoutePreservingSafety(route, layer)
                 best = candidate
                 break
             end
+            MaybeYieldRouteBuild('route-simplify-scan')
         end
         table.insert(simplified, CopyVec(route[best]))
         index = best
+        MaybeYieldRouteBuild('route-simplify')
     end
 
     simplified = RemoveDuplicateRoutePoints(simplified, 4)
@@ -1695,11 +1826,125 @@ local function UpdateRouteCohesionState(route, units)
     return details
 end
 
+local function BuildStrictSegmentRepairPath(layer, fromPos, toPos, depth)
+    if SegmentPassableStrict(layer, fromPos, toPos) then
+        return { CopyVec(fromPos), CopyVec(toPos) }
+    end
+
+    if depth >= StrictSegmentRepairMaxDepth then
+        return nil
+    end
+
+    local ok, navPath = pcall(NavUtils.PathTo, layer, fromPos, toPos)
+    if not (ok and navPath and table.getn(navPath) > 0) then
+        return nil
+    end
+
+    local rawRoute = { CopyVec(fromPos) }
+    for _, point in ipairs(navPath) do
+        table.insert(rawRoute, CopyVec(point))
+        MaybeYieldRouteBuild('strict-segment-nav')
+    end
+
+    local last = rawRoute[table.getn(rawRoute)]
+    if not last or DistSq(last, toPos) > 1 then
+        table.insert(rawRoute, CopyVec(toPos))
+    end
+
+    if table.getn(rawRoute) <= 2 then
+        return nil
+    end
+
+    local repaired = { CopyVec(rawRoute[1]) }
+    for index = 2, table.getn(rawRoute) do
+        local targetPoint = rawRoute[index]
+        local segment = BuildStrictSegmentRepairPath(layer, repaired[table.getn(repaired)], targetPoint, depth + 1)
+        if not segment then
+            return nil
+        end
+        for segmentIndex = 2, table.getn(segment) - 1 do
+            segment[segmentIndex]._transitAnchor = true
+        end
+        AppendRouteSegment(repaired, segment)
+        MaybeYieldRouteBuild('strict-segment-repair')
+    end
+
+    return repaired
+end
+
+local function EnforceStrictRouteSegments(route, layer)
+    if not route or table.getn(route) <= 1 then
+        return route, false, {}
+    end
+
+    local repairedRoute = { CopyVec(route[1]) }
+    local repaired = false
+    local failures = {}
+
+    for index = 2, table.getn(route) do
+        local segmentStart = repairedRoute[table.getn(repairedRoute)]
+        local segmentEnd = route[index]
+        if SegmentPassableStrict(layer, segmentStart, segmentEnd) then
+            table.insert(repairedRoute, CopyVec(segmentEnd))
+        else
+            repaired = true
+            table.insert(failures, {
+                index = index - 1,
+                fromPos = CopyVec(segmentStart),
+                toPos = CopyVec(segmentEnd),
+            })
+            RouteBuildLog(ActiveRouteBuildContext, ('strict segment failure index=%d from=(%.1f, %.1f) to=(%.1f, %.1f)'):format(
+                index - 1,
+                VecX(segmentStart), VecZ(segmentStart),
+                VecX(segmentEnd), VecZ(segmentEnd)
+            ))
+            local repairSegment = BuildStrictSegmentRepairPath(layer, segmentStart, segmentEnd, 0)
+            if not repairSegment then
+                return nil, repaired, failures
+            end
+            AppendRouteSegment(repairedRoute, repairSegment)
+        end
+        MaybeYieldRouteBuild('strict-route-pass')
+    end
+
+    return RemoveDuplicateRoutePoints(repairedRoute, 2), repaired, failures
+end
+
+local function BuildRouteDebugSummary(selectedSummary, context, routeVariant)
+    local summary = {}
+    if type(selectedSummary) == 'table' then
+        for key, value in pairs(selectedSummary) do
+            summary[key] = value
+        end
+    end
+
+    summary.selected = routeVariant or summary.selected or 'default'
+    if context then
+        summary.totalBuildTime = context.totalTime or 0
+        summary.stageTimings = context.stageTimings or {}
+        summary.yieldCount = context.yieldCount or 0
+        summary.yielded = (context.yieldCount or 0) > 0
+        summary.yieldReasons = context.yieldReasons or {}
+        summary.repairedAfterShaping = context.repairedAfterShaping and true or false
+        summary.strictFailures = context.strictFailures or {}
+    end
+    return summary
+end
+
 local function BuildWaypointMetadata(platoon, route, destination, opts, layer, startedOutside, ingressEdge, debugSummary)
     local metadata = {}
     local formation = opts and opts.Formation or nil
-    local assaultRadius = math.max(20, opts and opts.AssaultRadius or 40)
-    local stagingRadius = math.max(assaultRadius + 10, opts and opts.StagingRadius or 72)
+    local assaultRadius = math.max(20, opts and opts.AssaultRadius or DefaultAssaultRadius)
+    local stagingRadius = math.max(assaultRadius + 10, opts and opts.StagingRadius or DefaultStagingRadius)
+    local formationFootprint = RoutingUtils.EstimatePlatoonFootprint(platoon, formation, opts)
+    local aggressionRouteInfo = {
+        targetPosition = opts and opts.TargetPosition or destination,
+        assaultRadius = assaultRadius,
+        stagingRadius = stagingRadius,
+        assaultLeadDistance = opts and opts.AssaultLeadDistance or DefaultAssaultLeadDistance,
+        formationFootprint = formationFootprint,
+    }
+    local assaultTransitionRadius = RoutingUtils.ResolveAssaultTransitionRadius(aggressionRouteInfo, opts)
 
     for i = 2, table.getn(route) do
         local point = CopyVec(route[i])
@@ -1741,11 +1986,13 @@ local function BuildWaypointMetadata(platoon, route, destination, opts, layer, s
             localClearance = corridorInfo and corridorInfo.minimum or 0,
         }
 
-        waypoint.aggressiveMove, waypoint.moveMode = RoutingUtils.DetermineSegmentAggression({
-            targetPosition = opts and opts.TargetPosition or destination,
-            assaultRadius = assaultRadius,
-            stagingRadius = stagingRadius,
-        }, waypoint, i - 1, math.max(1, table.getn(route) - 1), opts)
+        waypoint.aggressiveMove, waypoint.moveMode = RoutingUtils.DetermineSegmentAggression(
+            aggressionRouteInfo,
+            waypoint,
+            i - 1,
+            math.max(1, table.getn(route) - 1),
+            opts
+        )
 
         table.insert(metadata, waypoint)
     end
@@ -1780,12 +2027,14 @@ local function BuildWaypointMetadata(platoon, route, destination, opts, layer, s
         isIngressRoute = ingressEdge ~= nil,
         assaultRadius = assaultRadius,
         stagingRadius = stagingRadius,
+        assaultLeadDistance = aggressionRouteInfo.assaultLeadDistance,
+        assaultTransitionRadius = assaultTransitionRadius,
         debugEnabled = opts and opts.Debug and true or false,
         debugSummary = debugSummary,
         waypoints = metadata,
         queuedIndex = nil,
         squadPlan = nil,
-        formationFootprint = RoutingUtils.EstimatePlatoonFootprint(platoon, formation, opts),
+        formationFootprint = formationFootprint,
     }
 
     stored.squadPlan = RoutingGraph.BuildSquadPlan(stored, stored.formationFootprint)
@@ -1844,11 +2093,20 @@ local function SyncRouteOptions(route, opts)
         route.assaultRadius = math.max(20, opts.AssaultRadius)
     end
     if opts and opts.StagingRadius ~= nil then
-        route.stagingRadius = math.max(route.assaultRadius or 40, opts.StagingRadius)
+        route.stagingRadius = math.max(route.assaultRadius or DefaultAssaultRadius, opts.StagingRadius)
+    end
+    if opts and opts.AssaultLeadDistance ~= nil then
+        route.assaultLeadDistance = math.max(0, opts.AssaultLeadDistance)
     end
     if opts and opts.Debug ~= nil then
         route.debugEnabled = opts.Debug and true or false
     end
+
+    route.assaultRadius = route.assaultRadius or DefaultAssaultRadius
+    route.stagingRadius = route.stagingRadius or DefaultStagingRadius
+    route.assaultLeadDistance = route.assaultLeadDistance or DefaultAssaultLeadDistance
+    route.formationFootprint = route.formationFootprint or RoutingUtils.EstimatePlatoonFootprint(nil, route.formation, opts)
+    route.assaultTransitionRadius = RoutingUtils.ResolveAssaultTransitionRadius(route, opts)
 
     local waypointCount = table.getn(route.waypoints or {})
     for index, waypoint in ipairs(route.waypoints or {}) do
@@ -1907,11 +2165,15 @@ function BuildPlatoonRoute(platoon, destination, opts)
     local target = area and ClampToPlayableArea(destination, area, 0) or CopyVec(destination)
     SetPointSurface(target, layer)
 
+    local buildContext = CreateRouteBuildContext(opts)
+    ActiveRouteBuildContext = buildContext
+
     local route = { CopyVec(startPos) }
     local routingStart = CopyVec(startPos)
     local ingressEdge = nil
 
     if PlatoonNeedsIngress(platoon, opts) then
+        RouteBuildSetStage(buildContext, 'ingress')
         local ingress
         ingress, ingressEdge = BuildCardinalIngress(startPos, area, layer)
         if ingress then
@@ -1920,22 +2182,51 @@ function BuildPlatoonRoute(platoon, destination, opts)
         end
     end
 
+    RouteBuildSetStage(buildContext, 'candidate-generation')
     local candidates = CollectRouteCandidates(layer, routingStart, target, opts, area)
     local selected, debugSummary = SelectRouteCandidate(candidates, opts)
     if not (selected and selected.path) then
+        ActiveRouteBuildContext = false
         return nil
     end
 
+    RouteBuildLog(buildContext, ('candidateCount=%d viableCount=%d chosenRouteType=%s randomize=%s uniform=%s'):format(
+        table.getn(candidates or {}),
+        debugSummary and debugSummary.viable or table.getn(candidates or {}),
+        tostring(debugSummary and debugSummary.selected or selected.routeType or 'default'),
+        tostring(debugSummary and debugSummary.randomized or false),
+        tostring(debugSummary and debugSummary.uniformRandom or false)
+    ))
+
     for i = 2, table.getn(selected.path) do
         table.insert(route, CopyVec(selected.path[i]))
+        MaybeYieldRouteBuild('selected-route-copy')
     end
 
+    RouteBuildSetStage(buildContext, 'route-shaping')
     route = RemoveDuplicateRoutePoints(route, 2)
     route = RemoveRouteDoubleBack(route)
     route = CenterRouteThroughCorridors(route, layer, area)
     route = SmoothRouteCorners(route, layer, area)
     route = CenterRouteThroughCorridors(route, layer, area)
     route = SimplifyRoutePreservingSafety(route, layer)
+
+    RouteBuildSetStage(buildContext, 'strict-segment-repair')
+    -- Run a final strict center-line pass after all shaping so simplification or
+    -- smoothing cannot leave a visible waypoint-to-waypoint segment crossing
+    -- blocked terrain. Failed segments are rebuilt before movement begins.
+    local repaired
+    route, repaired, buildContext.strictFailures = EnforceStrictRouteSegments(route, layer)
+    buildContext.repairedAfterShaping = repaired and true or false
+    if not route then
+        RouteBuildLog(buildContext, 'strict segment repair failed after shaping')
+        ActiveRouteBuildContext = false
+        return nil
+    end
+
+    if repaired then
+        RouteBuildLog(buildContext, ('strict segment repair inserted bends for %d segment(s)'):format(table.getn(buildContext.strictFailures or {})))
+    end
 
     local buildOpts = {}
     if type(opts) == 'table' then
@@ -1945,13 +2236,30 @@ function BuildPlatoonRoute(platoon, destination, opts)
     end
     buildOpts.RouteVariant = selected.routeType or 'default'
 
-    buildOpts.AssaultRadius = buildOpts.AssaultRadius or 40
-    buildOpts.StagingRadius = buildOpts.StagingRadius or 72
+    buildOpts.AssaultRadius = buildOpts.AssaultRadius or DefaultAssaultRadius
+    buildOpts.StagingRadius = buildOpts.StagingRadius or DefaultStagingRadius
+    buildOpts.AssaultLeadDistance = buildOpts.AssaultLeadDistance or DefaultAssaultLeadDistance
     buildOpts.Debug = buildOpts.Debug and true or false
 
+    RouteBuildSetStage(buildContext, 'waypoint-metadata')
     local stored = BuildWaypointMetadata(platoon, route, target, buildOpts, layer, startedOutside, ingressEdge, debugSummary)
+    FinalizeRouteBuildContext(buildContext)
+    debugSummary = BuildRouteDebugSummary(debugSummary, buildContext, selected.routeType or 'default')
+    RouteBuildLog(buildContext, ('routeBuildSeconds=%.4f stages={candidates=%.4f shaping=%.4f strict=%.4f metadata=%.4f} yielded=%s count=%d repaired=%s'):format(
+        debugSummary.totalBuildTime or 0,
+        (debugSummary.stageTimings and debugSummary.stageTimings['candidate-generation']) or 0,
+        (debugSummary.stageTimings and debugSummary.stageTimings['route-shaping']) or 0,
+        (debugSummary.stageTimings and debugSummary.stageTimings['strict-segment-repair']) or 0,
+        (debugSummary.stageTimings and debugSummary.stageTimings['waypoint-metadata']) or 0,
+        tostring(debugSummary.yielded or false),
+        debugSummary.yieldCount or 0,
+        tostring(debugSummary.repairedAfterShaping or false)
+    ))
+
+    stored.debugSummary = debugSummary
     SyncRouteOptions(stored, buildOpts)
     platoon._storedRoute = stored
+    ActiveRouteBuildContext = false
     return stored
 end
 
@@ -2240,7 +2548,10 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
             return 'fail'
         end
 
-        if DistSq(platoonPos, stored.destination) <= ((stored.assaultRadius or 40) * (stored.assaultRadius or 40)) then
+        local assaultTransitionRadius = stored.assaultTransitionRadius
+            or RoutingUtils.ResolveAssaultTransitionRadius(stored, opts)
+            or (stored.assaultRadius or DefaultAssaultRadius)
+        if DistSq(platoonPos, stored.destination) <= (assaultTransitionRadius * assaultTransitionRadius) then
             stored.routeStage = 'ASSAULT'
             stored.routeState = 'ASSAULT'
             return 'attack'
@@ -2276,7 +2587,7 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
         if stored.currentIndex > waypointCount then
             stored.routeStage = 'ASSAULT'
             stored.routeState = 'ASSAULT'
-            if destination and DistSq(platoonPos, destination) <= ((stored.assaultRadius or 40) * (stored.assaultRadius or 40)) then
+            if destination and DistSq(platoonPos, destination) <= (assaultTransitionRadius * assaultTransitionRadius) then
                 return 'attack'
             end
             return 'success'
@@ -2399,10 +2710,18 @@ function BuildPathSegment(layer, startPos, destination)
         return nil
     end
 
+    local buildContext = CreateRouteBuildContext()
+    ActiveRouteBuildContext = buildContext
+
     local centered = CenterRouteThroughCorridors(base, layer, area)
     centered = SmoothRouteCorners(centered, layer, area)
     centered = CenterRouteThroughCorridors(centered, layer, area)
     centered = SimplifyRoutePreservingSafety(centered, layer)
+    centered = EnforceStrictRouteSegments(centered, layer)
+    ActiveRouteBuildContext = false
+    if not centered then
+        return nil
+    end
 
     local out = {}
     for i = 2, table.getn(centered) do

@@ -139,7 +139,6 @@ local DistSq = Utils and Utils.DistSq or FallbackDistSq
 local HeadingDegrees = Utils and Utils.HeadingDegrees or FallbackHeadingDegrees
 local AngleDeltaDegrees = Utils and Utils.AngleDeltaDegrees or FallbackAngleDeltaDegrees
 
-local RandomizedRouteMaxCandidates = 4
 local RandomizedRouteLengthSlack = 1.55
 
 local GraphCache = false
@@ -322,51 +321,24 @@ function SelectCandidate(candidates, opts)
         then
             table.insert(viable, candidate)
         end
-        if table.getn(viable) >= RandomizedRouteMaxCandidates then
-            break
-        end
     end
 
     if table.getn(viable) == 0 then
         return best, {
             selected = best.routeType or 'default',
             randomized = false,
+            uniformRandom = false,
             candidates = table.getn(candidates),
+            viable = 0,
         }
     end
 
-    local weighted = {}
-    local totalWeight = 0
-    for _, candidate in ipairs(viable) do
-        local weight = 1
-        if candidate.routeType ~= 'default' then
-            weight = weight + math.max(1, math.floor(candidate.separation / 6)) + math.max(0, math.floor(candidate.flankAngle / 20))
-        else
-            local weakestViable = viable[table.getn(viable)]
-            weight = math.max(1, weight + math.floor((candidate.selectionScore - ((weakestViable and weakestViable.selectionScore) or 0)) / 8))
-        end
-        totalWeight = totalWeight + weight
-        table.insert(weighted, { candidate = candidate, weight = weight })
-    end
-
-    local roll = Random and Random(1, totalWeight) or math.random(1, totalWeight)
-    local running = 0
-    for _, entry in ipairs(weighted) do
-        running = running + entry.weight
-        if roll <= running then
-            return entry.candidate, {
-                selected = entry.candidate.routeType or 'default',
-                randomized = true,
-                candidates = table.getn(candidates),
-                viable = table.getn(viable),
-            }
-        end
-    end
-
-    local fallback = viable[table.getn(viable)] or best
-    return fallback, {
-        selected = fallback.routeType or 'default',
+    local choiceIndex = Random and Random(1, table.getn(viable)) or math.random(1, table.getn(viable))
+    local choice = viable[choiceIndex] or viable[table.getn(viable)] or best
+    return choice, {
+        selected = choice.routeType or 'default',
         randomized = true,
+        uniformRandom = true,
         candidates = table.getn(candidates),
         viable = table.getn(viable),
     }

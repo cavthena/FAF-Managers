@@ -188,6 +188,16 @@ function EstimatePlatoonFootprint(platoon, formation, opts)
     return math.max(8, unitScale * 4.5 * formationFactor)
 end
 
+function ResolveAssaultTransitionRadius(route, opts)
+    local assaultRadius = route and route.assaultRadius or (opts and opts.AssaultRadius) or 40
+    local stagingRadius = route and route.stagingRadius or (opts and opts.StagingRadius) or 72
+    local leadDistance = route and route.assaultLeadDistance or (opts and opts.AssaultLeadDistance) or 24
+    local formationFootprint = route and route.formationFootprint or (opts and opts.FormationFootprint) or 0
+
+    local footprintLead = math.max(0, formationFootprint * 0.6)
+    return math.max(assaultRadius, stagingRadius + leadDistance + footprintLead)
+end
+
 function DetermineSegmentAggression(route, waypoint, waypointIndex, waypointCount, opts)
     if not (opts and opts.AggressiveMove) then
         return false, 'move'
@@ -201,16 +211,19 @@ function DetermineSegmentAggression(route, waypoint, waypointIndex, waypointCoun
     local distanceToTargetSq = route and route.targetPosition and waypoint and waypoint.position and DistSq(waypoint.position, route.targetPosition) or HugeNumber
     local stagingRadius = route and route.stagingRadius or (opts and opts.StagingRadius) or 72
     local assaultRadius = route and route.assaultRadius or (opts and opts.AssaultRadius) or 40
+    local assaultTransitionRadius = ResolveAssaultTransitionRadius(route, opts)
 
-    if distanceToTargetSq <= (stagingRadius * stagingRadius) then
+    if distanceToTargetSq <= (assaultTransitionRadius * assaultTransitionRadius) then
         return true, 'aggressive'
     end
 
-    if waypointIndex >= math.max(1, waypointCount - 1) and distanceToTargetSq <= ((stagingRadius + 20) * (stagingRadius + 20)) then
+    if waypointIndex >= math.max(1, waypointCount - 1)
+        and distanceToTargetSq <= ((assaultTransitionRadius + 12) * (assaultTransitionRadius + 12))
+    then
         return true, 'aggressive'
     end
 
-    if waypointType == 'pre-attack' and distanceToTargetSq <= ((assaultRadius + 35) * (assaultRadius + 35)) then
+    if waypointType == 'pre-attack' and distanceToTargetSq <= ((math.max(assaultTransitionRadius, assaultRadius + 35)) * (math.max(assaultTransitionRadius, assaultRadius + 35))) then
         return true, 'aggressive'
     end
 
@@ -238,5 +251,6 @@ return {
     ProjectionAlongSegment = ProjectionAlongSegment,
     CopyOptions = CopyOptions,
     EstimatePlatoonFootprint = EstimatePlatoonFootprint,
+    ResolveAssaultTransitionRadius = ResolveAssaultTransitionRadius,
     DetermineSegmentAggression = DetermineSegmentAggression,
 }
