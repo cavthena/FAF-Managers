@@ -598,6 +598,13 @@ local function MergeAttackData(platoon, data)
     return merged
 end
 
+local function ReadStoredValue(platoon, key, fallback)
+    if platoon and platoon.PlatoonData and platoon.PlatoonData[key] ~= nil then
+        return platoon.PlatoonData[key]
+    end
+    return fallback
+end
+
 local function GetPlatoonPosition(platoon)
     local pos = platoon:GetPlatoonPosition()
     if pos then
@@ -1610,11 +1617,11 @@ local function AttackTargetArea(platoon, target, opts)
         Amphibious = opts.Amphibious,
         RandomizeRoute = opts.RandomizeRoute and true or false,
         RequireFinalStaging = opts.RequireFinalStaging and true or false,
-        DisableIngress = opts.DisableIngress,
+        DisableIngress = ReadStoredValue(platoon, 'DisableIngress', opts.DisableIngress),
         Debug = opts.Debug,
         RouteLayer = layer,
-        RouteSource = (platoon.PlatoonData and platoon.PlatoonData.RouteSource) or opts.RouteSource,
-        StartedOutsidePlayableArea = (platoon.PlatoonData and platoon.PlatoonData.StartedOutsidePlayableArea) or startedOutside,
+        RouteSource = ReadStoredValue(platoon, 'RouteSource', opts.RouteSource),
+        StartedOutsidePlayableArea = ReadStoredValue(platoon, 'StartedOutsidePlayableArea', startedOutside),
         TargetPosition = targetPos,
         TargetZone = target,
         AssaultLeadDistance = opts.AssaultLeadDistance,

@@ -340,6 +340,54 @@ local function ResolveStartedOutsidePlayableArea(position, override)
     return false
 end
 
+local function ResolveStartPositionContext(params, context, platoon, platoonData)
+    local source = context and context.startPosSource
+    local position = context and context.spawnPos
+
+    if not position and params and params.position ~= nil then
+        position = markerPos(params.position)
+        if position then
+            source = source or 'position'
+        end
+    end
+
+    if not position and params and params.spawnMarker ~= nil then
+        position = markerPos(params.spawnMarker)
+        if position then
+            source = source or 'spawnMarker'
+        end
+    end
+
+    if not position then
+        position = platoon and platoon._spawnerStartPosition
+        if position then
+            source = source or 'spawnMarker'
+        end
+    end
+
+    if not position and platoonData and platoonData.SpawnPosition then
+        position = platoonData.SpawnPosition
+        if position then
+            source = source or 'storedSpawnPosition'
+        end
+    end
+
+    if not position and platoon and platoon.GetPlatoonPosition then
+        position = platoon:GetPlatoonPosition()
+        if position then
+            source = source or 'GetPlatoonPosition'
+        end
+    end
+
+    return position and CopyPosition(position) or nil, source or 'unknown'
+end
+
+local function MetadataDebugLog(params, message)
+    if params and params.debug and LOG then
+        LOG(('[US:%s] %s'):format(tostring(params.spawnerTag or '?'), message))
+    end
+end
+
 local function ApplyPlatoonMetadata(platoon, params, context)
     if not platoon then
         return nil
@@ -355,18 +403,25 @@ local function ApplyPlatoonMetadata(platoon, params, context)
         end
     end
 
-    local spawnPos = context and context.spawnPos
-        or platoon._spawnerStartPosition
-        or platoonData.SpawnPosition
-    if not spawnPos and platoon.GetPlatoonPosition then
-        spawnPos = platoon:GetPlatoonPosition()
-    end
+    local spawnPos, startPosSource = ResolveStartPositionContext(params, context, platoon, platoonData)
     local routeSource = (params and params.routeSource) or platoonData.RouteSource or 'UnitSpawner'
     local startedOutside = ResolveStartedOutsidePlayableArea(spawnPos, params and params.startedOutsidePlayableArea)
+    local disableIngress = nil
+    if params and params.DisableIngress ~= nil then
+        disableIngress = params.DisableIngress and true or false
+    elseif attackData and attackData.DisableIngress ~= nil then
+        disableIngress = attackData.DisableIngress and true or false
+    elseif platoonData.DisableIngress ~= nil then
+        disableIngress = platoonData.DisableIngress and true or false
+    end
 
     platoonData.RouteSource = routeSource
     platoonData.StartedOutsidePlayableArea = startedOutside
     platoonData.Formation = platoonData.Formation or (params and params.formation) or 'GrowthFormation'
+    platoonData.StartPositionSource = startPosSource
+    if disableIngress ~= nil then
+        platoonData.DisableIngress = disableIngress
+    end
 
     if params and params.spawnerTag and platoonData.SpawnerTag == nil then
         platoonData.SpawnerTag = params.spawnerTag
@@ -383,6 +438,14 @@ local function ApplyPlatoonMetadata(platoon, params, context)
     if attackData and platoonData.AttackData == nil then
         platoonData.AttackData = attackData
     end
+
+    MetadataDebugLog(params, ('ApplyPlatoonMetadata routeSource=%s startSource=%s startPosition=%s startedOutsidePlayableArea=%s disableIngress=%s'):format(
+        tostring(routeSource),
+        tostring(startPosSource),
+        spawnPos and ('(%.2f, %.2f, %.2f)'):format(spawnPos[1] or 0, spawnPos[2] or 0, spawnPos[3] or 0) or 'false',
+        tostring(startedOutside),
+        tostring(disableIngress)
+    ))
 
     platoon.PlatoonData = platoonData
     return platoonData
@@ -872,10 +935,17 @@ function StartManualPlatoon(params)
     normalized.routeSource = params.routeSource or 'Manual'
     normalized.label = params.label or params.platoonLabel or normalized.spawnerTag or 'ManualPlatoon'
     normalized.startedOutsidePlayableArea = params.startedOutsidePlayableArea
-    normalized.spawnMarker = params.spawnMarker or params.position
+    normalized.spawnMarker = params.spawnMarker
+    normalized.position = params.position
     normalized.spawnSpread = (params.spawnSpread ~= nil) and params.spawnSpread or 0
 
     local spawnPos = markerPos(params.position) or markerPos(params.spawnMarker)
+    local startPosSource = nil
+    if markerPos(params.position) then
+        startPosSource = 'position'
+    elseif markerPos(params.spawnMarker) then
+        startPosSource = 'spawnMarker'
+    end
     local tag = normalized.spawnerTag or ('USM_' .. math.floor(100000 * Random()))
     normalized.spawnerTag = tag
 
@@ -896,6 +966,7 @@ function StartManualPlatoon(params)
 
     ApplyPlatoonMetadata(platoon, normalized, {
         spawnPos = spawnPos,
+        startPosSource = startPosSource,
     })
 
     if normalized.attackFn then

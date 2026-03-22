@@ -987,7 +987,12 @@ local function DetermineStartState(platoon, opts)
     local startPos = opts and opts.RouteStart and CopyVec(opts.RouteStart)
         or (platoon.GetPlatoonPosition and CopyVec(platoon:GetPlatoonPosition()))
     if not startPos then
-        return nil, nil, false
+        return nil, nil, false, 'missing'
+    end
+
+    local startSource = 'GetPlatoonPosition'
+    if opts and opts.RouteStart then
+        startSource = (platoon.PlatoonData and platoon.PlatoonData.StartPositionSource) or 'RouteStart'
     end
 
     local area = GetPlayableArea()
@@ -1005,7 +1010,7 @@ local function DetermineStartState(platoon, opts)
         startPos = ClampToPlayableArea(startPos, area, 0)
     end
 
-    return SetPointSurface(startPos, ResolveLayer(platoon, opts)), area, startedOutside
+    return SetPointSurface(startPos, ResolveLayer(platoon, opts)), area, startedOutside, startSource
 end
 
 local function EvaluateIngressDecision(platoon, opts, startPos, area)
@@ -2191,7 +2196,7 @@ function BuildPlatoonRoute(platoon, destination, opts)
     end
 
     local layer = ResolveLayer(platoon, opts)
-    local startPos, area, startedOutside = DetermineStartState(platoon, opts)
+    local startPos, area, startedOutside, startSource = DetermineStartState(platoon, opts)
     if not startPos then
         return nil
     end
@@ -2207,8 +2212,12 @@ function BuildPlatoonRoute(platoon, destination, opts)
     local ingressEdge = nil
 
     local ingressAllowed, ingressDecision = PlatoonNeedsIngress(platoon, opts)
-    RouteBuildLog(buildContext, ('ingress routeSource=%s startedOutsidePlayableArea=%s disableIngress=%s requested=%s allowed=%s currentOutsidePlayableArea=%s'):format(
+    RouteBuildLog(buildContext, ('ingress routeSource=%s startSource=%s startPosition=(%.2f, %.2f, %.2f) startedOutsidePlayableArea=%s disableIngress=%s requested=%s allowed=%s currentOutsidePlayableArea=%s'):format(
         tostring(ingressDecision and ingressDecision.routeSource or false),
+        tostring(startSource or 'unknown'),
+        VecX(startPos),
+        VecY(startPos),
+        VecZ(startPos),
         tostring(ingressDecision and ingressDecision.startedOutsidePlayableArea or false),
         tostring(ingressDecision and ingressDecision.disableIngress or false),
         tostring(ingressDecision and ingressDecision.requested or false),
