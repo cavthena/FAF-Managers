@@ -570,6 +570,12 @@ local function CopyOptions(data)
     end
     opts.AggressiveMove = aggressiveMove and true or false
     opts.RandomizeRoute = opts.RandomizeRoute and true or false
+    if opts.DisableIngress ~= nil then
+        opts.DisableIngress = opts.DisableIngress and true or false
+    end
+    if opts.Debug ~= nil then
+        opts.Debug = opts.Debug and true or false
+    end
     opts.Formation   = ValidateFormation(opts.Formation)
     return opts
 end
@@ -1604,6 +1610,8 @@ local function AttackTargetArea(platoon, target, opts)
         Amphibious = opts.Amphibious,
         RandomizeRoute = opts.RandomizeRoute and true or false,
         RequireFinalStaging = opts.RequireFinalStaging and true or false,
+        DisableIngress = opts.DisableIngress,
+        Debug = opts.Debug,
         RouteLayer = layer,
         RouteSource = (platoon.PlatoonData and platoon.PlatoonData.RouteSource) or opts.RouteSource,
         StartedOutsidePlayableArea = (platoon.PlatoonData and platoon.PlatoonData.StartedOutsidePlayableArea) or startedOutside,

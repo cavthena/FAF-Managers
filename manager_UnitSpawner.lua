@@ -355,7 +355,9 @@ local function ApplyPlatoonMetadata(platoon, params, context)
         end
     end
 
-    local spawnPos = context and context.spawnPos or platoon._spawnerStartPosition
+    local spawnPos = context and context.spawnPos
+        or platoon._spawnerStartPosition
+        or platoonData.SpawnPosition
     if not spawnPos and platoon.GetPlatoonPosition then
         spawnPos = platoon:GetPlatoonPosition()
     end

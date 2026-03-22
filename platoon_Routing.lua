@@ -1008,23 +1008,60 @@ local function DetermineStartState(platoon, opts)
     return SetPointSurface(startPos, ResolveLayer(platoon, opts)), area, startedOutside
 end
 
-function PlatoonNeedsIngress(platoon, opts)
-    local startPos, area, startedOutside = DetermineStartState(platoon, opts)
-    if not (startPos and area) then
-        return false
-    end
-
-    if not startedOutside then
-        return false
-    end
-
-    if opts and opts.DisableIngress then
-        return false
-    end
-
-    local source = (opts and opts.RouteSource)
+local function EvaluateIngressDecision(platoon, opts, startPos, area)
+    local routeSource = (opts and opts.RouteSource)
         or (platoon and platoon.PlatoonData and platoon.PlatoonData.RouteSource)
-    return source == 'UnitSpawner'
+
+    local startedOutsideFlag = nil
+    if opts and opts.StartedOutsidePlayableArea ~= nil then
+        startedOutsideFlag = opts.StartedOutsidePlayableArea and true or false
+    elseif platoon and platoon.PlatoonData and platoon.PlatoonData.StartedOutsidePlayableArea ~= nil then
+        startedOutsideFlag = platoon.PlatoonData.StartedOutsidePlayableArea and true or false
+    end
+
+    local disableIngress = nil
+    if opts and opts.DisableIngress ~= nil then
+        disableIngress = opts.DisableIngress and true or false
+    elseif platoon and platoon.PlatoonData and platoon.PlatoonData.DisableIngress ~= nil then
+        disableIngress = platoon.PlatoonData.DisableIngress and true or false
+    end
+
+    local currentOutside = false
+    if startPos and area then
+        currentOutside = not PositionInPlayableArea(startPos, area)
+    end
+
+    local requested = startedOutsideFlag == true
+    local allowed = false
+    local skipReason = nil
+
+    if not (startPos and area) then
+        skipReason = 'missing-start-or-area'
+    elseif disableIngress then
+        skipReason = 'disable-ingress'
+    elseif not requested then
+        skipReason = startedOutsideFlag == false and 'started-inside-playable-area' or 'missing-started-outside-flag'
+    elseif not currentOutside then
+        skipReason = 'start-already-inside-playable-area'
+    else
+        allowed = true
+    end
+
+    return {
+        routeSource = routeSource,
+        startedOutsidePlayableArea = startedOutsideFlag,
+        disableIngress = disableIngress and true or false,
+        currentOutsidePlayableArea = currentOutside,
+        requested = requested,
+        allowed = allowed,
+        skipReason = skipReason,
+    }
+end
+
+function PlatoonNeedsIngress(platoon, opts)
+    local startPos, area = DetermineStartState(platoon, opts)
+    local decision = EvaluateIngressDecision(platoon, opts, startPos, area)
+    return decision.allowed, decision
 end
 
 local function BuildCardinalIngress(startPos, area, layer)
@@ -2169,13 +2206,34 @@ function BuildPlatoonRoute(platoon, destination, opts)
     local routingStart = CopyVec(startPos)
     local ingressEdge = nil
 
-    if PlatoonNeedsIngress(platoon, opts) then
+    local ingressAllowed, ingressDecision = PlatoonNeedsIngress(platoon, opts)
+    RouteBuildLog(buildContext, ('ingress routeSource=%s startedOutsidePlayableArea=%s disableIngress=%s requested=%s allowed=%s currentOutsidePlayableArea=%s'):format(
+        tostring(ingressDecision and ingressDecision.routeSource or false),
+        tostring(ingressDecision and ingressDecision.startedOutsidePlayableArea or false),
+        tostring(ingressDecision and ingressDecision.disableIngress or false),
+        tostring(ingressDecision and ingressDecision.requested or false),
+        tostring(ingressAllowed),
+        tostring(ingressDecision and ingressDecision.currentOutsidePlayableArea or false)
+    ))
+    if ingressDecision and not ingressAllowed and ingressDecision.skipReason then
+        RouteBuildLog(buildContext, ('ingress skipped reason=%s'):format(tostring(ingressDecision.skipReason)))
+    end
+
+    if ingressAllowed then
         RouteBuildSetStage(buildContext, 'ingress')
         local ingress
         ingress, ingressEdge = BuildCardinalIngress(startPos, area, layer)
         if ingress then
             table.insert(route, CopyVec(ingress))
             routingStart = CopyVec(ingress)
+            RouteBuildLog(buildContext, ('ingress waypoint edge=%s position=(%.2f, %.2f, %.2f)'):format(
+                tostring(ingressEdge or rawget(ingress, '_ingressEdge') or false),
+                VecX(ingress),
+                VecY(ingress),
+                VecZ(ingress)
+            ))
+        else
+            RouteBuildLog(buildContext, 'ingress allowed but no playable ingress waypoint was found')
         end
     end
 
