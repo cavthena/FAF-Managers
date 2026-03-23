@@ -45,7 +45,7 @@
 --         Formation = 'AttackFormation',
 --         AggressiveMove = true,
 --     },
---     routeSource = 'Manual',
+--     routeSource = 'UnitSpawner', -- optional; default matches SpawnMgr.Start ingress/routing metadata',
 --   }
 --
 --   -- Manual platoon from a one-off composition ------------------------------
@@ -932,8 +932,10 @@ function StartManualPlatoon(params)
     assert(params.units or params.composition, 'units or composition are required')
 
     local normalized = normalizeParams(params)
-    normalized.routeSource = params.routeSource or 'Manual'
-    normalized.label = params.label or params.platoonLabel or normalized.spawnerTag or 'ManualPlatoon'
+    local tag = normalized.spawnerTag or ('USM_' .. math.floor(100000 * Random()))
+    normalized.spawnerTag = tag
+    normalized.routeSource = params.routeSource or 'UnitSpawner'
+    normalized.label = params.label or params.platoonLabel or tag or 'ManualPlatoon'
     normalized.startedOutsidePlayableArea = params.startedOutsidePlayableArea
     normalized.spawnMarker = params.spawnMarker
     normalized.position = params.position
@@ -946,8 +948,6 @@ function StartManualPlatoon(params)
     elseif markerPos(params.spawnMarker) then
         startPosSource = 'spawnMarker'
     end
-    local tag = normalized.spawnerTag or ('USM_' .. math.floor(100000 * Random()))
-    normalized.spawnerTag = tag
 
     local units = params.units or {}
     if params.composition then
