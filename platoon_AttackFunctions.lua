@@ -1454,14 +1454,14 @@ local function AmphibiousSurfaceHeight(layer, x, z)
     return GetTerrainHeight(x, z)
 end
 
-CanPathTo = function(platoon, layer, destination)
+local function CanPathTo(platoon, layer, destination)
     if not (Routing and Routing.CanPathTo) then
         return false
     end
     return Routing.CanPathTo(platoon, layer, destination)
 end
 
-CanPathBetween = function(layer, a, b)
+local function CanPathBetween(layer, a, b)
     if not (Routing and Routing.CanPathBetween) then
         return false
     end
@@ -1489,7 +1489,7 @@ local function RecomputePathWithFallback(platoon, layer, destination, opts)
     return Routing.RecomputePathWithFallback(platoon, layer, destination, CopyOptions(opts))
 end
 
-ClampPathToPlayableArea = function(path, buffer)
+local function ClampPathToPlayableArea(path, buffer)
     return path
 end
 
