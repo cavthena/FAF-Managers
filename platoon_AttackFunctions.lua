@@ -1454,7 +1454,7 @@ local function AmphibiousSurfaceHeight(layer, x, z)
     return GetTerrainHeight(x, z)
 end
 
-local function CanPathTo(platoon, layer, destination)
+CanPathTo = function(platoon, layer, destination)
     if not (Routing and Routing.CanPathTo) then
         return false
     end
