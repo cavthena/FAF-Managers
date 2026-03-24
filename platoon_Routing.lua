@@ -775,9 +775,14 @@ end
 local function ResolveRouteChainNames(platoon, opts)
     local names = {}
     local seen = {}
+    local requiredPrefix = 'RTE_'
 
     local function addName(value)
-        if type(value) == 'string' and value ~= '' and not seen[value] then
+        if type(value) == 'string'
+            and value ~= ''
+            and string.sub(value, 1, string.len(requiredPrefix)) == requiredPrefix
+            and not seen[value]
+        then
             seen[value] = true
             table.insert(names, value)
         end
@@ -1272,7 +1277,7 @@ local function DetermineStartState(platoon, opts)
     return SetPointSurface(startPos, ResolveLayer(platoon, opts)), area, startedOutside, startSource
 end
 
-local function EvaluateIngressDecision(platoon, opts, startPos, area)
+local function EvaluateIngressDecision(platoon, opts, startPos, area, inferredStartedOutside)
     local routeSource = (opts and opts.RouteSource)
         or (platoon and platoon.PlatoonData and platoon.PlatoonData.RouteSource)
 
@@ -1299,6 +1304,11 @@ local function EvaluateIngressDecision(platoon, opts, startPos, area)
     local allowed = false
     local skipReason = nil
 
+    if startedOutsideFlag == nil and inferredStartedOutside ~= nil then
+        startedOutsideFlag = inferredStartedOutside and true or false
+        requested = startedOutsideFlag == true
+    end
+
     if not (startPos and area) then
         skipReason = 'missing-start-or-area'
     elseif disableIngress then
@@ -1323,8 +1333,8 @@ local function EvaluateIngressDecision(platoon, opts, startPos, area)
 end
 
 function PlatoonNeedsIngress(platoon, opts)
-    local startPos, area = DetermineStartState(platoon, opts)
-    local decision = EvaluateIngressDecision(platoon, opts, startPos, area)
+    local startPos, area, startedOutside = DetermineStartState(platoon, opts)
+    local decision = EvaluateIngressDecision(platoon, opts, startPos, area, startedOutside)
     return decision.allowed, decision
 end
 
