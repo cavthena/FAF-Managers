@@ -2498,35 +2498,54 @@ local function SaveRouteTemplate(cacheKey, stored)
     cache.routes[cacheKey] = CloneStoredRouteTemplate(stored)
 end
 
+local WaypointMetadataContext = {
+    DefaultAssaultRadius = DefaultAssaultRadius,
+    DefaultStagingRadius = DefaultStagingRadius,
+    DefaultAssaultLeadDistance = DefaultAssaultLeadDistance,
+    PlatoonTraversalQueueWindow = PlatoonTraversalQueueWindow,
+    ContinuousReachDistanceSq = ContinuousReachDistanceSq,
+    SegmentReachDistanceSq = SegmentReachDistanceSq,
+    RoutePreferredClearance = RoutePreferredClearance,
+    CopyVec = CopyVec,
+    SetPointSurface = SetPointSurface,
+    DetermineWaypointType = DetermineWaypointType,
+    DetermineWaypointFacing = DetermineWaypointFacing,
+    SegmentLength = SegmentLength,
+    AngleDeltaDegrees = AngleDeltaDegrees,
+    AnalyzeSegmentClearance = AnalyzeSegmentClearance,
+    DetermineWaypointQueueDistanceSq = DetermineWaypointQueueDistanceSq,
+}
+
 local function BuildWaypointMetadata(platoon, route, destination, opts, layer, startedOutside, ingressEdge, debugSummary)
+    local ctx = WaypointMetadataContext
     local metadata = {}
     local formation = opts and opts.Formation or nil
-    local assaultRadius = math.max(20, opts and opts.AssaultRadius or DefaultAssaultRadius)
-    local stagingRadius = math.max(assaultRadius + 10, opts and opts.StagingRadius or DefaultStagingRadius)
+    local assaultRadius = math.max(20, opts and opts.AssaultRadius or ctx.DefaultAssaultRadius)
+    local stagingRadius = math.max(assaultRadius + 10, opts and opts.StagingRadius or ctx.DefaultStagingRadius)
     local formationFootprint = RoutingUtils.EstimatePlatoonFootprint(platoon, formation, opts)
     local aggressionRouteInfo = {
         targetPosition = opts and opts.TargetPosition or destination,
         assaultRadius = assaultRadius,
         stagingRadius = stagingRadius,
-        assaultLeadDistance = opts and opts.AssaultLeadDistance or DefaultAssaultLeadDistance,
+        assaultLeadDistance = opts and opts.AssaultLeadDistance or ctx.DefaultAssaultLeadDistance,
         formationFootprint = formationFootprint,
     }
     local assaultTransitionRadius = RoutingUtils.ResolveAssaultTransitionRadius(aggressionRouteInfo, opts)
 
     for i = 2, table.getn(route) do
-        local point = CopyVec(route[i])
-        SetPointSurface(point, layer)
+        local point = ctx.CopyVec(route[i])
+        ctx.SetPointSurface(point, layer)
         local prevPoint = route[i - 1] or point
         local nextPoint = route[i + 1] or point
-        local waypointType, staging = DetermineWaypointType(point, i, table.getn(route), opts and opts.RequireFinalStaging)
+        local waypointType, staging = ctx.DetermineWaypointType(point, i, table.getn(route), opts and opts.RequireFinalStaging)
         local continuous = not staging
 
-        local arrivalFacing, departureFacing, flowFacing, commandFacing = DetermineWaypointFacing(prevPoint, point, nextPoint, waypointType, continuous)
-        local segmentLength = SegmentLength(prevPoint, point)
-        local nextSegmentLength = SegmentLength(point, nextPoint)
-        local turnAngle = AngleDeltaDegrees(arrivalFacing, departureFacing)
-        local reachDistanceSq = continuous and ContinuousReachDistanceSq or SegmentReachDistanceSq
-        local corridorInfo = AnalyzeSegmentClearance(layer, prevPoint, point, RoutePreferredClearance)
+        local arrivalFacing, departureFacing, flowFacing, commandFacing = ctx.DetermineWaypointFacing(prevPoint, point, nextPoint, waypointType, continuous)
+        local segmentLength = ctx.SegmentLength(prevPoint, point)
+        local nextSegmentLength = ctx.SegmentLength(point, nextPoint)
+        local turnAngle = ctx.AngleDeltaDegrees(arrivalFacing, departureFacing)
+        local reachDistanceSq = continuous and ctx.ContinuousReachDistanceSq or ctx.SegmentReachDistanceSq
+        local corridorInfo = ctx.AnalyzeSegmentClearance(layer, prevPoint, point, ctx.RoutePreferredClearance)
 
         local waypoint = {
             position = point,
@@ -2542,10 +2561,10 @@ local function BuildWaypointMetadata(platoon, route, destination, opts, layer, s
             allowReform = staging and waypointType ~= 'ingress' and true or false,
             continuous = continuous,
             reachDistanceSq = reachDistanceSq,
-            queueDistanceSq = continuous and DetermineWaypointQueueDistanceSq(waypointType, segmentLength, nextSegmentLength, turnAngle) or reachDistanceSq,
-            segmentStart = CopyVec(prevPoint),
-            segmentEnd = CopyVec(point),
-            nextSegmentEnd = CopyVec(nextPoint),
+            queueDistanceSq = continuous and ctx.DetermineWaypointQueueDistanceSq(waypointType, segmentLength, nextSegmentLength, turnAngle) or reachDistanceSq,
+            segmentStart = ctx.CopyVec(prevPoint),
+            segmentEnd = ctx.CopyVec(point),
+            nextSegmentEnd = ctx.CopyVec(nextPoint),
             segmentLength = segmentLength,
             nextSegmentLength = nextSegmentLength,
             turnAngle = turnAngle,
@@ -2578,10 +2597,10 @@ local function BuildWaypointMetadata(platoon, route, destination, opts, layer, s
         initialFormIssuedTime = nil,
         cohesionBroken = false,
         cohesionState = nil,
-        queueWindow = (opts and opts.QueueWindow) or PlatoonTraversalQueueWindow,
-        destination = CopyVec(destination),
-        startPosition = route and route[1] and CopyVec(route[1]) or nil,
-        targetPosition = opts and opts.TargetPosition and CopyVec(opts.TargetPosition) or CopyVec(destination),
+        queueWindow = (opts and opts.QueueWindow) or ctx.PlatoonTraversalQueueWindow,
+        destination = ctx.CopyVec(destination),
+        startPosition = route and route[1] and ctx.CopyVec(route[1]) or nil,
+        targetPosition = opts and opts.TargetPosition and ctx.CopyVec(opts.TargetPosition) or ctx.CopyVec(destination),
         targetZone = opts and opts.TargetZone or nil,
         layer = layer,
         aggressiveMove = opts and opts.AggressiveMove and true or false,
