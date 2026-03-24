@@ -478,6 +478,27 @@ local function CopyVector(vec)
     return { vec[1], vec[2], vec[3] }
 end
 
+local function IsValidPositionVector(vec)
+    if type(vec) ~= 'table' then
+        return false
+    end
+
+    return type(vec[1]) == 'number'
+        and type(vec[3]) == 'number'
+end
+
+local function FormatPositionVector(vec)
+    if not IsValidPositionVector(vec) then
+        return 'nil'
+    end
+
+    return ('(%.2f, %.2f, %.2f)'):format(
+        vec[1],
+        type(vec[2]) == 'number' and vec[2] or 0,
+        vec[3]
+    )
+end
+
 local function VectorAdd(a, b)
     return { a[1] + b[1], a[2] + b[2], a[3] + b[3] }
 end
@@ -1598,8 +1619,8 @@ local function AttackTargetArea(platoon, target, opts)
 
     local layer = DetermineLayer(platoon, opts.Amphibious)
     local area = GetPlayableArea()
-    local startPos = GetPlatoonPosition(platoon)
-    if not startPos then
+    local liveStartPos = GetPlatoonPosition(platoon)
+    if not liveStartPos then
         return 'fail'
     end
 
@@ -1610,7 +1631,32 @@ local function AttackTargetArea(platoon, target, opts)
         targetPos = CopyVector(targetPos)
     end
 
-    local startedOutside = area and not PositionInPlayableArea(startPos, area)
+    local startedOutsideLive = area and not PositionInPlayableArea(liveStartPos, area)
+    local storedStartPos = ReadStoredValue(platoon, 'StartPosition', nil)
+    local storedStartedOutside = ReadStoredValue(platoon, 'StartedOutsidePlayableArea', startedOutsideLive)
+    local routeSource = ReadStoredValue(platoon, 'RouteSource', opts.RouteSource)
+    local startSource = ReadStoredValue(platoon, 'StartSource', ReadStoredValue(platoon, 'StartPositionSource', nil))
+
+    local startPos = liveStartPos
+    if storedStartedOutside then
+        if IsValidPositionVector(storedStartPos) then
+            startPos = CopyVector(storedStartPos)
+        else
+            RoutingLog('Warning: StartedOutsidePlayableArea=true but StartPosition missing/malformed; falling back to live position')
+        end
+    end
+
+    RoutingLog(
+        ('AttackTargetArea route handoff routeSource=%s startSource=%s liveStart=%s storedStart=%s startedOutside=%s selectedRouteStart=%s'):format(
+            tostring(routeSource or 'unknown'),
+            tostring(startSource or 'unknown'),
+            FormatPositionVector(liveStartPos),
+            FormatPositionVector(storedStartPos),
+            tostring(storedStartedOutside and true or false),
+            FormatPositionVector(startPos)
+        )
+    )
+
     local routeOpts = {
         Formation = opts.Formation,
         AggressiveMove = opts.AggressiveMove,
@@ -1620,12 +1666,12 @@ local function AttackTargetArea(platoon, target, opts)
         DisableIngress = ReadStoredValue(platoon, 'DisableIngress', opts.DisableIngress),
         Debug = opts.Debug,
         RouteLayer = layer,
-        RouteSource = ReadStoredValue(platoon, 'RouteSource', opts.RouteSource),
+        RouteSource = routeSource,
         RouteCacheTag = opts.RouteCacheTag
             or ReadStoredValue(platoon, 'SpawnerTag',
                 ReadStoredValue(platoon, 'BuilderTag',
                     ReadStoredValue(platoon, 'Tag', opts.Tag))),
-        StartedOutsidePlayableArea = ReadStoredValue(platoon, 'StartedOutsidePlayableArea', startedOutside),
+        StartedOutsidePlayableArea = storedStartedOutside and true or false,
         TargetPosition = targetPos,
         TargetZone = target,
         AssaultLeadDistance = opts.AssaultLeadDistance,

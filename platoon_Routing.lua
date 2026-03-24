@@ -251,6 +251,29 @@ local function CopyVec(v)
     return copy
 end
 
+local function IsValidRoutePosition(pos)
+    if type(pos) ~= 'table' then
+        return false
+    end
+
+    local x = ReadVecComponent(pos, 1, 'x')
+    local z = ReadVecComponent(pos, 3, 'z')
+    return type(x) == 'number' and type(z) == 'number'
+end
+
+local function FormatRoutePosition(pos)
+    if not IsValidRoutePosition(pos) then
+        return 'nil'
+    end
+
+    local y = ReadVecComponent(pos, 2, 'y')
+    if type(y) ~= 'number' then
+        y = 0
+    end
+
+    return ('(%.2f, %.2f, %.2f)'):format(VecX(pos), y, VecZ(pos))
+end
+
 local function BuildPoint(x, y, z)
     return { x, y or 0, z }
 end
@@ -1248,17 +1271,6 @@ local function DetermineStartState(platoon, opts)
         return nil, nil, false
     end
 
-    local startPos = opts and opts.RouteStart and CopyVec(opts.RouteStart)
-        or (platoon.GetPlatoonPosition and CopyVec(platoon:GetPlatoonPosition()))
-    if not startPos then
-        return nil, nil, false, 'missing'
-    end
-
-    local startSource = 'GetPlatoonPosition'
-    if opts and opts.RouteStart then
-        startSource = (platoon.PlatoonData and platoon.PlatoonData.StartPositionSource) or 'RouteStart'
-    end
-
     local area = GetPlayableArea()
     local startedOutside = false
 
@@ -1267,7 +1279,35 @@ local function DetermineStartState(platoon, opts)
     elseif platoon.PlatoonData and platoon.PlatoonData.StartedOutsidePlayableArea ~= nil then
         startedOutside = platoon.PlatoonData.StartedOutsidePlayableArea and true or false
     elseif area then
-        startedOutside = not PositionInPlayableArea(startPos, area)
+        local inferredStart = platoon.GetPlatoonPosition and CopyVec(platoon:GetPlatoonPosition()) or nil
+        if inferredStart then
+            startedOutside = not PositionInPlayableArea(inferredStart, area)
+        end
+    end
+
+    local startPos = nil
+    local startSource = 'GetPlatoonPosition'
+    local storedStartPos = platoon.PlatoonData and platoon.PlatoonData.StartPosition or nil
+
+    if opts and opts.RouteStart then
+        startPos = CopyVec(opts.RouteStart)
+        startSource = (platoon.PlatoonData and platoon.PlatoonData.StartPositionSource) or 'RouteStart'
+    elseif startedOutside then
+        if IsValidRoutePosition(storedStartPos) then
+            startPos = CopyVec(storedStartPos)
+            startSource = (platoon.PlatoonData and platoon.PlatoonData.StartPositionSource) or 'StoredStartPosition'
+        else
+            if LOG then
+                LOG('[PlatoonRouting] warning: StartedOutsidePlayableArea=true but StartPosition missing/malformed; falling back to current platoon position')
+            end
+            startPos = platoon.GetPlatoonPosition and CopyVec(platoon:GetPlatoonPosition()) or nil
+        end
+    else
+        startPos = platoon.GetPlatoonPosition and CopyVec(platoon:GetPlatoonPosition()) or nil
+    end
+
+    if not startPos then
+        return nil, area, startedOutside, 'missing'
     end
 
     if area and PositionInPlayableArea(startPos, area) then
@@ -2722,6 +2762,10 @@ function BuildPlatoonRoute(platoon, destination, opts)
     local ingressEdge = nil
 
     local ingressAllowed, ingressDecision = PlatoonNeedsIngress(platoon, opts)
+    RouteBuildLog(buildContext, ('route start selected source=%s position=%s'):format(
+        tostring(startSource or 'unknown'),
+        FormatRoutePosition(startPos)
+    ))
     RouteBuildLog(buildContext, ('ingress routeSource=%s startSource=%s startPosition=(%.2f, %.2f, %.2f) startedOutsidePlayableArea=%s disableIngress=%s requested=%s allowed=%s currentOutsidePlayableArea=%s'):format(
         tostring(ingressDecision and ingressDecision.routeSource or false),
         tostring(startSource or 'unknown'),
@@ -3383,6 +3427,9 @@ function BuildRoute(platoon, startPos, targetPos, opts)
     end
     if startPos then
         buildOpts.RouteStart = CopyVec(startPos)
+    end
+    if buildOpts.Debug and LOG then
+        LOG(('[PlatoonRouting] BuildRoute routeStart=%s'):format(FormatRoutePosition(buildOpts.RouteStart)))
     end
     return BuildPlatoonRoute(platoon, targetPos, buildOpts)
 end
