@@ -2740,7 +2740,44 @@ local function SyncRouteOptions(route, opts)
     return route
 end
 
+local BuildPlatoonRouteContext = {
+    ResolveLayer = ResolveLayer,
+    DetermineStartState = DetermineStartState,
+    ClampToPlayableArea = ClampToPlayableArea,
+    CopyVec = CopyVec,
+    SetPointSurface = SetPointSurface,
+    ResolveRouteCacheKey = ResolveRouteCacheKey,
+    RestoreSavedRoute = RestoreSavedRoute,
+    SyncRouteOptions = SyncRouteOptions,
+    CreateRouteBuildContext = CreateRouteBuildContext,
+    RouteBuildLog = RouteBuildLog,
+    FormatRoutePosition = FormatRoutePosition,
+    VecX = VecX,
+    VecY = VecY,
+    VecZ = VecZ,
+    PlatoonNeedsIngress = PlatoonNeedsIngress,
+    RouteBuildSetStage = RouteBuildSetStage,
+    BuildCardinalIngress = BuildCardinalIngress,
+    CollectRouteCandidates = CollectRouteCandidates,
+    SelectRouteCandidate = SelectRouteCandidate,
+    MaybeYieldRouteBuild = MaybeYieldRouteBuild,
+    RemoveDuplicateRoutePoints = RemoveDuplicateRoutePoints,
+    RemoveRouteDoubleBack = RemoveRouteDoubleBack,
+    ResolveRouteChainNames = ResolveRouteChainNames,
+    ApplyMarkerChainGuidance = ApplyMarkerChainGuidance,
+    SimplifyRoutePreservingSafety = SimplifyRoutePreservingSafety,
+    EnforceStrictRouteSegments = EnforceStrictRouteSegments,
+    BuildWaypointMetadata = BuildWaypointMetadata,
+    FinalizeRouteBuildContext = FinalizeRouteBuildContext,
+    BuildRouteDebugSummary = BuildRouteDebugSummary,
+    SaveRouteTemplate = SaveRouteTemplate,
+    DefaultAssaultRadius = DefaultAssaultRadius,
+    DefaultStagingRadius = DefaultStagingRadius,
+    DefaultAssaultLeadDistance = DefaultAssaultLeadDistance,
+}
+
 function BuildPlatoonRoute(platoon, destination, opts)
+    local ctx = BuildPlatoonRouteContext
     if not (platoon and destination) then
         return nil
     end
@@ -2750,47 +2787,47 @@ function BuildPlatoonRoute(platoon, destination, opts)
         return nil
     end
 
-    local layer = ResolveLayer(platoon, opts)
-    local startPos, area, startedOutside, startSource = DetermineStartState(platoon, opts)
+    local layer = ctx.ResolveLayer(platoon, opts)
+    local startPos, area, startedOutside, startSource = ctx.DetermineStartState(platoon, opts)
     if not startPos then
         return nil
     end
 
-    local target = area and ClampToPlayableArea(destination, area, 0) or CopyVec(destination)
-    SetPointSurface(target, layer)
+    local target = area and ctx.ClampToPlayableArea(destination, area, 0) or ctx.CopyVec(destination)
+    ctx.SetPointSurface(target, layer)
 
-    local cacheKey = ResolveRouteCacheKey(platoon, opts, layer, startPos, target)
+    local cacheKey = ctx.ResolveRouteCacheKey(platoon, opts, layer, startPos, target)
     if not (opts and opts.ForceRepath) then
-        local cached = RestoreSavedRoute(cacheKey)
+        local cached = ctx.RestoreSavedRoute(cacheKey)
         if cached then
-            cached.destination = CopyVec(target)
-            cached.targetPosition = opts and opts.TargetPosition and CopyVec(opts.TargetPosition) or CopyVec(target)
-            cached.startPosition = CopyVec(startPos)
+            cached.destination = ctx.CopyVec(target)
+            cached.targetPosition = opts and opts.TargetPosition and ctx.CopyVec(opts.TargetPosition) or ctx.CopyVec(target)
+            cached.startPosition = ctx.CopyVec(startPos)
             cached.routeCacheKey = cacheKey
-            SyncRouteOptions(cached, opts)
+            ctx.SyncRouteOptions(cached, opts)
             platoon._storedRoute = cached
             return cached
         end
     end
 
-    local buildContext = CreateRouteBuildContext(opts)
+    local buildContext = ctx.CreateRouteBuildContext(opts)
     ActiveRouteBuildContext = buildContext
 
-    local route = { CopyVec(startPos) }
-    local routingStart = CopyVec(startPos)
+    local route = { ctx.CopyVec(startPos) }
+    local routingStart = ctx.CopyVec(startPos)
     local ingressEdge = nil
 
-    local ingressAllowed, ingressDecision = PlatoonNeedsIngress(platoon, opts)
-    RouteBuildLog(buildContext, ('route start selected source=%s position=%s'):format(
+    local ingressAllowed, ingressDecision = ctx.PlatoonNeedsIngress(platoon, opts)
+    ctx.RouteBuildLog(buildContext, ('route start selected source=%s position=%s'):format(
         tostring(startSource or 'unknown'),
-        FormatRoutePosition(startPos)
+        ctx.FormatRoutePosition(startPos)
     ))
-    RouteBuildLog(buildContext, ('ingress routeSource=%s startSource=%s startPosition=(%.2f, %.2f, %.2f) startedOutsidePlayableArea=%s disableIngress=%s requested=%s allowed=%s currentOutsidePlayableArea=%s'):format(
+    ctx.RouteBuildLog(buildContext, ('ingress routeSource=%s startSource=%s startPosition=(%.2f, %.2f, %.2f) startedOutsidePlayableArea=%s disableIngress=%s requested=%s allowed=%s currentOutsidePlayableArea=%s'):format(
         tostring(ingressDecision and ingressDecision.routeSource or false),
         tostring(startSource or 'unknown'),
-        VecX(startPos),
-        VecY(startPos),
-        VecZ(startPos),
+        ctx.VecX(startPos),
+        ctx.VecY(startPos),
+        ctx.VecZ(startPos),
         tostring(ingressDecision and ingressDecision.startedOutsidePlayableArea or false),
         tostring(ingressDecision and ingressDecision.disableIngress or false),
         tostring(ingressDecision and ingressDecision.requested or false),
@@ -2798,36 +2835,36 @@ function BuildPlatoonRoute(platoon, destination, opts)
         tostring(ingressDecision and ingressDecision.currentOutsidePlayableArea or false)
     ))
     if ingressDecision and not ingressAllowed and ingressDecision.skipReason then
-        RouteBuildLog(buildContext, ('ingress skipped reason=%s'):format(tostring(ingressDecision.skipReason)))
+        ctx.RouteBuildLog(buildContext, ('ingress skipped reason=%s'):format(tostring(ingressDecision.skipReason)))
     end
 
     if ingressAllowed then
-        RouteBuildSetStage(buildContext, 'ingress')
+        ctx.RouteBuildSetStage(buildContext, 'ingress')
         local ingress
-        ingress, ingressEdge = BuildCardinalIngress(startPos, area, layer)
+        ingress, ingressEdge = ctx.BuildCardinalIngress(startPos, area, layer)
         if ingress then
-            table.insert(route, CopyVec(ingress))
-            routingStart = CopyVec(ingress)
-            RouteBuildLog(buildContext, ('ingress waypoint edge=%s position=(%.2f, %.2f, %.2f)'):format(
+            table.insert(route, ctx.CopyVec(ingress))
+            routingStart = ctx.CopyVec(ingress)
+            ctx.RouteBuildLog(buildContext, ('ingress waypoint edge=%s position=(%.2f, %.2f, %.2f)'):format(
                 tostring(ingressEdge or rawget(ingress, '_ingressEdge') or false),
-                VecX(ingress),
-                VecY(ingress),
-                VecZ(ingress)
+                ctx.VecX(ingress),
+                ctx.VecY(ingress),
+                ctx.VecZ(ingress)
             ))
         else
-            RouteBuildLog(buildContext, 'ingress allowed but no playable ingress waypoint was found')
+            ctx.RouteBuildLog(buildContext, 'ingress allowed but no playable ingress waypoint was found')
         end
     end
 
-    RouteBuildSetStage(buildContext, 'candidate-generation')
-    local candidates = CollectRouteCandidates(layer, routingStart, target, opts, area)
-    local selected, debugSummary = SelectRouteCandidate(candidates, opts)
+    ctx.RouteBuildSetStage(buildContext, 'candidate-generation')
+    local candidates = ctx.CollectRouteCandidates(layer, routingStart, target, opts, area)
+    local selected, debugSummary = ctx.SelectRouteCandidate(candidates, opts)
     if not (selected and selected.path) then
         ActiveRouteBuildContext = false
         return nil
     end
 
-    RouteBuildLog(buildContext, ('candidateCount=%d viableCount=%d chosenRouteType=%s randomize=%s uniform=%s'):format(
+    ctx.RouteBuildLog(buildContext, ('candidateCount=%d viableCount=%d chosenRouteType=%s randomize=%s uniform=%s'):format(
         table.getn(candidates or {}),
         debugSummary and debugSummary.viable or table.getn(candidates or {}),
         tostring(debugSummary and debugSummary.selected or selected.routeType or 'default'),
@@ -2836,35 +2873,35 @@ function BuildPlatoonRoute(platoon, destination, opts)
     ))
 
     for i = 2, table.getn(selected.path) do
-        table.insert(route, CopyVec(selected.path[i]))
-        MaybeYieldRouteBuild('selected-route-copy')
+        table.insert(route, ctx.CopyVec(selected.path[i]))
+        ctx.MaybeYieldRouteBuild('selected-route-copy')
     end
 
-    RouteBuildSetStage(buildContext, 'route-shaping')
-    route = RemoveDuplicateRoutePoints(route, 2)
-    route = RemoveRouteDoubleBack(route)
+    ctx.RouteBuildSetStage(buildContext, 'route-shaping')
+    route = ctx.RemoveDuplicateRoutePoints(route, 2)
+    route = ctx.RemoveRouteDoubleBack(route)
     local appliedChainName = nil
-    local chainNames = ResolveRouteChainNames(platoon, opts)
+    local chainNames = ctx.ResolveRouteChainNames(platoon, opts)
     if table.getn(chainNames) > 0 then
-        route, appliedChainName = ApplyMarkerChainGuidance(route, layer, chainNames)
+        route, appliedChainName = ctx.ApplyMarkerChainGuidance(route, layer, chainNames)
     end
-    route = SimplifyRoutePreservingSafety(route, layer)
+    route = ctx.SimplifyRoutePreservingSafety(route, layer)
 
-    RouteBuildSetStage(buildContext, 'strict-segment-repair')
+    ctx.RouteBuildSetStage(buildContext, 'strict-segment-repair')
     -- Run a final strict center-line pass after all shaping so simplification or
     -- smoothing cannot leave a visible waypoint-to-waypoint segment crossing
     -- blocked terrain. Failed segments are rebuilt before movement begins.
     local repaired
-    route, repaired, buildContext.strictFailures = EnforceStrictRouteSegments(route, layer)
+    route, repaired, buildContext.strictFailures = ctx.EnforceStrictRouteSegments(route, layer)
     buildContext.repairedAfterShaping = repaired and true or false
     if not route then
-        RouteBuildLog(buildContext, 'strict segment repair failed after shaping')
+        ctx.RouteBuildLog(buildContext, 'strict segment repair failed after shaping')
         ActiveRouteBuildContext = false
         return nil
     end
 
     if repaired then
-        RouteBuildLog(buildContext, ('strict segment repair inserted bends for %d segment(s)'):format(table.getn(buildContext.strictFailures or {})))
+        ctx.RouteBuildLog(buildContext, ('strict segment repair inserted bends for %d segment(s)'):format(table.getn(buildContext.strictFailures or {})))
     end
 
     local buildOpts = {}
@@ -2875,16 +2912,16 @@ function BuildPlatoonRoute(platoon, destination, opts)
     end
     buildOpts.RouteVariant = selected.routeType or 'default'
 
-    buildOpts.AssaultRadius = buildOpts.AssaultRadius or DefaultAssaultRadius
-    buildOpts.StagingRadius = buildOpts.StagingRadius or DefaultStagingRadius
-    buildOpts.AssaultLeadDistance = buildOpts.AssaultLeadDistance or DefaultAssaultLeadDistance
+    buildOpts.AssaultRadius = buildOpts.AssaultRadius or ctx.DefaultAssaultRadius
+    buildOpts.StagingRadius = buildOpts.StagingRadius or ctx.DefaultStagingRadius
+    buildOpts.AssaultLeadDistance = buildOpts.AssaultLeadDistance or ctx.DefaultAssaultLeadDistance
     buildOpts.Debug = buildOpts.Debug and true or false
 
-    RouteBuildSetStage(buildContext, 'waypoint-metadata')
-    local stored = BuildWaypointMetadata(platoon, route, target, buildOpts, layer, startedOutside, ingressEdge, debugSummary)
-    FinalizeRouteBuildContext(buildContext)
-    debugSummary = BuildRouteDebugSummary(debugSummary, buildContext, selected.routeType or 'default')
-    RouteBuildLog(buildContext, ('routeBuildSeconds=%.4f stages={candidates=%.4f shaping=%.4f strict=%.4f metadata=%.4f} yielded=%s count=%d repaired=%s'):format(
+    ctx.RouteBuildSetStage(buildContext, 'waypoint-metadata')
+    local stored = ctx.BuildWaypointMetadata(platoon, route, target, buildOpts, layer, startedOutside, ingressEdge, debugSummary)
+    ctx.FinalizeRouteBuildContext(buildContext)
+    debugSummary = ctx.BuildRouteDebugSummary(debugSummary, buildContext, selected.routeType or 'default')
+    ctx.RouteBuildLog(buildContext, ('routeBuildSeconds=%.4f stages={candidates=%.4f shaping=%.4f strict=%.4f metadata=%.4f} yielded=%s count=%d repaired=%s'):format(
         debugSummary.totalBuildTime or 0,
         (debugSummary.stageTimings and debugSummary.stageTimings['candidate-generation']) or 0,
         (debugSummary.stageTimings and debugSummary.stageTimings['route-shaping']) or 0,
@@ -2900,7 +2937,7 @@ function BuildPlatoonRoute(platoon, destination, opts)
     stored.routeChainUsed = appliedChainName
     SyncRouteOptions(stored, buildOpts)
     platoon._storedRoute = stored
-    SaveRouteTemplate(cacheKey, stored)
+    ctx.SaveRouteTemplate(cacheKey, stored)
     ActiveRouteBuildContext = false
     return stored
 end
