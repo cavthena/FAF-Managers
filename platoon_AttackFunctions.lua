@@ -1621,10 +1621,16 @@ local function AttackTargetArea(platoon, target, opts)
         Debug = opts.Debug,
         RouteLayer = layer,
         RouteSource = ReadStoredValue(platoon, 'RouteSource', opts.RouteSource),
+        RouteCacheTag = opts.RouteCacheTag
+            or ReadStoredValue(platoon, 'SpawnerTag',
+                ReadStoredValue(platoon, 'BuilderTag',
+                    ReadStoredValue(platoon, 'Tag', opts.Tag))),
         StartedOutsidePlayableArea = ReadStoredValue(platoon, 'StartedOutsidePlayableArea', startedOutside),
         TargetPosition = targetPos,
         TargetZone = target,
         AssaultLeadDistance = opts.AssaultLeadDistance,
+        RouteChain = opts.RouteChain or opts.MarkerChain or opts.Chain or opts.ChainName,
+        RouteChains = opts.RouteChains or opts.MarkerChains or opts.ChainNames,
     }
 
     local bombardRange = nil

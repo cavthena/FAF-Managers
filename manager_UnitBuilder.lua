@@ -672,6 +672,7 @@ function Builder:_HandOffPlatoon(units, label)
     if self.params.attackFn then
         platoon.PlatoonData = self.params.attackData or {}
         platoon.PlatoonData.RouteSource = platoon.PlatoonData.RouteSource or 'UnitBuilder'
+        platoon.PlatoonData.BuilderTag = platoon.PlatoonData.BuilderTag or self.tag
         _ForkAttack(platoon, self.params.attackFn, platoon.PlatoonData, self.tag)
     else
         self:Warn('No attackFn provided; platoon will idle')
