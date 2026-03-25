@@ -477,6 +477,8 @@ local function LaunchAttackThread(platoon, attackFn, attackData, warnFn)
                 end
                 return resolvedAttackFn(p, attackData)
             end)
+        elseif warnFn then
+            warnFn('AttackWrapper: platoon missing after handoff delay')
         end
     end)
 
