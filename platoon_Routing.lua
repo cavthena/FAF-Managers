@@ -95,6 +95,9 @@ local DefaultAssaultLeadDistance = 24
 local RouteBuildYieldInterval = 18
 local StrictSegmentSampleStep = 1.25
 local StrictSegmentRepairMaxDepth = 6
+local DefaultGraphResolution = 32
+local DefaultGraphHardInflation = 2.5
+local DefaultGraphSoftInflation = 8
 
 local CohesionMainBodyRadiusSq = 30 * 30
 local CohesionStragglerDistanceSq = 54 * 54
@@ -104,6 +107,7 @@ local CohesionReformMinMissingUnits = 2
 local PlatoonTraversalQueueWindow = 3
 local RouteStuckTimeout = 10
 local ActiveRouteBuildContext = false
+local MissionGraphInitialized = false
 
 local function RouteBuildClock()
     return GetGameTimeSeconds()
@@ -732,6 +736,44 @@ local function GetPlayableArea()
     end
 
     return nil
+end
+
+local function ResolveGraphConfig(opts, platoon)
+    local platoonData = platoon and platoon.PlatoonData or nil
+    local cfg = {
+        resolution = math.max(8, (opts and opts.GraphResolution) or (platoonData and platoonData.GraphResolution) or DefaultGraphResolution),
+        inflationHardBlock = (opts and opts.GraphInflationHardBlock) or (platoonData and platoonData.GraphInflationHardBlock) or DefaultGraphHardInflation,
+        inflationSoftPenalty = (opts and opts.GraphInflationSoftPenalty) or (platoonData and platoonData.GraphInflationSoftPenalty) or DefaultGraphSoftInflation,
+    }
+    return cfg
+end
+
+local function ShouldUseGraphRouting(platoon, opts)
+    local platoonData = platoon and platoon.PlatoonData or nil
+    local mode = (opts and opts.RouteMode) or (platoonData and platoonData.RouteMode)
+    local phase = (opts and opts.RoutePhase) or (platoonData and platoonData.RoutePhase)
+
+    if opts and opts.DisableGraphRouting then
+        return false, 'disabled-by-option'
+    end
+    if mode == 'ChainPatrol' or mode == 'AuthoredPath' then
+        return false, 'authored-mode'
+    end
+    if phase == 'ASSAULT' or phase == 'RALLY' then
+        return false, 'phase-opt-out'
+    end
+
+    return true, 'standard'
+end
+
+local function EnsureMissionRoutingGraph(platoon, opts, area)
+    if MissionGraphInitialized and not (opts and opts.ForceGraphRebuild) then
+        return
+    end
+
+    local graphConfig = ResolveGraphConfig(opts, platoon)
+    RoutingGraph.InitializeMissionGraph(area or GetPlayableArea(), graphConfig)
+    MissionGraphInitialized = true
 end
 
 local function PositionInPlayableArea(pos, area)
@@ -1432,19 +1474,32 @@ local function BuildCardinalIngress(startPos, area, layer)
     return SetPointSurface(fallback, layer), candidates[1].edge
 end
 
-local function BuildBasePath(layer, startPos, target)
+local function BuildBasePath(layer, startPos, target, opts, area)
     if not (startPos and target) then
         return nil
     end
 
-    local route = { CopyVec(startPos) }
-    local directAllowed = SegmentHasClearance(layer, startPos, target, DirectClearance)
-    if directAllowed then
-        table.insert(route, CopyVec(target))
-        return route
+    local useGraph = true
+    if opts and opts.UseGraphRouting ~= nil then
+        useGraph = opts.UseGraphRouting and true or false
     end
 
+    if useGraph then
+        local graphResult = RoutingGraph.FindGraphRoute(area, layer, startPos, target, {
+            GraphConfig = opts and opts.GraphConfig,
+            TemporaryNodePenalty = opts and opts.TemporaryNodePenalty,
+            DirectCheck = function(routeLayer, fromPos, toPos)
+                return SegmentHasClearance(routeLayer, fromPos, toPos, DirectClearance)
+            end,
+        })
+        if graphResult and graphResult.path and table.getn(graphResult.path) > 1 then
+            return graphResult.path, graphResult.routeType or 'graph'
+        end
+    end
+
+    local route = { CopyVec(startPos) }
     local ok, navPath = pcall(NavUtils.PathTo, layer, startPos, target)
+    RoutingGraph.RecordPathToCall()
     if ok and navPath and table.getn(navPath) > 0 then
         for _, point in ipairs(navPath) do
             table.insert(route, CopyVec(point))
@@ -1458,7 +1513,8 @@ local function BuildBasePath(layer, startPos, target)
         table.insert(route, CopyVec(target))
     end
 
-    return route
+    RoutingGraph.ReportPathToFallback()
+    return route, 'pathTo-fallback'
 end
 
 local function AppendRouteSegment(route, segment)
@@ -1494,7 +1550,7 @@ local function ComputeRouteLength(route)
     return length
 end
 
-local function BuildPathViaAnchors(layer, startPos, target, anchors)
+local function BuildPathViaAnchors(layer, startPos, target, anchors, opts, area)
     if not (startPos and target) then
         return nil
     end
@@ -1503,7 +1559,7 @@ local function BuildPathViaAnchors(layer, startPos, target, anchors)
     local current = startPos
 
     for _, anchor in ipairs(anchors or {}) do
-        local segment = BuildBasePath(layer, current, anchor)
+        local segment = BuildBasePath(layer, current, anchor, opts, area)
         if not segment then
             return nil
         end
@@ -1512,7 +1568,7 @@ local function BuildPathViaAnchors(layer, startPos, target, anchors)
         MaybeYieldRouteBuild('anchor-segment-build')
     end
 
-    local finalSegment = BuildBasePath(layer, current, target)
+    local finalSegment = BuildBasePath(layer, current, target, opts, area)
     if not finalSegment then
         return nil
     end
@@ -1741,7 +1797,7 @@ local function BuildOffsetAnchor(startPos, dirX, dirZ, normalX, normalZ, alongDi
     return anchor
 end
 
-local function BuildRandomizedRouteVariant(layer, startPos, target, area, variant)
+local function BuildRandomizedRouteVariant(layer, startPos, target, area, variant, opts)
     if not (startPos and target and variant) then
         return nil
     end
@@ -1793,7 +1849,7 @@ local function BuildRandomizedRouteVariant(layer, startPos, target, area, varian
         return nil
     end
 
-    return BuildPathViaAnchors(layer, startPos, target, anchors)
+    return BuildPathViaAnchors(layer, startPos, target, anchors, opts, area)
 end
 
 local function MeasureRouteClearance(route, layer)
@@ -1864,13 +1920,13 @@ end
 
 local function CollectRouteCandidates(layer, startPos, target, opts, area)
     local candidates = {}
-    local baseRoute = BuildBasePath(layer, startPos, target)
+    local baseRoute, baseType = BuildBasePath(layer, startPos, target, opts, area)
     if baseRoute then
         local clearance = MeasureRouteClearance(baseRoute, layer)
         if clearance then
             table.insert(candidates, {
                 path = baseRoute,
-                routeType = 'default',
+                routeType = baseType == 'graph' and 'graph-default' or  'default',
                 length = ComputeRouteLength(baseRoute),
                 clearance = clearance,
                 flankAngle = RoutingGraph.MeasureTerminalFlank(baseRoute, target),
@@ -1885,7 +1941,7 @@ local function CollectRouteCandidates(layer, startPos, target, opts, area)
 
         for variantIndex = 1, variantLimit do
             local variantSpec = variants[variantIndex]
-            local variant = BuildRandomizedRouteVariant(layer, startPos, target, area, variantSpec)
+            local variant = BuildRandomizedRouteVariant(layer, startPos, target, area, variantSpec, opts)
             if variant and table.getn(variant) > 1 then
                 local clearance = MeasureRouteClearance(variant, layer)
                 if clearance then
@@ -2609,6 +2665,8 @@ local function BuildWaypointMetadata(platoon, route, destination, opts, layer, s
         routeCacheTag = opts and opts.RouteCacheTag or nil,
         randomizeRoute = opts and opts.RandomizeRoute and true or false,
         routeVariant = opts and opts.RouteVariant or 'default',
+        graphPolicyReason = opts and opts.GraphPolicyReason or nil,
+        useGraphRouting = opts and opts.UseGraphRouting and true or false,
         routeChain = opts and (opts.RouteChain or opts.Chain or opts.ChainName or opts.MarkerChain) or nil,
         startedOutsidePlayableArea = startedOutside and true or false,
         ingressEdge = ingressEdge,
@@ -2676,6 +2734,12 @@ local function SyncRouteOptions(route, opts)
     end
     if opts and opts.RouteVariant ~= nil then
         route.routeVariant = opts.RouteVariant
+    end
+    if opts and opts.GraphPolicyReason ~= nil then
+        route.graphPolicyReason = opts.GraphPolicyReason
+    end
+    if opts and opts.UseGraphRouting ~= nil then
+        route.useGraphRouting = opts.UseGraphRouting and true or false
     end
     if opts and (opts.RouteChain ~= nil or opts.Chain ~= nil or opts.ChainName ~= nil or opts.MarkerChain ~= nil) then
         route.routeChain = opts.RouteChain or opts.Chain or opts.ChainName or opts.MarkerChain
@@ -2793,6 +2857,9 @@ function BuildPlatoonRoute(platoon, destination, opts)
         return nil
     end
 
+    local useGraphRouting, graphPolicyReason = ShouldUseGraphRouting(platoon, opts)
+    EnsureMissionRoutingGraph(platoon, opts, area)
+
     local target = area and ctx.ClampToPlayableArea(destination, area, 0) or ctx.CopyVec(destination)
     ctx.SetPointSurface(target, layer)
 
@@ -2857,7 +2924,16 @@ function BuildPlatoonRoute(platoon, destination, opts)
     end
 
     ctx.RouteBuildSetStage(buildContext, 'candidate-generation')
-    local candidates = ctx.CollectRouteCandidates(layer, routingStart, target, opts, area)
+    local candidateOpts = {}
+    if type(opts) == 'table' then
+        for key, value in pairs(opts) do
+            candidateOpts[key] = value
+        end
+    end
+    candidateOpts.UseGraphRouting = useGraphRouting
+    candidateOpts.GraphPolicyReason = graphPolicyReason
+    candidateOpts.GraphConfig = ResolveGraphConfig(opts, platoon)
+    local candidates = ctx.CollectRouteCandidates(layer, routingStart, target, candidateOpts, area)
     local selected, debugSummary = ctx.SelectRouteCandidate(candidates, opts)
     if not (selected and selected.path) then
         ActiveRouteBuildContext = false
@@ -2942,6 +3018,33 @@ function BuildPlatoonRoute(platoon, destination, opts)
     return stored
 end
 
+local function SelectPartialReplanAnchor(platoon, stored)
+    if not (platoon and stored and stored.waypoints and table.getn(stored.waypoints) > 0) then
+        return nil, nil
+    end
+
+    local platoonPos = platoon.GetPlatoonPosition and platoon:GetPlatoonPosition()
+    if not platoonPos then
+        return nil, nil
+    end
+
+    local startIndex = math.max(1, stored.currentIndex or 1)
+    local bestIndex = nil
+    local bestDistanceSq = HugeNumber
+    for index = startIndex, math.min(table.getn(stored.waypoints), startIndex + 8) do
+        local waypoint = stored.waypoints[index]
+        if waypoint and waypoint.position and DistSq(platoonPos, waypoint.position) < bestDistanceSq then
+            bestDistanceSq = DistSq(platoonPos, waypoint.position)
+            bestIndex = index
+        end
+    end
+
+    if bestIndex and bestDistanceSq <= (36 * 36) then
+        return CopyVec(stored.waypoints[bestIndex].position), bestIndex
+    end
+    return nil, nil
+end
+
 function RebuildPlatoonRouteIfNeeded(platoon, destination, opts)
     if not platoon then
         return nil
@@ -2961,7 +3064,12 @@ function RebuildPlatoonRouteIfNeeded(platoon, destination, opts)
     end
 
     if opts and opts.ForceRepath then
-        return BuildPlatoonRoute(platoon, destination, opts)
+        local rebuiltOpts = RoutingUtils.CopyOptions(opts)
+        local anchor = stored and SelectPartialReplanAnchor(platoon, stored) or nil
+        if anchor then
+            rebuiltOpts.RouteStart = anchor
+        end
+        return BuildPlatoonRoute(platoon, destination, rebuiltOpts)
     end
 
     if not (stored and stored.destination and stored.waypoints and table.getn(stored.waypoints) > 0) then
@@ -3473,6 +3581,15 @@ function RecomputePathWithFallback(platoon, layer, destination, opts)
     return path
 end
 
+function InitializeRoutingSystem(opts)
+    MissionGraphInitialized = false
+    EnsureMissionRoutingGraph(nil, opts, GetPlayableArea())
+    return RoutingGraph.GetMetrics(GetPlayableArea())
+end
+
+function GetRoutingMetrics()
+    return RoutingGraph.GetMetrics(GetPlayableArea())
+end
 
 function BuildRoute(platoon, startPos, targetPos, opts)
     local buildOpts = {}
@@ -3569,6 +3686,8 @@ function MoveToNearestPlayableIngress(platoon, layer, area, formation, destinati
 end
 
 return {
+    InitializeRoutingSystem = InitializeRoutingSystem,
+    GetRoutingMetrics = GetRoutingMetrics,
     BuildRoute = BuildRoute,
     FollowRoute = FollowRoute,
     ShouldRepath = ShouldRepath,

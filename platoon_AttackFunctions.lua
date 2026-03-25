@@ -1677,6 +1677,8 @@ local function AttackTargetArea(platoon, target, opts)
         AssaultLeadDistance = opts.AssaultLeadDistance,
         RouteChain = opts.RouteChain or opts.MarkerChain or opts.Chain or opts.ChainName,
         RouteChains = opts.RouteChains or opts.MarkerChains or opts.ChainNames,
+        RouteMode = opts.RouteMode or 'AttackMove',
+        RoutePhase = 'TRANSIT',
     }
 
     local bombardRange = nil
