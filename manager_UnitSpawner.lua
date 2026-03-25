@@ -416,8 +416,13 @@ local function ApplyPlatoonMetadata(platoon, params, context)
     if params and params.spawnMarker ~= nil and platoonData.SpawnMarker == nil then
         platoonData.SpawnMarker = params.spawnMarker
     end
-    if spawnPos and platoonData.SpawnPosition == nil then
+    if spawnPos then
         platoonData.SpawnPosition = CopyPosition(spawnPos)
+        platoonData.StartPosition = CopyPosition(spawnPos)
+    end
+    platoonData.StartSource = platoonData.StartPositionSource
+    if params and params.startedOutsidePlayableArea ~= nil then
+        platoonData.StartedOutsidePlayableArea = params.startedOutsidePlayableArea and true or false
     end
     if attackData and platoonData.AttackData == nil then
         platoonData.AttackData = attackData
@@ -627,11 +632,11 @@ function Spawner:HandOffToAttack(platoon)
         return false
     end
 
-    ApplyPlatoonMetadata(platoon, self.params, {
+    local platoonData = ApplyPlatoonMetadata(platoon, self.params, {
         spawnPos = platoon and platoon._spawnerStartPosition,
     })
 
-    return LaunchAttackThread(platoon, attackFn, self.params.attackData, function(msg)
+    return LaunchAttackThread(platoon, attackFn, platoonData or self.params.attackData, function(msg)
         self:Warn(msg)
     end)
 end
