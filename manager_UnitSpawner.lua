@@ -33,30 +33,14 @@
 --     },
 --   }
 --
---   -- Manual platoon from an existing unit list ------------------------------
---   local platoon = SpawnMgr.StartManualPlatoon{
---     brain = ArmyBrains[ScenarioInfo.Cybran],
---     units = units,
---     formation = 'GrowthFormation',
---     attackFn = plaAtk.WaveAttack,
---     attackData = {
---         Type = 'cluster',
---         TargetArmy = {ScenarioInfo.Player1},
---         Formation = 'AttackFormation',
---         AggressiveMove = true,
---     },
---     routeSource = 'UnitSpawner', -- optional; default matches SpawnMgr.Start ingress/routing metadata',
---   }
---
---   -- Manual platoon from a one-off composition ------------------------------
---   local platoon = SpawnMgr.StartManualPlatoon{
+--   -- One-shot normal spawn (same spawn/handoff path as SpawnMgr.Start) -----
+--   local platoon = SpawnMgr.StartSinglePlatoon{
 --     brain = ArmyBrains[ScenarioInfo.Cybran],
 --     spawnMarker = 'AREA1_SPAWN_EAST_3',
 --     composition = {
 --         {'url0106', 6},
 --         {'url0107', 6},
 --     },
---     formation = 'GrowthFormation',
 --     attackFn = plaAtk.WaveAttack,
 --     attackData = {
 --         Type = 'cluster',
@@ -499,35 +483,6 @@ local function LaunchAttackThread(platoon, attackFn, attackData, warnFn)
     return true
 end
 
-local function BuildUnitsFromComposition(params, tag, spawnPos)
-    local brain = params and params.brain
-    if not (brain and spawnPos) then
-        return {}
-    end
-
-    local spawned = {}
-    local spread = math.max(0, params.spawnSpread or 0)
-    local difficulty = params.difficulty or 2
-    local composition = normalizeComposition(params.composition)
-
-    for _, entry in ipairs(composition) do
-        local count = ResolveEntryCount(entry, difficulty)
-        for _ = 1, count do
-            local ox = (spread > 0) and (Random() * 2 - 1) * spread or 0
-            local oz = (spread > 0) and (Random() * 2 - 1) * spread or 0
-            local unit = CreateUnitHPR(entry.blueprint, brain:GetArmyIndex(), spawnPos[1] + ox, spawnPos[2], spawnPos[3] + oz, 0, 0, 0)
-            if unit then
-                unit.us_tag = tag
-                table.insert(spawned, unit)
-            else
-                WARN(('[US:%s] StartManualPlatoon: failed to create unit bp=%s'):format(tag or '?', tostring(entry.blueprint)))
-            end
-        end
-    end
-
-    return spawned
-end
-
 -- ========== class ==========
 local Spawner = {}
 Spawner.__index = Spawner
@@ -667,14 +622,14 @@ function Spawner:HandOffToAttack(platoon)
     local attackFn = self.params.attackFn
     if not attackFn then
         self:Warn('No attackFn provided; spawned platoon will idle.')
-        return
+        return false
     end
 
     ApplyPlatoonMetadata(platoon, self.params, {
         spawnPos = platoon and platoon._spawnerStartPosition,
     })
 
-    LaunchAttackThread(platoon, attackFn, self.params.attackData, function(msg)
+    return LaunchAttackThread(platoon, attackFn, self.params.attackData, function(msg)
         self:Warn(msg)
     end)
 end
@@ -708,10 +663,10 @@ function Spawner:SpawnWave(waveNo, wanted)
         platoon._spawnerStartPosition = { pos[1], pos[2], pos[3] }
     end
 
-    self:HandOffToAttack(platoon)
+    local attackLaunched = self:HandOffToAttack(platoon)
 
     local unitCount = resolveUnitCount(spawned)
-    return platoon, spawned, unitCount, wanted
+    return platoon, spawned, unitCount, wanted, attackLaunched
 end
 
  function Spawner:WaitForLossGate(platoon, expectedCount)
@@ -895,27 +850,44 @@ end
         onMode2ThresholdMet = p.onMode2ThresholdMet,
         escalationPercent  = p.escalationPercent or 0,
         escalationFrequency= p.escalationFrequency or 0,
+        routeSource        = p.routeSource,
+        label              = p.label or p.platoonLabel,
+        startedOutsidePlayableArea = p.startedOutsidePlayableArea,
+        position           = p.position,
     }
 end
 
- -- ========== Public API ==========
- function Start(params)
-     assert(params and params.brain and params.spawnMarker, 'brain and spawnMarker are required')
-     local o = setmetatable({}, Spawner)
-     o.params      = normalizeParams(params)
-     o.brain       = o.params.brain
-     o.tag         = o.params.spawnerTag or ('US_'.. math.floor(100000 * Random()))
-     o.params.spawnerTag = o.tag
-     o.spawnPositions = resolveSpawnList(o.params.spawnMarker)
-     if table.getn(o.spawnPositions) == 0 then
-         error('Invalid spawnMarker: '.. tostring(o.params.spawnMarker))
-     end
+local function BuildSpawner(params, tagPrefix)
+    local o = setmetatable({}, Spawner)
+    o.params      = normalizeParams(params)
+    o.brain       = o.params.brain
+    o.tag         = o.params.spawnerTag or ((tagPrefix or 'US_') .. math.floor(100000 * Random()))
+    o.params.spawnerTag = o.tag
+    o.spawnPositions = resolveSpawnList(o.params.spawnMarker)
+    if table.getn(o.spawnPositions) == 0 then
+        error('Invalid spawnMarker: '.. tostring(o.params.spawnMarker))
+    end
     o.lastSpawnIndex = 0
     o.stopped     = false
     o.wave        = 0
     o.composition = o.params.composition
     o.baseWanted  = o:BuildWantedForWave(1)
     o.callbacks   = {}
+    return o
+end
+
+local function SumWantedUnits(wanted)
+    local total = 0
+    for _, count in pairs(wanted or {}) do
+        total = total + (count or 0)
+    end
+    return total
+end
+
+ -- ========== Public API ==========
+ function Start(params)
+     assert(params and params.brain and params.spawnMarker, 'brain and spawnMarker are required')
+    local o = BuildSpawner(params, 'US_')
     o:RegisterInitialCallbacks()
     o:DebugEscalation()
     o:Start()
@@ -926,65 +898,40 @@ function Stop(handle)
      if handle and handle.Stop then handle:Stop() end
  end
 
--- Supported manual entry path for prebuilt units or one-off composition spawns.
-function StartManualPlatoon(params)
-    assert(params and params.brain, 'brain is required')
-    assert(params.units or params.composition, 'units or composition are required')
+function StartSinglePlatoon(params)
+    assert(params and params.brain and params.spawnMarker, 'brain and spawnMarker are required')
+    assert(params.composition, 'composition is required')
 
-    local normalized = normalizeParams(params)
-    local tag = normalized.spawnerTag or ('USM_' .. math.floor(100000 * Random()))
-    normalized.spawnerTag = tag
-    normalized.routeSource = params.routeSource or 'UnitSpawner'
-    normalized.label = params.label or params.platoonLabel or tag or 'ManualPlatoon'
-    normalized.startedOutsidePlayableArea = params.startedOutsidePlayableArea
-    normalized.spawnMarker = params.spawnMarker
-    normalized.position = params.position
-    normalized.spawnSpread = (params.spawnSpread ~= nil) and params.spawnSpread or 0
+    local spawner = BuildSpawner(params, 'US1_')
+    local waveNo = 1
+    local wanted = spawner:BuildWantedForWave(waveNo)
+    local requested = SumWantedUnits(wanted)
 
-    local spawnPos = markerPos(params.position) or markerPos(params.spawnMarker)
-    local startPosSource = nil
-    if markerPos(params.position) then
-        startPosSource = 'position'
-    elseif markerPos(params.spawnMarker) then
-        startPosSource = 'spawnMarker'
-    end
-
-    local units = params.units or {}
-    if params.composition then
-        assert(spawnPos, 'spawnMarker or position is required when composition is provided')
-        units = BuildUnitsFromComposition(normalized, tag, spawnPos)
-    end
-
-    local platoon = normalized.brain:MakePlatoon(normalized.label, '')
-    if units and table.getn(units) > 0 then
-        normalized.brain:AssignUnitsToPlatoon(platoon, units, 'Attack', normalized.formation or 'GrowthFormation')
-    end
-
-    if spawnPos then
-        platoon._spawnerStartPosition = CopyPosition(spawnPos)
-    end
-
-    ApplyPlatoonMetadata(platoon, normalized, {
-        spawnPos = spawnPos,
-        startPosSource = startPosSource,
-    })
-
-    if normalized.attackFn then
-        LaunchAttackThread(platoon, normalized.attackFn, normalized.attackData, function(msg)
-            WARN(('[US:%s] %s'):format(tag, msg))
-        end)
-    end
+    spawner:Log(('StartSinglePlatoon begin marker=%s tag=%s'):format(tostring(spawner.params.spawnMarker), tostring(spawner.tag)))
+    local platoon, units, unitCount, usedWanted, attackLaunched = spawner:SpawnWave(waveNo, wanted)
+    local spawnPos = platoon and platoon._spawnerStartPosition
+    local selectedIndex = spawner.lastSpawnIndex or 0
+    spawner:Log(('StartSinglePlatoon spawn markerIndex=%s position=%s'):format(
+        tostring(selectedIndex),
+        spawnPos and ('(%.2f, %.2f, %.2f)'):format(spawnPos[1] or 0, spawnPos[2] or 0, spawnPos[3] or 0) or 'nil'
+    ))
+    spawner:Log(('StartSinglePlatoon units requested=%d created=%d label=%s'):format(
+        requested,
+        unitCount or 0,
+        tostring((platoon and platoon.PlatoonData and platoon.PlatoonData.PlatoonLabel) or (spawner.tag .. '_Wave_1'))
+    ))
+    spawner:Log(('StartSinglePlatoon attackLaunched=%s'):format(tostring(attackLaunched and true or false)))
 
     return platoon
 end
 
 function LaunchPlatoon(params)
-    return StartManualPlatoon(params)
+    return StartSinglePlatoon(params)
 end
 
 return {
     Start = Start,
     Stop = Stop,
-    StartManualPlatoon = StartManualPlatoon,
+    StartSinglePlatoon = StartSinglePlatoon,
     LaunchPlatoon = LaunchPlatoon,
 }
