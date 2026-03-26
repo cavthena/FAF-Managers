@@ -768,12 +768,33 @@ end
 
 local function EnsureMissionRoutingGraph(platoon, opts, area)
     if MissionGraphInitialized and not (opts and opts.ForceGraphRebuild) then
+        if opts and opts.Debug and LOG then
+            local cfg = ResolveGraphConfig(opts, platoon)
+            LOG(('[PlatoonRouting] GraphInit skipped (already initialized) requestedResolution=%s requestedHard=%s requestedSoft=%s forceRebuild=%s'):format(
+                tostring(cfg and cfg.resolution),
+                tostring(cfg and cfg.inflationHardBlock),
+                tostring(cfg and cfg.inflationSoftPenalty),
+                tostring(opts and opts.ForceGraphRebuild and true or false)
+            ))
+        end
         return
     end
 
     local graphConfig = ResolveGraphConfig(opts, platoon)
     RoutingGraph.InitializeMissionGraph(area or GetPlayableArea(), graphConfig)
     MissionGraphInitialized = true
+    if opts and opts.Debug and LOG then
+        local metrics = RoutingGraph.GetMetrics(area or GetPlayableArea()) or {}
+        LOG(('[PlatoonRouting] GraphInit applied resolution=%s hard=%s soft=%s nodes=%s buildSeconds=%s componentsLand=%s componentsSea=%s'):format(
+            tostring(graphConfig and graphConfig.resolution),
+            tostring(graphConfig and graphConfig.inflationHardBlock),
+            tostring(graphConfig and graphConfig.inflationSoftPenalty),
+            tostring(metrics and metrics.nodeCount or false),
+            tostring(metrics and metrics.buildSeconds or false),
+            tostring(metrics and metrics.componentCounts and metrics.componentCounts.LAND or false),
+            tostring(metrics and metrics.componentCounts and metrics.componentCounts.SEA or false)
+        ))
+    end
 end
 
 local function PositionInPlayableArea(pos, area)
@@ -2859,6 +2880,16 @@ function BuildPlatoonRoute(platoon, destination, opts)
 
     local useGraphRouting, graphPolicyReason = ShouldUseGraphRouting(platoon, opts)
     EnsureMissionRoutingGraph(platoon, opts, area)
+    if opts and opts.Debug then
+        local chainRequest = opts.RouteChain or opts.Chain or opts.ChainName or opts.MarkerChain
+        if LOG then
+            LOG(('[PlatoonRouting] policy useGraphRouting=%s reason=%s routeChainRequest=%s'):format(
+                tostring(useGraphRouting and true or false),
+                tostring(graphPolicyReason or 'unknown'),
+                tostring(chainRequest or false)
+            ))
+        end
+    end
 
     local target = area and ctx.ClampToPlayableArea(destination, area, 0) or ctx.CopyVec(destination)
     ctx.SetPointSurface(target, layer)
@@ -3011,6 +3042,12 @@ function BuildPlatoonRoute(platoon, destination, opts)
     stored.debugSummary = debugSummary
     stored.routeCacheKey = cacheKey
     stored.routeChainUsed = appliedChainName
+    if opts and opts.Debug then
+        ctx.RouteBuildLog(buildContext, ('route-chain-summary requested=%s used=%s'):format(
+            tostring((opts.RouteChain or opts.Chain or opts.ChainName or opts.MarkerChain) or false),
+            tostring(appliedChainName or false)
+        ))
+    end
     SyncRouteOptions(stored, buildOpts)
     platoon._storedRoute = stored
     ctx.SaveRouteTemplate(cacheKey, stored)
@@ -3591,6 +3628,31 @@ function GetRoutingMetrics()
     return RoutingGraph.GetMetrics(GetPlayableArea())
 end
 
+local function GetPlatoonRouteValidity(platoon)
+    if not platoon then
+        return false, 'platoon=nil', 0, false
+    end
+
+    local brain = platoon.GetBrain and platoon:GetBrain() or nil
+    if not brain then
+        return false, 'brain=nil', 0, false
+    end
+
+    local exists = brain.PlatoonExists and brain:PlatoonExists(platoon) or false
+    local units = platoon.GetPlatoonUnits and platoon:GetPlatoonUnits() or {}
+    local unitCount = table.getn(units or {})
+    local valid = exists and unitCount > 0
+
+    if not exists then
+        return false, 'platoon-missing', unitCount, false
+    end
+    if unitCount <= 0 then
+        return false, 'no-units', 0, true
+    end
+
+    return valid, 'ok', unitCount, true
+end
+
 function BuildRoute(platoon, startPos, targetPos, opts)
     local buildOpts = {}
     if type(opts) == 'table' then
@@ -3602,9 +3664,31 @@ function BuildRoute(platoon, startPos, targetPos, opts)
         buildOpts.RouteStart = CopyVec(startPos)
     end
     if buildOpts.Debug and LOG then
-        LOG(('[PlatoonRouting] BuildRoute routeStart=%s'):format(FormatRoutePosition(buildOpts.RouteStart)))
+        local valid, reason, unitCount, exists = GetPlatoonRouteValidity(platoon)
+        local graphCfg = ResolveGraphConfig(buildOpts, platoon)
+        LOG(('[PlatoonRouting] BuildRoute routeStart=%s target=%s platoonValid=%s reason=%s platoonExists=%s unitCount=%d graphResolution=%s graphInflationHard=%s graphInflationSoft=%s'):format(
+            FormatRoutePosition(buildOpts.RouteStart),
+            FormatRoutePosition(targetPos),
+            tostring(valid),
+            tostring(reason),
+            tostring(exists),
+            unitCount or 0,
+            tostring(graphCfg and graphCfg.resolution),
+            tostring(graphCfg and graphCfg.inflationHardBlock),
+            tostring(graphCfg and graphCfg.inflationSoftPenalty)
+        ))
     end
-    return BuildPlatoonRoute(platoon, targetPos, buildOpts)
+    local route = BuildPlatoonRoute(platoon, targetPos, buildOpts)
+    if buildOpts.Debug and LOG then
+        LOG(('[PlatoonRouting] BuildRoute result routeBuilt=%s routeType=%s graphUsed=%s chainUsed=%s waypoints=%d'):format(
+            tostring(route and true or false),
+            tostring(route and route.routeType or false),
+            tostring(route and route.graphUsed and true or false),
+            tostring(route and route.routeChainUsed or false),
+            route and table.getn(route.waypoints or {}) or 0
+        ))
+    end
+    return route
 end
 
 function FollowRoute(platoon, route, opts)

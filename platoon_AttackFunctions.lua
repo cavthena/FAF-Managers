@@ -1286,6 +1286,10 @@ local function ChooseBestArea(brain, platoon, opts, layer, areaRadius, mode, cat
     local enemies = BrainEnemies(brain, opts.TargetArmy)
     local bestScore = -1e9
     local best = nil
+    local candidateCount = table.getn(candidates or {})
+    local candidatesWithTargets = 0
+    local rejectedByPathing = 0
+    local acceptedCandidates = 0
 
     for _, entry in ipairs(candidates) do
         local pos = entry.pos
@@ -1293,14 +1297,17 @@ local function ChooseBestArea(brain, platoon, opts, layer, areaRadius, mode, cat
             local units = AreaUnits(brain, enemies, pos, areaRadius, category, opts.IntelOnly)
             units = FilterUnits(units, layer, opts.Submersible)
             if table.getn(units) > 0 then
+                candidatesWithTargets = candidatesWithTargets + 1
                 if not opts.Transport and not CanPathTo(platoon, layer, pos) then
                     -- Skip unreachable areas so wave attacks don't repeatedly
                     -- retarget locations they cannot move toward.
+                    rejectedByPathing = rejectedByPathing + 1
                     units = {}
                 end
             end
 
             if table.getn(units) > 0 then
+                acceptedCandidates = acceptedCandidates + 1
                 local distance = Distance(startPos, pos)
                 local score = ScoreStructureCluster(units, mode, distance)
                 if opts.AvoidDef then
@@ -1318,6 +1325,19 @@ local function ChooseBestArea(brain, platoon, opts, layer, areaRadius, mode, cat
             end
         end
     end
+
+    DebugAttackRoute(opts, ('resolver-summary mode=%s layer=%s start=(%.2f, %.2f, %.2f) candidates=%d withTargets=%d pathRejected=%d accepted=%d bestScore=%s'):format(
+        tostring(mode or 'unknown'),
+        tostring(layer or 'unknown'),
+        startPos[1] or 0,
+        startPos[2] or 0,
+        startPos[3] or 0,
+        candidateCount,
+        candidatesWithTargets,
+        rejectedByPathing,
+        acceptedCandidates,
+        tostring(best and best.score or false)
+    ))
 
     return best
 end
@@ -1691,6 +1711,10 @@ local function AttackTargetArea(platoon, target, opts)
 
     local route = Routing.BuildRoute(platoon, startPos, targetPos, routeOpts)
     local canPath = route and true or CanPathTo(platoon, layer, targetPos)
+    DebugAttackRoute(opts, ('route-eval routeBuilt=%s canPathToTarget=%s'):format(
+        tostring(route and true or false),
+        tostring(canPath and true or false)
+    ))
     if not canPath then
         if opts.Transport then
             if not TransportAndMove(platoon, targetPos, opts) then
@@ -1703,8 +1727,22 @@ local function AttackTargetArea(platoon, target, opts)
     end
 
     if not route then
+        local metrics = (Routing and Routing.GetRoutingMetrics and Routing.GetRoutingMetrics()) or nil
+        DebugAttackRoute(opts, ('route-selected=false repath=true metrics={queries=%s astar=%s fallback=%s disconnected=%s}'):format(
+            tostring(metrics and metrics.routeQueries or false),
+            tostring(metrics and metrics.astarSearches or false),
+            tostring(metrics and metrics.fallbackPathTo or false),
+            tostring(metrics and metrics.disconnectedFastFails or false)
+        ))
         return 'repath'
     end
+
+    DebugAttackRoute(opts, ('route-selected type=%s chainUsed=%s graphUsed=%s waypointCount=%d'):format(
+        tostring(route.routeType or 'unknown'),
+        tostring(route.routeChainUsed or false),
+        tostring(route.graphUsed and true or false),
+        table.getn(route.waypoints or {})
+    ))
 
     local routeStatus = nil
     if bombardRange then
@@ -1831,6 +1869,12 @@ local function WaitForTargets(brain, delay)
     SafeWait(delay or RecheckDelay)
 end
 
+local function DebugAttackRoute(opts, message)
+    if opts and opts.Debug and LOG then
+        LOG(('[AttackRouting] %s'):format(tostring(message or '')))
+    end
+end
+
 local function AttackLoop(platoon, resolver, opts)
     local brain = platoon:GetBrain()
     if not brain then return end
@@ -1841,6 +1885,17 @@ local function AttackLoop(platoon, resolver, opts)
     while PlatoonAlive(platoon) do
         if not currentTarget then
             currentTarget = resolver(brain, platoon, opts, layer)
+            if currentTarget then
+                local pos = currentTarget.position
+                DebugAttackRoute(opts, ('target-found=true position=(%.2f, %.2f, %.2f) score=%s'):format(
+                    pos and pos[1] or 0,
+                    pos and pos[2] or 0,
+                    pos and pos[3] or 0,
+                    tostring(currentTarget.score)
+                ))
+            else
+                DebugAttackRoute(opts, 'target-found=false (resolver returned nil)')
+            end
             if not currentTarget then
                 WaitForTargets(brain, RecheckDelay)
             end
