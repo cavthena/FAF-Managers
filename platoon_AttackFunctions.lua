@@ -594,9 +594,10 @@ local function CopyOptions(data)
     if opts.DisableIngress ~= nil then
         opts.DisableIngress = opts.DisableIngress and true or false
     end
-    if opts.Debug ~= nil then
-        opts.Debug = opts.Debug and true or false
+    if opts.Debug == nil and opts.debug ~= nil then
+        opts.Debug = opts.debug
     end
+    opts.Debug = (opts.Debug == true)
     opts.Formation   = ValidateFormation(opts.Formation)
     return opts
 end
@@ -1276,6 +1277,7 @@ local function LeastDefendedStructures(brain, layer, structures)
 end
 
 local CanPathTo
+local DebugAttackRoute
 
 local function ChooseBestArea(brain, platoon, opts, layer, areaRadius, mode, category)
     local startPos = GetPlatoonPosition(platoon)
@@ -1869,7 +1871,7 @@ local function WaitForTargets(brain, delay)
     SafeWait(delay or RecheckDelay)
 end
 
-local function DebugAttackRoute(opts, message)
+DebugAttackRoute = function(opts, message)
     if opts and opts.Debug and LOG then
         LOG(('[AttackRouting] %s'):format(tostring(message or '')))
     end
