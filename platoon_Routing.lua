@@ -896,6 +896,22 @@ local function ResolveRouteChainNames(platoon, opts)
     addValue(platoonData and (platoonData.ChainNames or platoonData.ChainName))
     addValue(platoonData and platoonData.Chain)
 
+    if table.getn(names) == 0 then
+        local function addFromChainTable(chains)
+            if type(chains) ~= 'table' then
+                return
+            end
+            for chainName, _ in pairs(chains) do
+                addName(chainName)
+            end
+        end
+
+        addFromChainTable(Scenario and Scenario.MasterChain)
+        addFromChainTable(Scenario and Scenario.Chains)
+        addFromChainTable(ScenarioInfo and ScenarioInfo.MasterChain)
+        addFromChainTable(ScenarioInfo and ScenarioInfo.Chains)
+    end
+
     return names
 end
 
@@ -1636,6 +1652,68 @@ local function BuildMarkerChainTransitSegment(layer, fromPos, toPos, chainName)
     end
 
     return route
+end
+
+local function BuildRouteFromMarkerChain(layer, startPos, target, chainName)
+    if not (layer and startPos and target and chainName) then
+        return nil
+    end
+
+    local chainPoints = ResolveMarkerChainPoints(chainName, layer)
+    if table.getn(chainPoints or {}) == 0 then
+        return nil
+    end
+
+    local route = { CopyVec(startPos) }
+    local first = chainPoints[1]
+    local joinIn = BuildMarkerChainTransitSegment(layer, startPos, first, chainName)
+    if not joinIn then
+        return nil
+    end
+    AppendRouteSegment(route, joinIn)
+
+    local previous = first
+    for index = 2, table.getn(chainPoints) do
+        local nextPoint = chainPoints[index]
+        local transitSegment = BuildMarkerChainTransitSegment(layer, previous, nextPoint, chainName)
+        if not transitSegment then
+            return nil
+        end
+        AppendRouteSegment(route, transitSegment)
+        previous = nextPoint
+        MaybeYieldRouteBuild('chain-route-build')
+    end
+
+    local joinOut = BuildMarkerChainTransitSegment(layer, previous, target, chainName)
+    if not joinOut then
+        return nil
+    end
+    AppendRouteSegment(route, joinOut)
+    return RemoveDuplicateRoutePoints(route, 2)
+end
+
+local function CollectMarkerChainCandidates(layer, startPos, target, chainNames)
+    local candidates = {}
+    for _, chainName in ipairs(chainNames or {}) do
+        local route = BuildRouteFromMarkerChain(layer, startPos, target, tostring(chainName))
+        if route and table.getn(route) > 1 then
+            table.insert(candidates, {
+                path = route,
+                routeType = 'chain-' .. tostring(chainName),
+                length = ComputeRouteLength(route),
+                clearance = {
+                    minimum = RouteMinimumBalancedClearance,
+                    average = RouteMinimumBalancedClearance,
+                    centeredness = 0,
+                },
+                flankAngle = RoutingGraph.MeasureTerminalFlank(route, target),
+                target = target,
+                chainName = tostring(chainName),
+            })
+        end
+    end
+
+    return candidates
 end
 
 local function FindMarkerChainWindow(route, chainPoints)
@@ -2844,6 +2922,7 @@ local BuildPlatoonRouteContext = {
     RouteBuildSetStage = RouteBuildSetStage,
     BuildCardinalIngress = BuildCardinalIngress,
     CollectRouteCandidates = CollectRouteCandidates,
+    CollectMarkerChainCandidates = CollectMarkerChainCandidates,
     SelectRouteCandidate = SelectRouteCandidate,
     MaybeYieldRouteBuild = MaybeYieldRouteBuild,
     RemoveDuplicateRoutePoints = RemoveDuplicateRoutePoints,
@@ -2964,7 +3043,15 @@ function BuildPlatoonRoute(platoon, destination, opts)
     candidateOpts.UseGraphRouting = useGraphRouting
     candidateOpts.GraphPolicyReason = graphPolicyReason
     candidateOpts.GraphConfig = ResolveGraphConfig(opts, platoon)
+    local chainNames = ctx.ResolveRouteChainNames(platoon, opts)
     local candidates = ctx.CollectRouteCandidates(layer, routingStart, target, candidateOpts, area)
+    if not candidates and table.getn(chainNames) > 0 then
+        candidates = ctx.CollectMarkerChainCandidates(layer, routingStart, target, chainNames)
+        if candidates and table.getn(candidates) > 0 then
+            candidates = RoutingGraph.ScoreCandidates(candidates)
+            ctx.RouteBuildLog(buildContext, ('candidate-generation fallback=marker-chain chainCandidates=%d'):format(table.getn(candidates)))
+        end
+    end
     local selected, debugSummary = ctx.SelectRouteCandidate(candidates, opts)
     if not (selected and selected.path) then
         ActiveRouteBuildContext = false
@@ -2987,8 +3074,7 @@ function BuildPlatoonRoute(platoon, destination, opts)
     ctx.RouteBuildSetStage(buildContext, 'route-shaping')
     route = ctx.RemoveDuplicateRoutePoints(route, 2)
     route = ctx.RemoveRouteDoubleBack(route)
-    local appliedChainName = nil
-    local chainNames = ctx.ResolveRouteChainNames(platoon, opts)
+    local appliedChainName = selected.chainName or nil
     if table.getn(chainNames) > 0 then
         route, appliedChainName = ctx.ApplyMarkerChainGuidance(route, layer, chainNames)
     end
@@ -3624,6 +3710,10 @@ function InitializeRoutingSystem(opts)
     return RoutingGraph.GetMetrics(GetPlayableArea())
 end
 
+function PrimeRoutingGraph(opts)
+    return InitializeRoutingSystem(opts)
+end
+
 function GetRoutingMetrics()
     return RoutingGraph.GetMetrics(GetPlayableArea())
 end
@@ -3771,6 +3861,7 @@ end
 
 return {
     InitializeRoutingSystem = InitializeRoutingSystem,
+    PrimeRoutingGraph = PrimeRoutingGraph,
     GetRoutingMetrics = GetRoutingMetrics,
     BuildRoute = BuildRoute,
     FollowRoute = FollowRoute,

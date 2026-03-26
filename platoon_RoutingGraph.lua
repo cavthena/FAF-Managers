@@ -168,6 +168,30 @@ local Directions = {
 local RandomizedRouteLengthSlack = 1.55
 local GraphCache = false
 
+local function ResolveConfig(opts)
+    local cfg = {}
+    for k, v in pairs(BaseConfig) do
+        cfg[k] = v
+    end
+    for k, v in pairs(opts or {}) do
+        cfg[k] = v
+    end
+    return cfg
+end
+
+local function ConfigMatches(existing, requested)
+    if not (existing and requested) then
+        return false
+    end
+
+    return existing.resolution == requested.resolution
+        and existing.obstacleProbeDistance == requested.obstacleProbeDistance
+        and existing.obstacleProbeStep == requested.obstacleProbeStep
+        and existing.inflationHardBlock == requested.inflationHardBlock
+        and existing.inflationSoftPenalty == requested.inflationSoftPenalty
+        and existing.diagonalCost == requested.diagonalCost
+end
+
 local function ResolveMapKey(area)
     local mapName = ScenarioInfo and (ScenarioInfo.name or ScenarioInfo.map or ScenarioInfo.MapName) or 'unknown-map'
     if area then
@@ -333,13 +357,7 @@ local function LabelComponents(graph, domain)
 end
 
 local function BuildMissionGraph(area, opts)
-    local cfg = {}
-    for k, v in pairs(BaseConfig) do
-        cfg[k] = v
-    end
-    for k, v in pairs(opts or {}) do
-        cfg[k] = v
-    end
+    local cfg = ResolveConfig(opts)
 
     local playable = GetPlayableArea(area)
     local nodes, indexByGrid, width, height = BuildNodes(playable, cfg)
@@ -408,7 +426,11 @@ end
 
 local function EnsureScenarioGraph(area, opts)
     local key = ResolveMapKey(GetPlayableArea(area))
-    if not GraphCache or GraphCache.key ~= key then
+    local requestedConfig = ResolveConfig(opts)
+    if not GraphCache
+        or GraphCache.key ~= key
+        or not ConfigMatches(GraphCache.config, requestedConfig)
+    then
         GraphCache = BuildMissionGraph(area, opts)
     end
     return GraphCache
