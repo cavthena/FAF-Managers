@@ -785,11 +785,14 @@ local function EnsureMissionRoutingGraph(platoon, opts, area)
     MissionGraphInitialized = true
     if opts and opts.Debug and LOG then
         local metrics = RoutingGraph.GetMetrics(area or GetPlayableArea()) or {}
-        LOG(('[PlatoonRouting] GraphInit applied resolution=%s hard=%s soft=%s nodes=%s buildSeconds=%s componentsLand=%s componentsSea=%s'):format(
+        LOG(('[PlatoonRouting] GraphInit applied resolution=%s hard=%s soft=%s totalNodes=%s validLand=%s validSea=%s validAir=%s buildSeconds=%s componentsLand=%s componentsSea=%s'):format(
             tostring(graphConfig and graphConfig.resolution),
             tostring(graphConfig and graphConfig.inflationHardBlock),
             tostring(graphConfig and graphConfig.inflationSoftPenalty),
             tostring(metrics and metrics.nodeCount or false),
+            tostring(metrics and metrics.validNodeCounts and metrics.validNodeCounts.LAND or false),
+            tostring(metrics and metrics.validNodeCounts and metrics.validNodeCounts.SEA or false),
+            tostring(metrics and metrics.validNodeCounts and metrics.validNodeCounts.AIR or false),
             tostring(metrics and metrics.buildSeconds or false),
             tostring(metrics and metrics.componentCounts and metrics.componentCounts.LAND or false),
             tostring(metrics and metrics.componentCounts and metrics.componentCounts.SEA or false)

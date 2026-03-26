@@ -373,6 +373,7 @@ local function BuildMissionGraph(area, opts)
         indexByGrid = indexByGrid,
         metrics = {
             buildSeconds = 0,
+            nodeCount = table.getn(nodes or {}),
             routeQueries = 0,
             directShortcuts = 0,
             astarSearches = 0,
@@ -382,6 +383,7 @@ local function BuildMissionGraph(area, opts)
             routeBuildSecondsTotal = 0,
             routeBuildTimes = {},
             componentCounts = { LAND = 0, SEA = 0, AIR = 1 },
+            validNodeCounts = { LAND = 0, SEA = 0, AIR = 0 },
         },
         variantSpecs = {
             { routeType = 'left-wide', sideSign = -1, lateralScale = 0.30, fractions = { { 0.22, 0.65 }, { 0.48, 1.0 }, { 0.74, 0.85 } }, approachOffset = 0.95, approachBackoff = 0.20, maxOffset = 96, bias = 'wide-flank' },
@@ -396,6 +398,7 @@ local function BuildMissionGraph(area, opts)
     for _, node in ipairs(graph.nodes) do
         node.reachability.LAND = PointPassable(Domains.LAND, node.position)
         node.reachability.SEA = PointPassable(Domains.SEA, node.position)
+        node.reachability.AIR = PointPassable(Domains.AIR, node.position)
         node.clearance.LAND = ProbeClearance(Domains.LAND, node, cfg)
         node.clearance.SEA = ProbeClearance(Domains.SEA, node, cfg)
 
@@ -413,6 +416,16 @@ local function BuildMissionGraph(area, opts)
             elseif node.clearance.SEA < cfg.inflationSoftPenalty then
                 node.penalty.SEA = (cfg.inflationSoftPenalty - node.clearance.SEA) * 3
             end
+        end
+
+        if node.reachability.LAND then
+            graph.metrics.validNodeCounts.LAND = graph.metrics.validNodeCounts.LAND + 1
+        end
+        if node.reachability.SEA then
+            graph.metrics.validNodeCounts.SEA = graph.metrics.validNodeCounts.SEA + 1
+        end
+        if node.reachability.AIR then
+            graph.metrics.validNodeCounts.AIR = graph.metrics.validNodeCounts.AIR + 1
         end
     end
 
