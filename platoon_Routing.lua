@@ -1,17 +1,194 @@
 local NavUtils = import('/lua/sim/NavUtils.lua')
+local ScenarioUtils = import('/lua/sim/ScenarioUtilities.lua')
+
+local function ImportFirstAvailable(paths)
+    for _, path in ipairs(paths or {}) do
+        if type(path) == 'string' and path ~= '' then
+            local okImport, mod = pcall(import, path)
+            if okImport and mod then
+                return mod
+            end
+        end
+    end
+    return nil
+end
+
+local function AppendCaseVariants(paths, path)
+    if type(path) ~= 'string' or path == '' then
+        return
+    end
+
+    table.insert(paths, path)
+
+    local lower = string.lower(path)
+    if lower ~= path then
+        table.insert(paths, lower)
+    end
+end
+
+local function ResolveSiblingModule(fileName, fallbackPath)
+    local candidates = {}
+
+    local ok, info = pcall(debug.getinfo, 1, 'S')
+    if ok and info and info.source then
+        local src = info.source
+        if type(src) == 'string' and string.sub(src, 1, 1) == '@' then
+            local dir = string.match(src, '^@(.*/)[^/]*$')
+            if dir then
+                AppendCaseVariants(candidates, dir .. fileName)
+            end
+        end
+    end
+
+    if ScenarioInfo and ScenarioInfo.MapPath then
+        local mp = ScenarioInfo.MapPath
+        if type(mp) == 'string' then
+            local dir = string.match(mp, '^(.-)/[^/]*$') or mp
+            if dir then
+                if string.sub(dir, 1, 1) ~= '/' then
+                    dir = '/' .. dir
+                end
+                AppendCaseVariants(candidates, dir .. '/' .. fileName)
+            end
+        end
+    end
+
+    AppendCaseVariants(candidates, fallbackPath)
+
+    local mod = ImportFirstAvailable(candidates)
+    if mod then
+        return mod
+    end
+
+    return import(fallbackPath)
+end
+
+local RoutingUtils = ResolveSiblingModule('platoon_RoutingUtils.lua', '/maps/faf_coop_U01.v0001/platoon_RoutingUtils.lua')
+local RoutingGraph = ResolveSiblingModule('platoon_RoutingGraph.lua', '/maps/faf_coop_U01.v0001/platoon_RoutingGraph.lua')
 
 local SegmentPassable
+local SetPointSurface
+local SegmentPassableStrict
 local RouteStamp = 0
+local SavedRouteCache = false
 
-local DirectClearance = 6
-local SimplifyClearance = 5
-local CornerAngleThreshold = 28
-local WideCornerAngleThreshold = 55
-local CornerSampleDistance = 18
+local DirectClearance = 9
+local SimplifyClearance = 8
+local RoutePreferredClearance = 11
+local RouteMinimumBalancedClearance = 4
+local SegmentTraversalSampleStep = 3.5
+local SegmentTraversalOffsetStep = 0.45
+local SegmentTraversalMaxOffsetFraction = 0.7
+local SegmentLengthClearanceScale = 0.08
+local SegmentLengthClearanceMaxBonus = 9
+local CorridorBalanceProbeDistance = 26
+local CorridorBalanceStep = 1.5
 local SegmentReachDistanceSq = 36
 local ContinuousReachDistanceSq = 64
 local ContinuousQueueDistanceSq = 196
-local FinalAttackDistanceSq = 40 * 40
+local RouteCachePositionQuantization = 8
+local ChainGuidanceActivationDistance = 28
+local HugeNumber = math.huge or 1e9
+local DefaultAssaultRadius = 40
+local DefaultStagingRadius = 72
+local DefaultAssaultLeadDistance = 24
+local RouteBuildYieldInterval = 18
+local StrictSegmentSampleStep = 1.25
+local StrictSegmentRepairMaxDepth = 6
+local DefaultGraphResolution = 32
+local DefaultGraphHardInflation = 2.5
+local DefaultGraphSoftInflation = 8
+
+local CohesionMainBodyRadiusSq = 30 * 30
+local CohesionStragglerDistanceSq = 54 * 54
+local CohesionWorstOutlierDistanceSq = 62 * 62
+local CohesionReformOutlierRatio = 0.40
+local CohesionReformMinMissingUnits = 2
+local PlatoonTraversalQueueWindow = 3
+local RouteStuckTimeout = 10
+local ActiveRouteBuildContext = false
+local MissionGraphInitialized = false
+
+local function RouteBuildClock()
+    return GetGameTimeSeconds()
+end
+
+local function RouteBuildDebugEnabled(context)
+    return context and context.debugEnabled and LOG
+end
+
+local function RouteBuildLog(context, message)
+    if RouteBuildDebugEnabled(context) then
+        LOG(('[PlatoonRouting] %s'):format(message))
+    end
+end
+
+local function CreateRouteBuildContext(opts)
+    return {
+        debugEnabled = opts and opts.Debug and true or false,
+        startedAt = RouteBuildClock(),
+        stageStartedAt = RouteBuildClock(),
+        stageName = 'init',
+        stageTimings = {},
+        yieldCount = 0,
+        yieldReasons = {},
+        iterationBudget = 0,
+        repairedAfterShaping = false,
+        strictFailures = {},
+    }
+end
+
+local function RouteBuildSetStage(context, stageName)
+    if not context then
+        return
+    end
+
+    local now = RouteBuildClock()
+    local previous = context.stageName
+    if previous then
+        context.stageTimings[previous] = (context.stageTimings[previous] or 0) + (now - (context.stageStartedAt or now))
+    end
+
+    context.stageName = stageName
+    context.stageStartedAt = now
+end
+
+local function FinalizeRouteBuildContext(context)
+    if not context then
+        return nil
+    end
+
+    RouteBuildSetStage(context, 'complete')
+    context.totalTime = RouteBuildClock() - (context.startedAt or RouteBuildClock())
+    return context
+end
+
+local function MaybeYieldRouteBuild(reason)
+    local context = ActiveRouteBuildContext
+    if not context then
+        return false
+    end
+
+    context.iterationBudget = (context.iterationBudget or 0) + 1
+    if context.iterationBudget < RouteBuildYieldInterval then
+        return false
+    end
+    context.iterationBudget = 0
+
+    if not (WaitTicks and coroutine and coroutine.running and coroutine.running()) then
+        return false
+    end
+
+    context.yieldCount = (context.yieldCount or 0) + 1
+    if reason then
+        context.yieldReasons[reason] = (context.yieldReasons[reason] or 0) + 1
+    end
+
+    -- Route building can run inside the platoon AI coroutine. Yielding here
+    -- keeps long candidate/validation/shaping passes from monopolizing sim time.
+    WaitTicks(1)
+    return true
+end
 
 local function ReadVecComponent(v, numericIndex, axisName)
     if v == nil then
@@ -59,6 +236,9 @@ local function CopyMetadata(fromPos, toPos)
     toPos._ingress = rawget(fromPos, '_ingress')
     toPos._ingressEdge = rawget(fromPos, '_ingressEdge')
     toPos._anchor = rawget(fromPos, '_anchor')
+    toPos._transitAnchor = rawget(fromPos, '_transitAnchor')
+    toPos._forceStaging = rawget(fromPos, '_forceStaging')
+    toPos._preAttack = rawget(fromPos, '_preAttack')
 end
 
 local function CopyVec(v)
@@ -75,18 +255,300 @@ local function CopyVec(v)
     return copy
 end
 
+local function IsValidRoutePosition(pos)
+    if type(pos) ~= 'table' then
+        return false
+    end
+
+    local x = ReadVecComponent(pos, 1, 'x')
+    local z = ReadVecComponent(pos, 3, 'z')
+    return type(x) == 'number' and type(z) == 'number'
+end
+
+local function FormatRoutePosition(pos)
+    if not IsValidRoutePosition(pos) then
+        return 'nil'
+    end
+
+    local y = ReadVecComponent(pos, 2, 'y')
+    if type(y) ~= 'number' then
+        y = 0
+    end
+
+    return ('(%.2f, %.2f, %.2f)'):format(VecX(pos), y, VecZ(pos))
+end
+
 local function BuildPoint(x, y, z)
     return { x, y or 0, z }
 end
 
+local function QuantizeCoord(value, size)
+    local quantum = math.max(1, size or 1)
+    return math.floor(((value or 0) / quantum) + 0.5) * quantum
+end
+
+local function BuildQuantizedPointKey(pos, quantum)
+    if not pos then
+        return 'nil'
+    end
+
+    return ('%d:%d'):format(
+        QuantizeCoord(VecX(pos), quantum or RouteCachePositionQuantization),
+        QuantizeCoord(VecZ(pos), quantum or RouteCachePositionQuantization)
+    )
+end
+
+local function ResolveScenarioRouteCache()
+    local mapName = ScenarioInfo and (ScenarioInfo.name or ScenarioInfo.map or ScenarioInfo.MapName) or 'unknown-map'
+    if not SavedRouteCache or SavedRouteCache.mapName ~= mapName then
+        SavedRouteCache = {
+            mapName = mapName,
+            routes = {},
+        }
+    end
+    return SavedRouteCache
+end
+
+local function ResolveRouteCacheTag(platoon, opts)
+    if opts and opts.RouteCacheTag then
+        return tostring(opts.RouteCacheTag)
+    end
+
+    local platoonData = platoon and platoon.PlatoonData or nil
+    local candidates = {
+        platoonData and platoonData.SpawnerTag,
+        platoonData and platoonData.BuilderTag,
+        platoonData and platoonData.Tag,
+        platoonData and platoonData.RequesterTag,
+        platoonData and platoonData.PlatoonLabel,
+        platoonData and platoonData.RouteSource,
+    }
+
+    for _, candidate in ipairs(candidates) do
+        if candidate ~= nil and candidate ~= '' then
+            return tostring(candidate)
+        end
+    end
+
+    return nil
+end
+
+local function ResolveRouteDestinationTag(opts, destination)
+    if opts and opts.RouteDestinationTag then
+        return tostring(opts.RouteDestinationTag)
+    end
+
+    local zone = opts and opts.TargetZone or nil
+    local candidates = {
+        zone and zone.tag,
+        zone and zone.Tag,
+        zone and zone.name,
+        zone and zone.Name,
+        zone and zone.marker,
+        zone and zone.Marker,
+    }
+
+    for _, candidate in ipairs(candidates) do
+        if candidate ~= nil and candidate ~= '' then
+            return tostring(candidate)
+        end
+    end
+
+    return BuildQuantizedPointKey(destination, RouteCachePositionQuantization)
+end
+
+local function ResolveRouteCacheKey(platoon, opts, layer, startPos, destination)
+    local cacheTag = ResolveRouteCacheTag(platoon, opts)
+    if not cacheTag then
+        return nil
+    end
+
+    local sourcePos = opts and opts.RouteCacheStart
+        or (platoon and platoon.PlatoonData and platoon.PlatoonData.SpawnPosition)
+        or startPos
+
+    local routeSource = opts and opts.RouteSource
+        or (platoon and platoon.PlatoonData and platoon.PlatoonData.RouteSource)
+        or 'unknown'
+
+    local sourceKey = BuildQuantizedPointKey(sourcePos, RouteCachePositionQuantization)
+    local destinationKey = ResolveRouteDestinationTag(opts, destination)
+    local randomizeKey = opts and opts.RandomizeRoute and 'rand' or 'norand'
+    local ingressKey = opts and opts.DisableIngress and 'noingress' or 'ingress'
+    local chainKey = opts and (opts.RouteChain or opts.Chain or opts.ChainName or opts.MarkerChain) or nil
+    chainKey = chainKey and tostring(chainKey) or 'nochain'
+
+    return table.concat({
+        tostring(cacheTag),
+        tostring(routeSource),
+        tostring(layer or 'unknown'),
+        sourceKey,
+        destinationKey,
+        randomizeKey,
+        ingressKey,
+        chainKey,
+    }, '|')
+end
+
+local function CloneWaypoint(waypoint)
+    if type(waypoint) ~= 'table' then
+        return waypoint
+    end
+
+    local copy = {}
+    for key, value in pairs(waypoint) do
+        if type(value) == 'table' and (value[1] ~= nil or value.x ~= nil) then
+            copy[key] = CopyVec(value)
+        else
+            copy[key] = value
+        end
+    end
+    return copy
+end
+
+local function CloneStoredRouteTemplate(route)
+    if type(route) ~= 'table' then
+        return nil
+    end
+
+    local copy = {}
+    for key, value in pairs(route) do
+        if key == 'waypoints' then
+            local waypoints = {}
+            for index, waypoint in ipairs(value or {}) do
+                waypoints[index] = CloneWaypoint(waypoint)
+            end
+            copy.waypoints = waypoints
+        elseif key == 'destination' or key == 'startPosition' or key == 'targetPosition' then
+            copy[key] = CopyVec(value)
+        elseif key == 'cohesionState' then
+            copy[key] = nil
+        elseif key == 'debugSummary' and type(value) == 'table' then
+            local summary = {}
+            for summaryKey, summaryValue in pairs(value) do
+                summary[summaryKey] = summaryValue
+            end
+            summary.cacheHit = value.cacheHit and true or false
+            copy[key] = summary
+        elseif key == 'squadPlan' and type(value) == 'table' then
+            local squadPlan = {
+                requiresSplit = value.requiresSplit and true or false,
+                splitIndices = {},
+                rejoinIndices = {},
+                chokepoints = {},
+            }
+            for index, item in ipairs(value.splitIndices or {}) do
+                squadPlan.splitIndices[index] = item
+            end
+            for index, item in ipairs(value.rejoinIndices or {}) do
+                squadPlan.rejoinIndices[index] = item
+            end
+            for index, item in ipairs(value.chokepoints or {}) do
+                squadPlan.chokepoints[index] = {
+                    index = item.index,
+                    width = item.width,
+                }
+            end
+            copy[key] = squadPlan
+        else
+            copy[key] = value
+        end
+    end
+
+    copy.stamp = route.stamp
+    copy.createdAt = GetGameTimeSeconds and GetGameTimeSeconds() or 0
+    copy.currentIndex = 1
+    copy.lastQueuedIndex = 0
+    copy.lastIssuedIndex = nil
+    copy.lastIssuedTime = nil
+    copy.routeStage = copy.isIngressRoute and 'INGRESS' or 'TRANSIT'
+    copy.routeState = copy.routeStage
+    copy.initialFormComplete = false
+    copy.initialFormIssuedTime = nil
+    copy.cohesionBroken = false
+    copy.cohesionState = nil
+    copy.queuedIndex = nil
+    copy.repathReason = nil
+
+    for _, waypoint in ipairs(copy.waypoints or {}) do
+        if waypoint then
+            waypoint.stagingIssued = nil
+        end
+    end
+
+    return copy
+end
+
 local function DistSq(a, b)
     if not (a and b) then
-        return math.huge
+        return HugeNumber
     end
 
     local dx = VecX(a) - VecX(b)
     local dz = VecZ(a) - VecZ(b)
     return dx * dx + dz * dz
+end
+
+local function UnitDistanceSqToPoint(unit, point)
+    if not (unit and point and unit.GetPosition) then
+        return HugeNumber
+    end
+
+    local pos = unit:GetPosition()
+    if not pos then
+        return HugeNumber
+    end
+
+    local dx = (pos[1] or 0) - VecX(point)
+    local dz = (pos[3] or 0) - VecZ(point)
+    return (dx * dx) + (dz * dz)
+end
+
+local function SafeGetBrain(platoon)
+    if not platoon then
+        return nil
+    end
+
+    if platoon.BeenDestroyed and platoon:BeenDestroyed() then
+        return nil
+    end
+
+    local ok, brain = pcall(platoon.GetBrain, platoon)
+    if not ok then
+        return nil
+    end
+
+    return brain
+end
+
+local function PlatoonAlive(platoon)
+    if not platoon then
+        return false
+    end
+
+    local brain = SafeGetBrain(platoon)
+    if not brain then
+        return false
+    end
+
+    if not brain:PlatoonExists(platoon) then
+        return false
+    end
+
+    local units = platoon:GetPlatoonUnits()
+    return units and table.getn(units) > 0
+end
+
+local function GetRandomInt(minValue, maxValue)
+    if maxValue <= minValue then
+        return minValue
+    end
+
+    if Random then
+        return Random(minValue, maxValue)
+    end
+
+    return math.random(minValue, maxValue)
 end
 
 local function Lerp(a, b, t)
@@ -131,6 +593,98 @@ local function HeadingDegrees(a, b)
     end
 
     return math.deg((math.atan2 or math.atan)(dz, dx))
+end
+
+local function NormalizeAngleDegrees(angle)
+    local value = angle or 0
+    local turns = value >= 0 and math.floor(value / 360) or math.ceil(value / 360)
+    local normalized = value - (turns * 360)
+    if normalized > 180 then
+        normalized = normalized - 360
+    elseif normalized < -180 then
+        normalized = normalized + 360
+    end
+    return normalized
+end
+
+local function AngleDeltaDegrees(a, b)
+    return math.abs(NormalizeAngleDegrees((b or 0) - (a or 0)))
+end
+
+local function ProjectionAlongSegment(point, segmentStart, segmentEnd)
+    if not (point and segmentStart and segmentEnd) then
+        return 0, 0
+    end
+
+    local dirX, dirZ, length = DirectionBetween(segmentStart, segmentEnd)
+    if length < 0.001 then
+        return 0, 0
+    end
+
+    local fromStartX = VecX(point) - VecX(segmentStart)
+    local fromStartZ = VecZ(point) - VecZ(segmentStart)
+    return (fromStartX * dirX) + (fromStartZ * dirZ), length
+end
+
+local function DetermineWaypointFacing(prevPoint, point, nextPoint, waypointType, continuous)
+    local arrivalFacing = HeadingDegrees(prevPoint, point)
+    local departureFacing = HeadingDegrees(point, nextPoint)
+    local nextDistanceSq = DistSq(point, nextPoint)
+
+    if not nextPoint or nextDistanceSq <= 1 then
+        departureFacing = arrivalFacing
+    end
+
+    local flowFacing = arrivalFacing
+    if nextPoint and nextDistanceSq > 1 then
+        flowFacing = HeadingDegrees(prevPoint, nextPoint)
+    end
+
+    local commandFacing = arrivalFacing
+    if continuous then
+        if waypointType == 'curve' then
+            commandFacing = departureFacing
+        else
+            commandFacing = flowFacing
+        end
+    elseif waypointType == 'pre-attack' or waypointType == 'staging' then
+        commandFacing = arrivalFacing
+    elseif waypointType == 'curve' then
+        commandFacing = departureFacing
+    elseif waypointType == 'transit' or waypointType == 'corridor' or waypointType == 'ingress' then
+        commandFacing = flowFacing
+    end
+
+    return arrivalFacing, departureFacing, flowFacing, commandFacing
+end
+
+local function DetermineWaypointQueueDistanceSq(waypointType, segmentLength, nextSegmentLength, turnAngle)
+    if waypointType == 'pre-attack' or waypointType == 'staging' then
+        return SegmentReachDistanceSq
+    end
+
+    local lookahead = math.max(10, math.min(segmentLength * 0.45, 24))
+    if waypointType == 'corridor' then
+        lookahead = math.max(12, math.min(segmentLength * 0.50, 20))
+    elseif waypointType == 'curve' then
+        lookahead = math.max(10, math.min(segmentLength * 0.40, 16))
+    elseif waypointType == 'ingress' then
+        lookahead = math.max(11, math.min(segmentLength * 0.45, 18))
+    end
+
+    if nextSegmentLength and nextSegmentLength > 0 then
+        lookahead = math.min(lookahead, math.max(8, nextSegmentLength * 0.50))
+    end
+
+    if turnAngle >= 95 then
+        lookahead = math.max(7, lookahead * 0.60)
+    elseif turnAngle >= 55 then
+        lookahead = math.max(8, lookahead * 0.75)
+    elseif turnAngle <= 20 then
+        lookahead = math.min(24, lookahead * 1.15)
+    end
+
+    return math.max(SegmentReachDistanceSq, lookahead * lookahead)
 end
 
 local function OffsetPoint(point, dx, dz, y)
@@ -184,6 +738,44 @@ local function GetPlayableArea()
     return nil
 end
 
+local function ResolveGraphConfig(opts, platoon)
+    local platoonData = platoon and platoon.PlatoonData or nil
+    local cfg = {
+        resolution = math.max(8, (opts and opts.GraphResolution) or (platoonData and platoonData.GraphResolution) or DefaultGraphResolution),
+        inflationHardBlock = (opts and opts.GraphInflationHardBlock) or (platoonData and platoonData.GraphInflationHardBlock) or DefaultGraphHardInflation,
+        inflationSoftPenalty = (opts and opts.GraphInflationSoftPenalty) or (platoonData and platoonData.GraphInflationSoftPenalty) or DefaultGraphSoftInflation,
+    }
+    return cfg
+end
+
+local function ShouldUseGraphRouting(platoon, opts)
+    local platoonData = platoon and platoon.PlatoonData or nil
+    local mode = (opts and opts.RouteMode) or (platoonData and platoonData.RouteMode)
+    local phase = (opts and opts.RoutePhase) or (platoonData and platoonData.RoutePhase)
+
+    if opts and opts.DisableGraphRouting then
+        return false, 'disabled-by-option'
+    end
+    if mode == 'ChainPatrol' or mode == 'AuthoredPath' then
+        return false, 'authored-mode'
+    end
+    if phase == 'ASSAULT' or phase == 'RALLY' then
+        return false, 'phase-opt-out'
+    end
+
+    return true, 'standard'
+end
+
+local function EnsureMissionRoutingGraph(platoon, opts, area)
+    if MissionGraphInitialized and not (opts and opts.ForceGraphRebuild) then
+        return
+    end
+
+    local graphConfig = ResolveGraphConfig(opts, platoon)
+    RoutingGraph.InitializeMissionGraph(area or GetPlayableArea(), graphConfig)
+    MissionGraphInitialized = true
+end
+
 local function PositionInPlayableArea(pos, area)
     if not (pos and area) then
         return true
@@ -222,6 +814,70 @@ local function ClampToPlayableArea(pos, area, margin)
     return { x, VecY(pos), z }
 end
 
+local function ResolveMarkerChainPoints(chainName, layer)
+    if not chainName then
+        return {}
+    end
+
+    local ok, chain = pcall(ScenarioUtils.ChainToPositions, chainName)
+    if not (ok and type(chain) == 'table') then
+        return {}
+    end
+
+    local points = {}
+    for _, position in ipairs(chain) do
+        if position and position[1] and position[3] then
+            local point = { position[1], position[2] or 0, position[3] }
+            SetPointSurface(point, layer)
+            point._chain = tostring(chainName)
+            point._transitAnchor = true
+            table.insert(points, point)
+        end
+    end
+    return points
+end
+
+local function ResolveRouteChainNames(platoon, opts)
+    local names = {}
+    local seen = {}
+    local requiredPrefix = 'RTE_'
+
+    local function addName(value)
+        if type(value) == 'string'
+            and value ~= ''
+            and string.sub(value, 1, string.len(requiredPrefix)) == requiredPrefix
+            and not seen[value]
+        then
+            seen[value] = true
+            table.insert(names, value)
+        end
+    end
+
+    local function addValue(value)
+        if type(value) == 'table' then
+            for _, item in ipairs(value) do
+                addValue(item)
+            end
+            return
+        end
+
+        addName(value)
+    end
+
+    local platoonData = platoon and platoon.PlatoonData or nil
+    addValue(opts and (opts.RouteChains or opts.RouteChain))
+    addValue(opts and (opts.MarkerChains or opts.MarkerChain))
+    addValue(opts and (opts.ChainNames or opts.ChainName))
+    addValue(opts and opts.Chain)
+
+    addValue(platoonData and (platoonData.RouteChains or platoonData.RouteChain))
+    addValue(platoonData and (platoonData.MarkerChains or platoonData.MarkerChain))
+    addValue(platoonData and (platoonData.ChainNames or platoonData.ChainName))
+    addValue(platoonData and platoonData.Chain)
+
+    return names
+end
+
 local function SurfaceHeightForLayer(layer, x, z)
     if layer == 'Water' or layer == 'Naval' then
         return GetSurfaceHeight(x, z)
@@ -230,7 +886,7 @@ local function SurfaceHeightForLayer(layer, x, z)
     return math.max(GetTerrainHeight(x, z), GetSurfaceHeight(x, z))
 end
 
-local function SetPointSurface(point, layer)
+SetPointSurface = function(point, layer)
     if not point then
         return nil
     end
@@ -294,33 +950,312 @@ local function SamplePointClearance(layer, point, tangentX, tangentZ, maxDistanc
     return leftClearance, rightClearance, nx, nz
 end
 
-local function SegmentHasClearance(layer, fromPos, toPos, desiredClearance)
+local function NormalizeClearanceInfo(info)
+    info = info or {}
+
+    local left = tonumber(info.left) or 0
+    local right = tonumber(info.right) or 0
+    local minimum = tonumber(info.minimum)
+    if minimum == nil then
+        minimum = math.min(left, right)
+    end
+
+    local total = tonumber(info.total)
+    if total == nil then
+        total = left + right
+    end
+
+    local centeredness = tonumber(info.centeredness)
+    if centeredness == nil then
+        centeredness = total > 0 and (1 - (math.abs(left - right) / total)) or 0
+    end
+
+    local nx = tonumber(info.nx) or 0
+    local nz = tonumber(info.nz) or 0
+
+    return {
+        left = left,
+        right = right,
+        minimum = minimum,
+        total = total,
+        centeredness = centeredness,
+        balanced = info.balanced and true or false,
+        preferred = info.preferred and true or false,
+        nx = nx,
+        nz = nz,
+    }
+end
+
+local function MeasurePointBufferedClearance(layer, point, tangentX, tangentZ, desiredClearance)
+    if not point then
+        return NormalizeClearanceInfo()
+    end
+
+    local probe = math.max(desiredClearance or RoutePreferredClearance, RoutePreferredClearance)
+    local left, right, nx, nz = SamplePointClearance(layer, point, tangentX, tangentZ, probe, 1.5)
+    local info = NormalizeClearanceInfo({
+        left = left,
+        right = right,
+        nx = nx,
+        nz = nz,
+    })
+
+    info.balanced = info.minimum >= math.max(RouteMinimumBalancedClearance, probe * 0.45)
+    info.preferred = info.minimum >= probe * 0.70
+    return info
+end
+
+local function DetermineDesiredSegmentClearance(length, desiredClearance)
+    local preferred = desiredClearance or SimplifyClearance
+    if not length or length <= 18 then
+        return preferred
+    end
+
+    local bonus = math.min(SegmentLengthClearanceMaxBonus, math.max(0, (length - 18) * SegmentLengthClearanceScale))
+    return preferred + bonus
+end
+
+local function BuildSegmentSamplePoint(fromPos, toPos, t)
+    return {
+        Lerp(VecX(fromPos), VecX(toPos), t),
+        Lerp(VecY(fromPos), VecY(toPos), t),
+        Lerp(VecZ(fromPos), VecZ(toPos), t),
+    }
+end
+
+SegmentPassableStrict = function(layer, fromPos, toPos)
+    if not (fromPos and toPos) then
+        return false
+    end
+
     if not SegmentPassable(layer, fromPos, toPos) then
         return false
     end
 
-    local dirX, dirZ, length = DirectionBetween(fromPos, toPos)
-    if length < 0.001 then
+    local segmentLength = SegmentLength(fromPos, toPos)
+    if segmentLength < 0.001 then
         return PointPassable(layer, fromPos)
     end
 
-    local clearance = desiredClearance or SimplifyClearance
-    local samples = math.max(2, math.floor(length / 6))
-    for i = 0, samples do
-        local t = i / samples
-        local sample = {
-            Lerp(VecX(fromPos), VecX(toPos), t),
-            Lerp(VecY(fromPos), VecY(toPos), t),
-            Lerp(VecZ(fromPos), VecZ(toPos), t),
-        }
-
-        local left, right = SamplePointClearance(layer, sample, dirX, dirZ, clearance, math.max(1, clearance * 0.5))
-        if left < clearance and right < clearance then
+    local steps = math.max(2, math.ceil(segmentLength / StrictSegmentSampleStep))
+    local previous = CopyVec(fromPos)
+    for stepIndex = 1, steps do
+        local sample = BuildSegmentSamplePoint(fromPos, toPos, stepIndex / steps)
+        SetPointSurface(sample, layer)
+        if not PointPassable(layer, sample) or not SegmentPassable(layer, previous, sample) then
             return false
         end
+        previous = sample
+        MaybeYieldRouteBuild('strict-segment-validation')
     end
 
     return true
+end
+
+local function SegmentTraversesPassableSpace(layer, fromPos, toPos, tangentX, tangentZ, desiredClearance)
+    if not (fromPos and toPos) then
+        return false
+    end
+
+    local segmentLength = SegmentLength(fromPos, toPos)
+    if segmentLength < 0.001 then
+        return PointPassable(layer, fromPos)
+    end
+
+    local nx, nz = -tangentZ, tangentX
+    local normalLength = Length2D(nx, nz)
+    if normalLength < 0.001 then
+        nx, nz = 0, 1
+    else
+        nx = nx / normalLength
+        nz = nz / normalLength
+    end
+
+    local preferred = DetermineDesiredSegmentClearance(segmentLength, desiredClearance)
+    local lateralLimit = math.max(0, preferred * SegmentTraversalMaxOffsetFraction)
+    local steps = math.max(2, math.ceil(segmentLength / SegmentTraversalSampleStep))
+    local rails = { 0 }
+    local offset = SegmentTraversalOffsetStep
+    while offset <= lateralLimit do
+        table.insert(rails, offset)
+        table.insert(rails, -offset)
+        offset = offset + SegmentTraversalOffsetStep
+    end
+
+    local previousSamples = {}
+    for _, lateral in ipairs(rails) do
+        local initial = OffsetPoint(fromPos, nx * lateral, nz * lateral)
+        SetPointSurface(initial, layer)
+        if not PointPassable(layer, initial) then
+            return false
+        end
+        table.insert(previousSamples, initial)
+    end
+
+    for stepIndex = 1, steps do
+        local t = stepIndex / steps
+        local center = BuildSegmentSamplePoint(fromPos, toPos, t)
+        SetPointSurface(center, layer)
+
+        for railIndex, lateral in ipairs(rails) do
+            local sample = lateral == 0 and center or OffsetPoint(center, nx * lateral, nz * lateral)
+            SetPointSurface(sample, layer)
+            if not PointPassable(layer, sample) then
+                return false
+            end
+            if not SegmentPassable(layer, previousSamples[railIndex], sample) then
+                return false
+            end
+            previousSamples[railIndex] = sample
+        end
+        MaybeYieldRouteBuild('segment-clearance-sampling')
+    end
+
+    return true
+end
+
+local function AnalyzeSegmentClearance(layer, fromPos, toPos, desiredClearance)
+    if not (fromPos and toPos) then
+        return nil
+    end
+
+    if not SegmentPassable(layer, fromPos, toPos) then
+        return nil
+    end
+
+    local dirX, dirZ, length = DirectionBetween(fromPos, toPos)
+    if length < 0.001 then
+        if not PointPassable(layer, fromPos) then
+            return nil
+        end
+        local pointClearance = MeasurePointBufferedClearance(layer, fromPos, 0, 1, desiredClearance)
+        pointClearance.length = 0
+        return pointClearance
+    end
+
+    local preferred = DetermineDesiredSegmentClearance(length, desiredClearance)
+    if not SegmentTraversesPassableSpace(layer, fromPos, toPos, dirX, dirZ, preferred) then
+        return nil
+    end
+
+    local samples = math.max(3, math.floor(length / 5))
+    local minimum = HugeNumber
+    local minimumTotal = HugeNumber
+    local centeredness = 0
+    local preferredHits = 0
+
+    for i = 0, samples do
+        local t = i / samples
+        local sample = BuildSegmentSamplePoint(fromPos, toPos, t)
+
+        local info = NormalizeClearanceInfo(MeasurePointBufferedClearance(layer, sample, dirX, dirZ, preferred))
+        local sampleMinimum = info.minimum
+        local sampleTotal = info.total
+        local sampleCenteredness = info.centeredness
+
+        minimum = math.min(minimum, sampleMinimum)
+        minimumTotal = math.min(minimumTotal, sampleTotal)
+        centeredness = centeredness + sampleCenteredness
+        if info.preferred then
+            preferredHits = preferredHits + 1
+        end
+        MaybeYieldRouteBuild('segment-analysis')
+    end
+
+    return {
+        length = length,
+        desired = preferred,
+        minimum = minimum,
+        total = minimumTotal,
+        centeredness = centeredness / (samples + 1),
+        preferredFraction = preferredHits / (samples + 1),
+    }
+end
+
+local function SegmentHasClearance(layer, fromPos, toPos, desiredClearance)
+    local analysis = AnalyzeSegmentClearance(layer, fromPos, toPos, desiredClearance)
+    if not analysis then
+        return false
+    end
+
+    local preferred = analysis.desired or desiredClearance or SimplifyClearance
+    if analysis.minimum >= preferred then
+        return true
+    end
+
+    local relaxedMinimum = math.max(RouteMinimumBalancedClearance, preferred * 0.55)
+    if analysis.minimum < relaxedMinimum then
+        return false
+    end
+
+    if analysis.total < math.max(preferred * 1.5, relaxedMinimum * 2.1) then
+        return false
+    end
+
+    return analysis.centeredness >= 0.48 or analysis.preferredFraction >= 0.35
+end
+
+local function ScoreCandidatePointInCorridor(layer, candidate, tangentX, tangentZ, desiredClearance)
+    local info = NormalizeClearanceInfo(MeasurePointBufferedClearance(layer, candidate, tangentX, tangentZ, desiredClearance))
+    local score = (info.minimum * 5) + (info.total * 0.6) + (info.centeredness * 10)
+    if info.preferred then
+        score = score + 12
+    elseif info.balanced then
+        score = score + 5
+    end
+    return score, info
+end
+
+local function FindBestBufferedPoint(layer, point, tangentX, tangentZ, area, prev, nextPoint, desiredClearance, maxProbeDistance, stepSize)
+    if not point then
+        return nil, nil
+    end
+
+    local baselineScore, baselineInfo = ScoreCandidatePointInCorridor(layer, point, tangentX, tangentZ, desiredClearance)
+    local bestPoint = CopyVec(point)
+    local bestInfo = baselineInfo
+    local bestScore = baselineScore
+
+    local nx = baselineInfo.nx
+    local nz = baselineInfo.nz
+    if math.abs(nx) < 0.001 and math.abs(nz) < 0.001 then
+        return bestPoint, bestInfo
+    end
+
+    local limit = maxProbeDistance or CorridorBalanceProbeDistance
+    local stride = stepSize or CorridorBalanceStep
+    local distance = -limit
+    while distance <= limit do
+        if math.abs(distance) > 0.05 then
+            local candidate = OffsetPoint(point, nx * distance, nz * distance)
+            if area then
+                candidate = ClampToPlayableArea(candidate, area, 0)
+            end
+            SetPointSurface(candidate, layer)
+
+            local valid = PointPassable(layer, candidate)
+            if valid and prev then
+                valid = SegmentHasClearance(layer, prev, candidate, math.max(RouteMinimumBalancedClearance, (desiredClearance or RoutePreferredClearance) * 0.55))
+            end
+            if valid and nextPoint then
+                valid = SegmentHasClearance(layer, candidate, nextPoint, math.max(RouteMinimumBalancedClearance, (desiredClearance or RoutePreferredClearance) * 0.55))
+            end
+
+            if valid then
+                local score, info = ScoreCandidatePointInCorridor(layer, candidate, tangentX, tangentZ, desiredClearance)
+                score = score - (math.abs(distance) * 0.08)
+                if score > bestScore + 0.15 then
+                    bestPoint = candidate
+                    bestInfo = info
+                    bestScore = score
+                end
+            end
+        end
+        MaybeYieldRouteBuild('corridor-probe')
+        distance = distance + stride
+    end
+
+    return bestPoint, bestInfo
 end
 
 local function RemoveDuplicateRoutePoints(route, minDistanceSq)
@@ -335,6 +1270,7 @@ local function RemoveDuplicateRoutePoints(route, minDistanceSq)
         if point and DistSq(cleaned[table.getn(cleaned)], point) > minSq then
             table.insert(cleaned, CopyVec(point))
         end
+        MaybeYieldRouteBuild('route-deduplicate')
     end
 
     return cleaned
@@ -357,7 +1293,7 @@ local function RemoveRouteDoubleBack(route)
             local offsetDx = VecX(point) - ((VecX(prev) + VecX(nextPoint)) * 0.5)
             local offsetDz = VecZ(point) - ((VecZ(prev) + VecZ(nextPoint)) * 0.5)
             local offsetSq = (offsetDx * offsetDx) + (offsetDz * offsetDz)
-            if rawget(point, '_anchor') or rawget(point, '_ingress') or rawget(point, '_corridor') then
+            if rawget(point, '_anchor') or rawget(point, '_ingress') or rawget(point, '_corridor') or rawget(point, '_curve') or rawget(point, '_transitAnchor') then
                 table.insert(cleaned, CopyVec(point))
             elseif dot < -0.35 and offsetSq < 36 then
                 -- Skip hard reversals that do not materially contribute to the route.
@@ -365,6 +1301,7 @@ local function RemoveRouteDoubleBack(route)
                 table.insert(cleaned, CopyVec(point))
             end
         end
+        MaybeYieldRouteBuild('route-doubleback-cleanup')
     end
 
     table.insert(cleaned, CopyVec(route[table.getn(route)]))
@@ -376,12 +1313,6 @@ local function DetermineStartState(platoon, opts)
         return nil, nil, false
     end
 
-    local startPos = opts and opts.RouteStart and CopyVec(opts.RouteStart)
-        or (platoon.GetPlatoonPosition and CopyVec(platoon:GetPlatoonPosition()))
-    if not startPos then
-        return nil, nil, false
-    end
-
     local area = GetPlayableArea()
     local startedOutside = false
 
@@ -390,33 +1321,103 @@ local function DetermineStartState(platoon, opts)
     elseif platoon.PlatoonData and platoon.PlatoonData.StartedOutsidePlayableArea ~= nil then
         startedOutside = platoon.PlatoonData.StartedOutsidePlayableArea and true or false
     elseif area then
-        startedOutside = not PositionInPlayableArea(startPos, area)
+        local inferredStart = platoon.GetPlatoonPosition and CopyVec(platoon:GetPlatoonPosition()) or nil
+        if inferredStart then
+            startedOutside = not PositionInPlayableArea(inferredStart, area)
+        end
+    end
+
+    local startPos = nil
+    local startSource = 'GetPlatoonPosition'
+    local storedStartPos = platoon.PlatoonData and platoon.PlatoonData.StartPosition or nil
+
+    if opts and opts.RouteStart then
+        startPos = CopyVec(opts.RouteStart)
+        startSource = (platoon.PlatoonData and platoon.PlatoonData.StartPositionSource) or 'RouteStart'
+    elseif startedOutside then
+        if IsValidRoutePosition(storedStartPos) then
+            startPos = CopyVec(storedStartPos)
+            startSource = (platoon.PlatoonData and platoon.PlatoonData.StartPositionSource) or 'StoredStartPosition'
+        else
+            if LOG then
+                LOG('[PlatoonRouting] warning: StartedOutsidePlayableArea=true but StartPosition missing/malformed; falling back to current platoon position')
+            end
+            startPos = platoon.GetPlatoonPosition and CopyVec(platoon:GetPlatoonPosition()) or nil
+        end
+    else
+        startPos = platoon.GetPlatoonPosition and CopyVec(platoon:GetPlatoonPosition()) or nil
+    end
+
+    if not startPos then
+        return nil, area, startedOutside, 'missing'
     end
 
     if area and PositionInPlayableArea(startPos, area) then
         startPos = ClampToPlayableArea(startPos, area, 0)
     end
 
-    return SetPointSurface(startPos, ResolveLayer(platoon, opts)), area, startedOutside
+    return SetPointSurface(startPos, ResolveLayer(platoon, opts)), area, startedOutside, startSource
+end
+
+local function EvaluateIngressDecision(platoon, opts, startPos, area, inferredStartedOutside)
+    local routeSource = (opts and opts.RouteSource)
+        or (platoon and platoon.PlatoonData and platoon.PlatoonData.RouteSource)
+
+    local startedOutsideFlag = nil
+    if opts and opts.StartedOutsidePlayableArea ~= nil then
+        startedOutsideFlag = opts.StartedOutsidePlayableArea and true or false
+    elseif platoon and platoon.PlatoonData and platoon.PlatoonData.StartedOutsidePlayableArea ~= nil then
+        startedOutsideFlag = platoon.PlatoonData.StartedOutsidePlayableArea and true or false
+    end
+
+    local disableIngress = nil
+    if opts and opts.DisableIngress ~= nil then
+        disableIngress = opts.DisableIngress and true or false
+    elseif platoon and platoon.PlatoonData and platoon.PlatoonData.DisableIngress ~= nil then
+        disableIngress = platoon.PlatoonData.DisableIngress and true or false
+    end
+
+    local currentOutside = false
+    if startPos and area then
+        currentOutside = not PositionInPlayableArea(startPos, area)
+    end
+
+    local requested = startedOutsideFlag == true
+    local allowed = false
+    local skipReason = nil
+
+    if startedOutsideFlag == nil and inferredStartedOutside ~= nil then
+        startedOutsideFlag = inferredStartedOutside and true or false
+        requested = startedOutsideFlag == true
+    end
+
+    if not (startPos and area) then
+        skipReason = 'missing-start-or-area'
+    elseif disableIngress then
+        skipReason = 'disable-ingress'
+    elseif not requested then
+        skipReason = startedOutsideFlag == false and 'started-inside-playable-area' or 'missing-started-outside-flag'
+    elseif not currentOutside then
+        skipReason = 'start-already-inside-playable-area'
+    else
+        allowed = true
+    end
+
+    return {
+        routeSource = routeSource,
+        startedOutsidePlayableArea = startedOutsideFlag,
+        disableIngress = disableIngress and true or false,
+        currentOutsidePlayableArea = currentOutside,
+        requested = requested,
+        allowed = allowed,
+        skipReason = skipReason,
+    }
 end
 
 function PlatoonNeedsIngress(platoon, opts)
     local startPos, area, startedOutside = DetermineStartState(platoon, opts)
-    if not (startPos and area) then
-        return false
-    end
-
-    if not startedOutside then
-        return false
-    end
-
-    if opts and opts.DisableIngress then
-        return false
-    end
-
-    local source = (opts and opts.RouteSource)
-        or (platoon and platoon.PlatoonData and platoon.PlatoonData.RouteSource)
-    return source == 'UnitSpawner'
+    local decision = EvaluateIngressDecision(platoon, opts, startPos, area, startedOutside)
+    return decision.allowed, decision
 end
 
 local function BuildCardinalIngress(startPos, area, layer)
@@ -424,7 +1425,7 @@ local function BuildCardinalIngress(startPos, area, layer)
         return nil, nil
     end
 
-    local safeBuffer = 6
+    local safeBuffer = 10
     local sx = VecX(startPos)
     local sz = VecZ(startPos)
     local candidates = {}
@@ -458,7 +1459,7 @@ local function BuildCardinalIngress(startPos, area, layer)
     for _, candidate in ipairs(candidates) do
         local ingress = ClampToPlayableArea(candidate.point, area, safeBuffer)
         ingress._ingress = true
-        ingress._anchor = true
+        ingress._transitAnchor = true
         ingress._ingressEdge = candidate.edge
         SetPointSurface(ingress, layer)
         if PointPassable(layer, ingress) then
@@ -468,24 +1469,37 @@ local function BuildCardinalIngress(startPos, area, layer)
 
     local fallback = ClampToPlayableArea(candidates[1].point, area, safeBuffer)
     fallback._ingress = true
-    fallback._anchor = true
+    fallback._transitAnchor = true
     fallback._ingressEdge = candidates[1].edge
     return SetPointSurface(fallback, layer), candidates[1].edge
 end
 
-local function BuildBasePath(layer, startPos, target)
+local function BuildBasePath(layer, startPos, target, opts, area)
     if not (startPos and target) then
         return nil
     end
 
-    local route = { CopyVec(startPos) }
-    local directAllowed = SegmentHasClearance(layer, startPos, target, DirectClearance)
-    if directAllowed then
-        table.insert(route, CopyVec(target))
-        return route
+    local useGraph = true
+    if opts and opts.UseGraphRouting ~= nil then
+        useGraph = opts.UseGraphRouting and true or false
     end
 
+    if useGraph then
+        local graphResult = RoutingGraph.FindGraphRoute(area, layer, startPos, target, {
+            GraphConfig = opts and opts.GraphConfig,
+            TemporaryNodePenalty = opts and opts.TemporaryNodePenalty,
+            DirectCheck = function(routeLayer, fromPos, toPos)
+                return SegmentHasClearance(routeLayer, fromPos, toPos, DirectClearance)
+            end,
+        })
+        if graphResult and graphResult.path and table.getn(graphResult.path) > 1 then
+            return graphResult.path, graphResult.routeType or 'graph'
+        end
+    end
+
+    local route = { CopyVec(startPos) }
     local ok, navPath = pcall(NavUtils.PathTo, layer, startPos, target)
+    RoutingGraph.RecordPathToCall()
     if ok and navPath and table.getn(navPath) > 0 then
         for _, point in ipairs(navPath) do
             table.insert(route, CopyVec(point))
@@ -499,7 +1513,463 @@ local function BuildBasePath(layer, startPos, target)
         table.insert(route, CopyVec(target))
     end
 
+    RoutingGraph.ReportPathToFallback()
+    return route, 'pathTo-fallback'
+end
+
+local function AppendRouteSegment(route, segment)
+    if not (route and segment and table.getn(segment) > 0) then
+        return route
+    end
+
+    for index = 1, table.getn(segment) do
+        local point = segment[index]
+        if point then
+            local shouldInsert = true
+            if table.getn(route) > 0 and DistSq(route[table.getn(route)], point) <= 1 then
+                shouldInsert = false
+            end
+            if shouldInsert then
+                table.insert(route, CopyVec(point))
+            end
+        end
+    end
+
     return route
+end
+
+local function ComputeRouteLength(route)
+    if not route or table.getn(route) <= 1 then
+        return 0
+    end
+
+    local length = 0
+    for i = 2, table.getn(route) do
+        length = length + SegmentLength(route[i - 1], route[i])
+    end
+    return length
+end
+
+local function BuildPathViaAnchors(layer, startPos, target, anchors, opts, area)
+    if not (startPos and target) then
+        return nil
+    end
+
+    local route = { CopyVec(startPos) }
+    local current = startPos
+
+    for _, anchor in ipairs(anchors or {}) do
+        local segment = BuildBasePath(layer, current, anchor, opts, area)
+        if not segment then
+            return nil
+        end
+        AppendRouteSegment(route, segment)
+        current = anchor
+        MaybeYieldRouteBuild('anchor-segment-build')
+    end
+
+    local finalSegment = BuildBasePath(layer, current, target, opts, area)
+    if not finalSegment then
+        return nil
+    end
+    AppendRouteSegment(route, finalSegment)
+    return route
+end
+
+local function BuildMarkerChainTransitSegment(layer, fromPos, toPos, chainName)
+    if not (fromPos and toPos) then
+        return nil
+    end
+
+    if SegmentPassableStrict(layer, fromPos, toPos) then
+        local direct = { CopyVec(fromPos), CopyVec(toPos) }
+        for _, point in ipairs(direct) do
+            point._chain = chainName
+            point._transitAnchor = true
+        end
+        return direct
+    end
+
+    local ok, navPath = pcall(NavUtils.PathTo, layer, fromPos, toPos)
+    if not (ok and navPath and table.getn(navPath) > 0) then
+        return nil
+    end
+
+    local route = { CopyVec(fromPos) }
+    route[1]._chain = chainName
+    route[1]._transitAnchor = true
+    for _, point in ipairs(navPath) do
+        local sample = CopyVec(point)
+        sample._chain = chainName
+        sample._transitAnchor = true
+        table.insert(route, sample)
+        MaybeYieldRouteBuild('chain-transit-build')
+    end
+
+    local last = route[table.getn(route)]
+    if not last or DistSq(last, toPos) > 1 then
+        local finalPoint = CopyVec(toPos)
+        finalPoint._chain = chainName
+        finalPoint._transitAnchor = true
+        table.insert(route, finalPoint)
+    end
+
+    return route
+end
+
+local function FindMarkerChainWindow(route, chainPoints)
+    if not (route and chainPoints and table.getn(route) > 1 and table.getn(chainPoints) >= 2) then
+        return nil
+    end
+
+    local activationDistanceSq = ChainGuidanceActivationDistance * ChainGuidanceActivationDistance
+    local nearestSamples = {}
+    for routeIndex, routePoint in ipairs(route) do
+        local bestChainIndex = nil
+        local bestDistanceSq = activationDistanceSq
+        for chainIndex, chainPoint in ipairs(chainPoints) do
+            local distanceSq = DistSq(routePoint, chainPoint)
+            if distanceSq <= bestDistanceSq then
+                bestDistanceSq = distanceSq
+                bestChainIndex = chainIndex
+            end
+        end
+
+        if bestChainIndex then
+            table.insert(nearestSamples, {
+                routeIndex = routeIndex,
+                chainIndex = bestChainIndex,
+                distanceSq = bestDistanceSq,
+            })
+        end
+    end
+
+    if table.getn(nearestSamples) < 2 then
+        return nil
+    end
+
+    local bestWindow = nil
+    for firstIndex = 1, table.getn(nearestSamples) - 1 do
+        local first = nearestSamples[firstIndex]
+        for secondIndex = table.getn(nearestSamples), firstIndex + 1, -1 do
+            local second = nearestSamples[secondIndex]
+            if math.abs(second.chainIndex - first.chainIndex) >= 1 then
+                local span = math.abs(second.routeIndex - first.routeIndex)
+                local chainSpan = math.abs(second.chainIndex - first.chainIndex)
+                local score = (span * 8) + (chainSpan * 5) - math.sqrt(first.distanceSq) - math.sqrt(second.distanceSq)
+                if not bestWindow or score > bestWindow.score then
+                    bestWindow = {
+                        entryRouteIndex = math.min(first.routeIndex, second.routeIndex),
+                        exitRouteIndex = math.max(first.routeIndex, second.routeIndex),
+                        entryChainIndex = first.chainIndex,
+                        exitChainIndex = second.chainIndex,
+                        score = score,
+                    }
+                end
+            end
+        end
+    end
+
+    return bestWindow
+end
+
+local function ApplyMarkerChainGuidance(route, layer, chainNames)
+    if not (route and table.getn(route) > 1) then
+        return route, nil
+    end
+
+    local bestResult = nil
+    for _, chainName in ipairs(chainNames or {}) do
+        local chainPoints = ResolveMarkerChainPoints(chainName, layer)
+        local window = FindMarkerChainWindow(route, chainPoints)
+        if window then
+            local guided = {}
+            local validGuidance = true
+            local entryRouteIndex = window.entryRouteIndex
+            local exitRouteIndex = window.exitRouteIndex
+            local entryChainIndex = window.entryChainIndex
+            local exitChainIndex = window.exitChainIndex
+            local step = entryChainIndex <= exitChainIndex and 1 or -1
+
+            for index = 1, math.max(1, entryRouteIndex - 1) do
+                table.insert(guided, CopyVec(route[index]))
+            end
+
+            local chainEntry = CopyVec(chainPoints[entryChainIndex])
+            chainEntry._chain = tostring(chainName)
+            chainEntry._transitAnchor = true
+            local joinIn = BuildBasePath(layer, guided[table.getn(guided)], chainEntry)
+            if joinIn then
+                AppendRouteSegment(guided, joinIn)
+            else
+                validGuidance = false
+            end
+
+            local previous = chainEntry
+            local chainCursor = entryChainIndex
+            while validGuidance do
+                local chainPoint = CopyVec(chainPoints[chainCursor])
+                chainPoint._chain = tostring(chainName)
+                chainPoint._transitAnchor = true
+                local transitSegment = BuildMarkerChainTransitSegment(layer, previous, chainPoint, tostring(chainName))
+                if not transitSegment then
+                    validGuidance = false
+                    break
+                end
+                AppendRouteSegment(guided, transitSegment)
+                if chainCursor == exitChainIndex then
+                    previous = chainPoint
+                    break
+                end
+                chainCursor = chainCursor + step
+                previous = chainPoint
+                MaybeYieldRouteBuild('chain-guidance')
+            end
+
+            local joinOut = nil
+            if validGuidance then
+                local suffixStart = route[exitRouteIndex + 1] or route[table.getn(route)]
+                joinOut = BuildBasePath(layer, previous, suffixStart)
+                if not joinOut then
+                    validGuidance = false
+                end
+            end
+
+            if validGuidance then
+                AppendRouteSegment(guided, joinOut)
+                for index = exitRouteIndex + 1, table.getn(route) do
+                    AppendRouteSegment(guided, { route[index] })
+                end
+
+                guided = RemoveDuplicateRoutePoints(guided, 2)
+                local score = window.score - math.abs(ComputeRouteLength(guided) - ComputeRouteLength(route)) * 0.2
+                if not bestResult or score > bestResult.score then
+                    bestResult = {
+                        route = guided,
+                        chainName = tostring(chainName),
+                        score = score,
+                    }
+                end
+            end
+        end
+    end
+
+    if bestResult then
+        return bestResult.route, bestResult.chainName
+    end
+
+    return route, nil
+end
+
+local function BuildApproachAnchor(target, dirX, dirZ, normalX, normalZ, alongDistance, lateralOffset, layer, area)
+    local anchor = {
+        VecX(target) - (dirX * alongDistance) + (normalX * lateralOffset),
+        0,
+        VecZ(target) - (dirZ * alongDistance) + (normalZ * lateralOffset),
+    }
+    if area then
+        anchor = ClampToPlayableArea(anchor, area, 8)
+    end
+    SetPointSurface(anchor, layer)
+    if not PointPassable(layer, anchor) then
+        return nil
+    end
+    anchor._anchor = true
+    anchor._transitAnchor = true
+    return anchor
+end
+
+local function BuildOffsetAnchor(startPos, dirX, dirZ, normalX, normalZ, alongDistance, lateralOffset, layer, area)
+    local anchor = {
+        VecX(startPos) + (dirX * alongDistance) + (normalX * lateralOffset),
+        0,
+        VecZ(startPos) + (dirZ * alongDistance) + (normalZ * lateralOffset),
+    }
+    if area then
+        anchor = ClampToPlayableArea(anchor, area, 8)
+    end
+    SetPointSurface(anchor, layer)
+    if not PointPassable(layer, anchor) then
+        return nil
+    end
+    anchor._anchor = true
+    anchor._transitAnchor = true
+    return anchor
+end
+
+local function BuildRandomizedRouteVariant(layer, startPos, target, area, variant, opts)
+    if not (startPos and target and variant) then
+        return nil
+    end
+
+    local dirX, dirZ, totalLength = DirectionBetween(startPos, target)
+    if totalLength < 24 then
+        return nil
+    end
+
+    local sideSign = variant.sideSign or 0
+    if sideSign == 0 then
+        return nil
+    end
+
+    local normalX = -dirZ * sideSign
+    local normalZ = dirX * sideSign
+    local lateralScale = variant.lateralScale or 0.24
+    local offsetDistance = math.max(20, math.min(totalLength * lateralScale, variant.maxOffset or 88))
+    local anchors = {}
+
+    for _, fraction in ipairs(variant.fractions or {}) do
+        local lateralMultiplier = fraction[2] or 1
+        local alongDistance = totalLength * (fraction[1] or fraction)
+        local anchor = BuildOffsetAnchor(startPos, dirX, dirZ, normalX, normalZ, alongDistance, offsetDistance * lateralMultiplier, layer, area)
+        if anchor then
+            table.insert(anchors, anchor)
+        end
+        MaybeYieldRouteBuild('variant-anchor-generation')
+    end
+
+    if variant.approachOffset then
+        local approach = BuildApproachAnchor(
+            target,
+            dirX,
+            dirZ,
+            normalX,
+            normalZ,
+            math.max(14, math.min(totalLength * (variant.approachBackoff or 0.18), 44)),
+            offsetDistance * variant.approachOffset,
+            layer,
+            area
+        )
+        if approach then
+            table.insert(anchors, approach)
+        end
+    end
+
+    if table.getn(anchors) == 0 then
+        return nil
+    end
+
+    return BuildPathViaAnchors(layer, startPos, target, anchors, opts, area)
+end
+
+local function MeasureRouteClearance(route, layer)
+    if not route or table.getn(route) <= 1 then
+        return nil
+    end
+
+    local minClearance = HugeNumber
+    local totalClearance = 0
+    local totalCenteredness = 0
+    local segmentCount = 0
+
+    for i = 2, table.getn(route) do
+        local analysis = AnalyzeSegmentClearance(layer, route[i - 1], route[i], RoutePreferredClearance)
+        if not analysis then
+            return nil
+        end
+        minClearance = math.min(minClearance, analysis.minimum)
+        totalClearance = totalClearance + analysis.minimum
+        totalCenteredness = totalCenteredness + analysis.centeredness
+        segmentCount = segmentCount + 1
+        MaybeYieldRouteBuild('route-clearance-measure')
+    end
+
+    return {
+        minimum = minClearance,
+        average = segmentCount > 0 and (totalClearance / segmentCount) or 0,
+        centeredness = segmentCount > 0 and (totalCenteredness / segmentCount) or 0,
+    }
+end
+
+local function RoutePathSeparation(route, reference)
+    if not (route and reference and table.getn(route) > 0 and table.getn(reference) > 0) then
+        return 0
+    end
+
+    local total = 0
+    local samples = 0
+    for i = 2, math.max(2, table.getn(route) - 1) do
+        local point = route[i]
+        if point then
+            local nearestSq = HugeNumber
+            for _, other in ipairs(reference) do
+                local distanceSq = DistSq(point, other)
+                if distanceSq < nearestSq then
+                    nearestSq = distanceSq
+                end
+            end
+            total = total + math.sqrt(nearestSq)
+            samples = samples + 1
+        end
+    end
+
+    return samples > 0 and (total / samples) or 0
+end
+
+local function MeasureTerminalFlank(route, target)
+    if not (route and target and table.getn(route) >= 2) then
+        return 0
+    end
+
+    local finalPoint = route[table.getn(route)]
+    local prevPoint = route[table.getn(route) - 1] or finalPoint
+    local approachHeading = HeadingDegrees(prevPoint, finalPoint)
+    local directHeading = HeadingDegrees(route[1], target)
+    return AngleDeltaDegrees(directHeading, approachHeading)
+end
+
+local function CollectRouteCandidates(layer, startPos, target, opts, area)
+    local candidates = {}
+    local baseRoute, baseType = BuildBasePath(layer, startPos, target, opts, area)
+    if baseRoute then
+        local clearance = MeasureRouteClearance(baseRoute, layer)
+        if clearance then
+            table.insert(candidates, {
+                path = baseRoute,
+                routeType = baseType == 'graph' and 'graph-default' or  'default',
+                length = ComputeRouteLength(baseRoute),
+                clearance = clearance,
+                flankAngle = RoutingGraph.MeasureTerminalFlank(baseRoute, target),
+                target = target,
+            })
+        end
+    end
+
+    if opts and opts.RandomizeRoute then
+        local variants = RoutingGraph.GetVariantSpecs(area, opts)
+        local variantLimit = math.min(2, table.getn(variants))
+
+        for variantIndex = 1, variantLimit do
+            local variantSpec = variants[variantIndex]
+            local variant = BuildRandomizedRouteVariant(layer, startPos, target, area, variantSpec, opts)
+            if variant and table.getn(variant) > 1 then
+                local clearance = MeasureRouteClearance(variant, layer)
+                if clearance then
+                    table.insert(candidates, {
+                        path = variant,
+                        routeType = variantSpec.routeType,
+                        length = ComputeRouteLength(variant),
+                        clearance = clearance,
+                        flankAngle = RoutingGraph.MeasureTerminalFlank(variant, target),
+                        sideSign = variantSpec.sideSign,
+                        bias = variantSpec.bias,
+                        target = target,
+                    })
+                end
+            end
+            MaybeYieldRouteBuild('candidate-generation')
+        end
+    end
+
+    if table.getn(candidates) == 0 then
+        return nil
+    end
+
+    return RoutingGraph.ScoreCandidates(candidates)
+end
+
+local function SelectRouteCandidate(candidates, opts)
+    return RoutingGraph.SelectCandidate(candidates, opts)
 end
 
 local function BalancePointInCorridor(route, index, layer, area)
@@ -522,50 +1992,33 @@ local function BalancePointInCorridor(route, index, layer, area)
         return CopyVec(point)
     end
 
-    local left, right, nx, nz = SamplePointClearance(layer, point, tangentX, tangentZ, CornerSampleDistance, 1.5)
-    local corridorWidth = left + right
-    if corridorWidth <= 0 then
-        return CopyVec(point)
-    end
+    local desiredClearance = RoutePreferredClearance
+    local bestPoint, info = FindBestBufferedPoint(
+        layer,
+        point,
+        tangentX,
+        tangentZ,
+        area,
+        prev,
+        nextPoint,
+        desiredClearance,
+        CorridorBalanceProbeDistance,
+        CorridorBalanceStep
+    )
 
-    local targetShift = (right - left) * 0.5
-    if math.abs(targetShift) < 0.35 then
-        local stable = CopyVec(point)
-        if math.min(left, right) <= 5 then
-            stable._corridor = true
-            stable._centered = true
-            stable._anchor = true
-        end
-        return stable
-    end
-
-    local maxShift = math.min(7, math.max(left, right) * 0.7)
-    targetShift = math.max(-maxShift, math.min(maxShift, targetShift))
-    local candidate = OffsetPoint(point, -nx * targetShift, -nz * targetShift)
-    if area then
-        candidate = ClampToPlayableArea(candidate, area, 0)
-    end
-    SetPointSurface(candidate, layer)
-
-    if PointPassable(layer, candidate)
-        and SegmentPassable(layer, prev, candidate)
-        and SegmentPassable(layer, candidate, nextPoint)
+    local balanced = bestPoint and CopyVec(bestPoint) or CopyVec(point)
+    local minClearance = info and info.minimum or 0
+    local widened = bestPoint and DistSq(bestPoint, point) > 1 or false
+    if (info and info.total <= (desiredClearance * 3.4))
+        or minClearance <= (desiredClearance * 1.15)
+        or widened
     then
-        candidate._centered = true
-        if math.min(left, right) <= 6 or math.abs(targetShift) >= 1 then
-            candidate._corridor = true
-            candidate._anchor = true
-        end
-        return candidate
+        balanced._corridor = true
+        balanced._centered = true
+        balanced._transitAnchor = true
     end
 
-    local fallback = CopyVec(point)
-    if math.min(left, right) <= 5 then
-        fallback._corridor = true
-        fallback._centered = true
-        fallback._anchor = true
-    end
-    return fallback
+    return balanced
 end
 
 local function CenterRouteThroughCorridors(route, layer, area)
@@ -578,6 +2031,7 @@ local function CenterRouteThroughCorridors(route, layer, area)
         local balanced = { CopyVec(current[1]) }
         for i = 2, table.getn(current) - 1 do
             table.insert(balanced, BalancePointInCorridor(current, i, layer, area))
+            MaybeYieldRouteBuild('corridor-centering')
         end
         table.insert(balanced, CopyVec(current[table.getn(current)]))
         current = RemoveDuplicateRoutePoints(balanced, 2)
@@ -604,16 +2058,36 @@ local function BuildCornerCurve(prev, corner, nextPoint, layer, area)
         return nil
     end
 
-    local left, right = SamplePointClearance(layer, corner, inX + outX, inZ + outZ, CornerSampleDistance, 1.5)
-    local localClearance = math.min(left, right)
-    local radius = math.min(inLength * 0.35, outLength * 0.35, math.max(3, localClearance))
-    if turnAngle >= WideCornerAngleThreshold then
-        radius = math.min(inLength * 0.42, outLength * 0.42, math.max(4, localClearance + 1))
+    local bisectorX, bisectorZ = Normalize2D(inX + outX, inZ + outZ)
+    if math.abs(bisectorX) < 0.001 and math.abs(bisectorZ) < 0.001 then
+        bisectorX, bisectorZ = DirectionBetween(prev, nextPoint)
     end
-    radius = math.max(2.5, radius)
 
-    local entry = OffsetPoint(corner, -inX * radius, -inZ * radius)
-    local exit = OffsetPoint(corner, outX * radius, outZ * radius)
+    local cornerPoint, cornerInfo = FindBestBufferedPoint(
+        layer,
+        corner,
+        bisectorX,
+        bisectorZ,
+        area,
+        prev,
+        nextPoint,
+        RoutePreferredClearance,
+        math.max(8, math.min(18, CornerSampleDistance * 0.8)),
+        1
+    )
+    if not cornerPoint then
+        return nil
+    end
+
+    local localClearance = cornerInfo and cornerInfo.minimum or 0
+    local radius = math.min(inLength * 0.34, outLength * 0.34, math.max(4, localClearance + 1.5))
+    if turnAngle >= WideCornerAngleThreshold then
+        radius = math.min(inLength * 0.46, outLength * 0.46, math.max(5, localClearance + 3))
+    end
+    radius = math.max(3.5, radius)
+
+    local entry = OffsetPoint(cornerPoint, -inX * radius, -inZ * radius)
+    local exit = OffsetPoint(cornerPoint, outX * radius, outZ * radius)
     if area then
         entry = ClampToPlayableArea(entry, area, 0)
         exit = ClampToPlayableArea(exit, area, 0)
@@ -625,43 +2099,48 @@ local function BuildCornerCurve(prev, corner, nextPoint, layer, area)
         return nil
     end
 
-    local curve = { entry }
-    local blendWeights = { 0.2, 0.4, 0.6, 0.8 }
+    local curve = {}
+    local previous = prev
+    local blendWeights = { 0, 0.18, 0.38, 0.62, 0.82, 1 }
     for _, t in ipairs(blendWeights) do
         local oneMinus = 1 - t
-        local x = (oneMinus * oneMinus * VecX(entry)) + (2 * oneMinus * t * VecX(corner)) + (t * t * VecX(exit))
-        local z = (oneMinus * oneMinus * VecZ(entry)) + (2 * oneMinus * t * VecZ(corner)) + (t * t * VecZ(exit))
+        local x = (oneMinus * oneMinus * VecX(entry)) + (2 * oneMinus * t * VecX(cornerPoint)) + (t * t * VecX(exit))
+        local z = (oneMinus * oneMinus * VecZ(entry)) + (2 * oneMinus * t * VecZ(cornerPoint)) + (t * t * VecZ(exit))
         local sample = BuildPoint(x, 0, z)
         if area then
             sample = ClampToPlayableArea(sample, area, 0)
         end
         SetPointSurface(sample, layer)
-        if not PointPassable(layer, sample) then
+        sample, cornerInfo = FindBestBufferedPoint(
+            layer,
+            sample,
+            bisectorX,
+            bisectorZ,
+            area,
+            previous,
+            nextPoint,
+            RoutePreferredClearance,
+            6,
+            1
+        )
+        if not (sample and PointPassable(layer, sample)) then
+            return nil
+        end
+        if not SegmentHasClearance(layer, previous, sample, math.max(RouteMinimumBalancedClearance, SimplifyClearance)) then
             return nil
         end
         sample._curve = true
-        sample._anchor = true
+        sample._transitAnchor = true
         table.insert(curve, sample)
-    end
-    table.insert(curve, exit)
-
-    curve[1]._curve = true
-    curve[1]._anchor = true
-    curve[table.getn(curve)]._curve = true
-    curve[table.getn(curve)]._anchor = true
-
-    local previous = prev
-    for _, sample in ipairs(curve) do
-        if not SegmentPassable(layer, previous, sample) then
-            return nil
-        end
         previous = sample
+        MaybeYieldRouteBuild('corner-smoothing')
     end
-    if not SegmentPassable(layer, previous, nextPoint) then
+
+    if not SegmentHasClearance(layer, previous, nextPoint, math.max(RouteMinimumBalancedClearance, SimplifyClearance)) then
         return nil
     end
 
-    return curve
+    return RemoveDuplicateRoutePoints(curve, 2)
 end
 
 local function SmoothRouteCorners(route, layer, area)
@@ -682,6 +2161,7 @@ local function SmoothRouteCorners(route, layer, area)
         else
             table.insert(smoothed, CopyVec(corner))
         end
+        MaybeYieldRouteBuild('route-smoothing')
     end
     table.insert(smoothed, CopyVec(route[table.getn(route)]))
 
@@ -693,11 +2173,35 @@ local function CanSkipWaypoint(route, fromIndex, toIndex, layer)
         return false
     end
 
+    local preservedMinimum = HugeNumber
     for index = fromIndex + 1, toIndex - 1 do
         local point = route[index]
-        if point and (point._anchor or point._ingress or point._corridor or point._curve) then
+        if point and (point._anchor or point._ingress or point._corridor or point._curve or point._transitAnchor) then
             return false
         end
+
+        local segment = AnalyzeSegmentClearance(layer, route[index - 1], route[index], SimplifyClearance)
+        if segment then
+            preservedMinimum = math.min(preservedMinimum, segment.minimum)
+        end
+    end
+
+    local finalSegment = AnalyzeSegmentClearance(layer, route[toIndex - 1], route[toIndex], SimplifyClearance)
+    if finalSegment then
+        preservedMinimum = math.min(preservedMinimum, finalSegment.minimum)
+    end
+
+    local shortcut = AnalyzeSegmentClearance(layer, route[fromIndex], route[toIndex], SimplifyClearance)
+    if not shortcut then
+        return false
+    end
+
+    if preservedMinimum < HugeNumber and shortcut.minimum + 1.25 < preservedMinimum then
+        return false
+    end
+
+    if shortcut.centeredness < 0.42 and shortcut.minimum < SimplifyClearance then
+        return false
     end
 
     return SegmentHasClearance(layer, route[fromIndex], route[toIndex], SimplifyClearance)
@@ -717,9 +2221,11 @@ local function SimplifyRoutePreservingSafety(route, layer)
                 best = candidate
                 break
             end
+            MaybeYieldRouteBuild('route-simplify-scan')
         end
         table.insert(simplified, CopyVec(route[best]))
         index = best
+        MaybeYieldRouteBuild('route-simplify')
     end
 
     simplified = RemoveDuplicateRoutePoints(simplified, 4)
@@ -727,71 +2233,474 @@ local function SimplifyRoutePreservingSafety(route, layer)
     return simplified
 end
 
-local function BuildWaypointMetadata(route, destination, opts, layer, startedOutside, ingressEdge)
+local function DetermineWaypointType(point, index, routeCount, allowFinalStaging)
+    if point._ingress then
+        return 'ingress', false
+    end
+
+    if point._corridor then
+        return 'corridor', false
+    end
+
+    if point._curve then
+        return 'curve', false
+    end
+
+    if point._forceStaging then
+        return index == routeCount and 'pre-attack' or 'staging', true
+    end
+
+    if index == routeCount then
+        if allowFinalStaging or point._preAttack then
+            return 'pre-attack', true
+        end
+        return 'transit', false
+    end
+
+    if point._anchor or point._transitAnchor then
+        return 'transit', false
+    end
+
+    return 'transit', false
+end
+
+local function DetermineRouteStage(route, waypoint)
+    if not route then
+        return 'REPATH'
+    end
+
+    if not route.initialFormComplete then
+        if route.isIngressRoute and route.currentIndex == 1 then
+            return 'INGRESS'
+        end
+        return 'MARCH'
+    end
+
+    if waypoint and waypoint.staging then
+        return 'STAGING'
+    end
+
+    if waypoint and waypoint.waypointType == 'ingress' then
+        return 'INGRESS'
+    end
+
+    if waypoint and waypoint.aggressiveMove then
+        return 'ASSAULT'
+    end
+
+    return 'MARCH'
+end
+
+local function GetPlatoonMainBodyCenter(units)
+    if not units then
+        return nil, 0
+    end
+
+    local positions = {}
+    for _, unit in ipairs(units) do
+        if unit and not unit.Dead and unit.GetPosition then
+            local pos = unit:GetPosition()
+            if pos then
+                table.insert(positions, { pos[1] or 0, pos[2] or 0, pos[3] or 0 })
+            end
+        end
+    end
+
+    local count = table.getn(positions)
+    if count == 0 then
+        return nil, 0
+    end
+
+    local bestCenter = positions[1]
+    local bestCount = 0
+    local bestScore = HugeNumber
+
+    for _, candidate in ipairs(positions) do
+        local clusterCount = 0
+        local clusterScore = 0
+        for _, other in ipairs(positions) do
+            local distanceSq = DistSq(candidate, other)
+            if distanceSq <= CohesionMainBodyRadiusSq then
+                clusterCount = clusterCount + 1
+                clusterScore = clusterScore + distanceSq
+            end
+        end
+
+        if clusterCount > bestCount or (clusterCount == bestCount and clusterScore < bestScore) then
+            bestCenter = candidate
+            bestCount = clusterCount
+            bestScore = clusterScore
+        end
+    end
+
+    local sumX = 0
+    local sumY = 0
+    local sumZ = 0
+    local mainBodyCount = 0
+    for _, pos in ipairs(positions) do
+        if DistSq(bestCenter, pos) <= CohesionMainBodyRadiusSq then
+            sumX = sumX + VecX(pos)
+            sumY = sumY + VecY(pos)
+            sumZ = sumZ + VecZ(pos)
+            mainBodyCount = mainBodyCount + 1
+        end
+    end
+
+    if mainBodyCount == 0 then
+        return CopyVec(bestCenter), bestCount
+    end
+
+    return { sumX / mainBodyCount, sumY / mainBodyCount, sumZ / mainBodyCount }, mainBodyCount
+end
+
+local function SamplePlatoonCohesion(units)
+    local mainBodyCenter, mainBodyCount = GetPlatoonMainBodyCenter(units)
+    if not mainBodyCenter then
+        return false, nil
+    end
+
+    local totalUnits = 0
+    local outliers = 0
+    local severeOutliers = 0
+    local worstDistanceSq = 0
+    for _, unit in ipairs(units or {}) do
+        if unit and not unit.Dead then
+            totalUnits = totalUnits + 1
+            local distanceSq = UnitDistanceSqToPoint(unit, mainBodyCenter)
+            if distanceSq > CohesionStragglerDistanceSq then
+                outliers = outliers + 1
+                if distanceSq > CohesionWorstOutlierDistanceSq then
+                    severeOutliers = severeOutliers + 1
+                end
+                if distanceSq > worstDistanceSq then
+                    worstDistanceSq = distanceSq
+                end
+            end
+        end
+    end
+
+    local details = {
+        center = mainBodyCenter,
+        totalUnits = totalUnits,
+        mainBodyCount = mainBodyCount,
+        outliers = outliers,
+        severeOutliers = severeOutliers,
+        worstDistanceSq = worstDistanceSq,
+    }
+
+    if totalUnits <= 2 then
+        return false, details
+    end
+
+    local missingForReform = math.max(
+        CohesionReformMinMissingUnits,
+        math.ceil(totalUnits * CohesionReformOutlierRatio)
+    )
+    details.missingForReform = missingForReform
+
+    local mainBodyStable = mainBodyCount >= math.max(2, math.ceil(totalUnits * 0.55))
+    local enoughOutliers = outliers >= missingForReform
+    local severeBreak = severeOutliers >= math.max(1, math.floor(missingForReform * 0.5))
+    local broken = mainBodyStable and enoughOutliers and (severeBreak or outliers >= (missingForReform + 1))
+
+    return broken, details
+end
+
+local function UpdateRouteCohesionState(route, units)
+    if not route then
+        return nil
+    end
+
+    local broken, details = SamplePlatoonCohesion(units)
+    route.cohesionBroken = broken and true or false
+    route.cohesionState = details
+    return details
+end
+
+local function BuildStrictSegmentRepairPath(layer, fromPos, toPos, depth)
+    if SegmentPassableStrict(layer, fromPos, toPos) then
+        return { CopyVec(fromPos), CopyVec(toPos) }
+    end
+
+    if depth >= StrictSegmentRepairMaxDepth then
+        return nil
+    end
+
+    local ok, navPath = pcall(NavUtils.PathTo, layer, fromPos, toPos)
+    if not (ok and navPath and table.getn(navPath) > 0) then
+        return nil
+    end
+
+    local rawRoute = { CopyVec(fromPos) }
+    for _, point in ipairs(navPath) do
+        table.insert(rawRoute, CopyVec(point))
+        MaybeYieldRouteBuild('strict-segment-nav')
+    end
+
+    local last = rawRoute[table.getn(rawRoute)]
+    if not last or DistSq(last, toPos) > 1 then
+        table.insert(rawRoute, CopyVec(toPos))
+    end
+
+    if table.getn(rawRoute) <= 2 then
+        return nil
+    end
+
+    local repaired = { CopyVec(rawRoute[1]) }
+    for index = 2, table.getn(rawRoute) do
+        local targetPoint = rawRoute[index]
+        local segment = BuildStrictSegmentRepairPath(layer, repaired[table.getn(repaired)], targetPoint, depth + 1)
+        if not segment then
+            return nil
+        end
+        for segmentIndex = 2, table.getn(segment) - 1 do
+            segment[segmentIndex]._transitAnchor = true
+        end
+        AppendRouteSegment(repaired, segment)
+        MaybeYieldRouteBuild('strict-segment-repair')
+    end
+
+    return repaired
+end
+
+local function EnforceStrictRouteSegments(route, layer)
+    if not route or table.getn(route) <= 1 then
+        return route, false, {}
+    end
+
+    local repairedRoute = { CopyVec(route[1]) }
+    local repaired = false
+    local failures = {}
+
+    for index = 2, table.getn(route) do
+        local segmentStart = repairedRoute[table.getn(repairedRoute)]
+        local segmentEnd = route[index]
+        if SegmentPassableStrict(layer, segmentStart, segmentEnd) then
+            table.insert(repairedRoute, CopyVec(segmentEnd))
+        else
+            repaired = true
+            table.insert(failures, {
+                index = index - 1,
+                fromPos = CopyVec(segmentStart),
+                toPos = CopyVec(segmentEnd),
+            })
+            RouteBuildLog(ActiveRouteBuildContext, ('strict segment failure index=%d from=(%.1f, %.1f) to=(%.1f, %.1f)'):format(
+                index - 1,
+                VecX(segmentStart), VecZ(segmentStart),
+                VecX(segmentEnd), VecZ(segmentEnd)
+            ))
+            local repairSegment = BuildStrictSegmentRepairPath(layer, segmentStart, segmentEnd, 0)
+            if not repairSegment then
+                return nil, repaired, failures
+            end
+            AppendRouteSegment(repairedRoute, repairSegment)
+        end
+        MaybeYieldRouteBuild('strict-route-pass')
+    end
+
+    return RemoveDuplicateRoutePoints(repairedRoute, 2), repaired, failures
+end
+
+local function BuildRouteDebugSummary(selectedSummary, context, routeVariant)
+    local summary = {}
+    if type(selectedSummary) == 'table' then
+        for key, value in pairs(selectedSummary) do
+            summary[key] = value
+        end
+    end
+
+    summary.selected = routeVariant or summary.selected or 'default'
+    if context then
+        summary.totalBuildTime = context.totalTime or 0
+        summary.stageTimings = context.stageTimings or {}
+        summary.yieldCount = context.yieldCount or 0
+        summary.yielded = (context.yieldCount or 0) > 0
+        summary.yieldReasons = context.yieldReasons or {}
+        summary.repairedAfterShaping = context.repairedAfterShaping and true or false
+        summary.strictFailures = context.strictFailures or {}
+    end
+    return summary
+end
+
+local function RestoreSavedRoute(cacheKey)
+    if not cacheKey then
+        return nil
+    end
+
+    local cache = ResolveScenarioRouteCache()
+    local stored = cache.routes[cacheKey]
+    if not stored then
+        return nil
+    end
+
+    local clone = CloneStoredRouteTemplate(stored)
+    if clone then
+        RouteStamp = RouteStamp + 1
+        clone.stamp = RouteStamp
+    end
+    if clone and clone.debugSummary then
+        clone.debugSummary.cacheHit = true
+        clone.debugSummary.cacheKey = cacheKey
+    end
+    return clone
+end
+
+local function SaveRouteTemplate(cacheKey, stored)
+    if not (cacheKey and stored) then
+        return
+    end
+
+    local cache = ResolveScenarioRouteCache()
+    cache.routes[cacheKey] = CloneStoredRouteTemplate(stored)
+end
+
+local WaypointMetadataContext = {
+    DefaultAssaultRadius = DefaultAssaultRadius,
+    DefaultStagingRadius = DefaultStagingRadius,
+    DefaultAssaultLeadDistance = DefaultAssaultLeadDistance,
+    PlatoonTraversalQueueWindow = PlatoonTraversalQueueWindow,
+    ContinuousReachDistanceSq = ContinuousReachDistanceSq,
+    SegmentReachDistanceSq = SegmentReachDistanceSq,
+    RoutePreferredClearance = RoutePreferredClearance,
+    CopyVec = CopyVec,
+    SetPointSurface = SetPointSurface,
+    DetermineWaypointType = DetermineWaypointType,
+    DetermineWaypointFacing = DetermineWaypointFacing,
+    SegmentLength = SegmentLength,
+    AngleDeltaDegrees = AngleDeltaDegrees,
+    AnalyzeSegmentClearance = AnalyzeSegmentClearance,
+    DetermineWaypointQueueDistanceSq = DetermineWaypointQueueDistanceSq,
+}
+
+local function BuildWaypointMetadata(platoon, route, destination, opts, layer, startedOutside, ingressEdge, debugSummary)
+    local ctx = WaypointMetadataContext
     local metadata = {}
     local formation = opts and opts.Formation or nil
-    local aggressiveMove = opts and opts.AggressiveMove and true or false
+    local assaultRadius = math.max(20, opts and opts.AssaultRadius or ctx.DefaultAssaultRadius)
+    local stagingRadius = math.max(assaultRadius + 10, opts and opts.StagingRadius or ctx.DefaultStagingRadius)
+    local formationFootprint = RoutingUtils.EstimatePlatoonFootprint(platoon, formation, opts)
+    local aggressionRouteInfo = {
+        targetPosition = opts and opts.TargetPosition or destination,
+        assaultRadius = assaultRadius,
+        stagingRadius = stagingRadius,
+        assaultLeadDistance = opts and opts.AssaultLeadDistance or ctx.DefaultAssaultLeadDistance,
+        formationFootprint = formationFootprint,
+    }
+    local assaultTransitionRadius = RoutingUtils.ResolveAssaultTransitionRadius(aggressionRouteInfo, opts)
 
     for i = 2, table.getn(route) do
-        local point = CopyVec(route[i])
-        SetPointSurface(point, layer)
+        local point = ctx.CopyVec(route[i])
+        ctx.SetPointSurface(point, layer)
         local prevPoint = route[i - 1] or point
         local nextPoint = route[i + 1] or point
-        local waypointType = 'transit'
-        if point._ingress then
-            waypointType = 'ingress'
-        elseif i == table.getn(route) then
-            waypointType = 'pre-attack'
-        elseif point._curve then
-            waypointType = 'curve'
-        elseif point._corridor then
-            waypointType = 'corridor'
-        end
-
-        local arrivalFacing = HeadingDegrees(prevPoint, point)
-        local departureFacing = HeadingDegrees(point, nextPoint)
-        if i == table.getn(route) or DistSq(point, nextPoint) <= 1 then
-            departureFacing = arrivalFacing
-        end
-
-        local staging = waypointType == 'pre-attack' or waypointType == 'ingress' or point._anchor and true or false
+        local waypointType, staging = ctx.DetermineWaypointType(point, i, table.getn(route), opts and opts.RequireFinalStaging)
         local continuous = not staging
 
-        table.insert(metadata, {
+        local arrivalFacing, departureFacing, flowFacing, commandFacing = ctx.DetermineWaypointFacing(prevPoint, point, nextPoint, waypointType, continuous)
+        local segmentLength = ctx.SegmentLength(prevPoint, point)
+        local nextSegmentLength = ctx.SegmentLength(point, nextPoint)
+        local turnAngle = ctx.AngleDeltaDegrees(arrivalFacing, departureFacing)
+        local reachDistanceSq = continuous and ctx.ContinuousReachDistanceSq or ctx.SegmentReachDistanceSq
+        local corridorInfo = ctx.AnalyzeSegmentClearance(layer, prevPoint, point, ctx.RoutePreferredClearance)
+
+        local waypoint = {
             position = point,
-            useFormation = formation and formation ~= 'NoFormation' and true or false,
-            aggressiveMove = aggressiveMove,
-            facing = arrivalFacing,
+            aggressiveMove = false,
+            moveMode = 'move',
+            facing = commandFacing,
             arrivalFacing = arrivalFacing,
             departureFacing = departureFacing,
+            flowFacing = flowFacing,
+            commandFacing = commandFacing,
             waypointType = waypointType,
             staging = staging,
+            allowReform = staging and waypointType ~= 'ingress' and true or false,
             continuous = continuous,
-            allowReform = staging,
-            reachDistanceSq = continuous and ContinuousReachDistanceSq or SegmentReachDistanceSq,
-            queueDistanceSq = continuous and ContinuousQueueDistanceSq or SegmentReachDistanceSq,
-            segmentStart = CopyVec(prevPoint),
-            segmentEnd = CopyVec(point),
-            nextSegmentEnd = CopyVec(nextPoint),
-        })
+            reachDistanceSq = reachDistanceSq,
+            queueDistanceSq = continuous and ctx.DetermineWaypointQueueDistanceSq(waypointType, segmentLength, nextSegmentLength, turnAngle) or reachDistanceSq,
+            segmentStart = ctx.CopyVec(prevPoint),
+            segmentEnd = ctx.CopyVec(point),
+            nextSegmentEnd = ctx.CopyVec(nextPoint),
+            segmentLength = segmentLength,
+            nextSegmentLength = nextSegmentLength,
+            turnAngle = turnAngle,
+            corridorWidth = corridorInfo and corridorInfo.total or 0,
+            localClearance = corridorInfo and corridorInfo.minimum or 0,
+        }
+
+        waypoint.aggressiveMove, waypoint.moveMode = RoutingUtils.DetermineSegmentAggression(
+            aggressionRouteInfo,
+            waypoint,
+            i - 1,
+            math.max(1, table.getn(route) - 1),
+            opts
+        )
+
+        table.insert(metadata, waypoint)
     end
 
     RouteStamp = RouteStamp + 1
-    return {
+    local stored = {
         stamp = RouteStamp,
         createdAt = GetGameTimeSeconds and GetGameTimeSeconds() or 0,
         currentIndex = 1,
-        destination = CopyVec(destination),
-        targetPosition = opts and opts.TargetPosition and CopyVec(opts.TargetPosition) or CopyVec(destination),
+        lastQueuedIndex = 0,
+        lastIssuedIndex = nil,
+        lastIssuedTime = nil,
+        routeStage = 'INGRESS',
+        routeState = 'INGRESS',
+        initialFormComplete = false,
+        initialFormIssuedTime = nil,
+        cohesionBroken = false,
+        cohesionState = nil,
+        queueWindow = (opts and opts.QueueWindow) or ctx.PlatoonTraversalQueueWindow,
+        destination = ctx.CopyVec(destination),
+        startPosition = route and route[1] and ctx.CopyVec(route[1]) or nil,
+        targetPosition = opts and opts.TargetPosition and ctx.CopyVec(opts.TargetPosition) or ctx.CopyVec(destination),
         targetZone = opts and opts.TargetZone or nil,
         layer = layer,
-        aggressiveMove = aggressiveMove,
+        aggressiveMove = opts and opts.AggressiveMove and true or false,
         formation = formation,
         routeSource = opts and opts.RouteSource or nil,
+        routeCacheTag = opts and opts.RouteCacheTag or nil,
+        randomizeRoute = opts and opts.RandomizeRoute and true or false,
+        routeVariant = opts and opts.RouteVariant or 'default',
+        graphPolicyReason = opts and opts.GraphPolicyReason or nil,
+        useGraphRouting = opts and opts.UseGraphRouting and true or false,
+        routeChain = opts and (opts.RouteChain or opts.Chain or opts.ChainName or opts.MarkerChain) or nil,
         startedOutsidePlayableArea = startedOutside and true or false,
         ingressEdge = ingressEdge,
+        isIngressRoute = ingressEdge ~= nil,
+        assaultRadius = assaultRadius,
+        stagingRadius = stagingRadius,
+        assaultLeadDistance = aggressionRouteInfo.assaultLeadDistance,
+        assaultTransitionRadius = assaultTransitionRadius,
+        debugEnabled = opts and opts.Debug and true or false,
+        debugSummary = debugSummary,
         waypoints = metadata,
+        queuedIndex = nil,
+        squadPlan = nil,
+        formationFootprint = formationFootprint,
     }
+
+    stored.squadPlan = RoutingGraph.BuildSquadPlan(stored, stored.formationFootprint)
+    if stored.squadPlan and stored.squadPlan.requiresSplit then
+        for _, splitIndex in ipairs(stored.squadPlan.splitIndices or {}) do
+            local waypoint = stored.waypoints[splitIndex]
+            if waypoint then
+                waypoint.splitRequired = true
+            end
+        end
+        for _, rejoinIndex in ipairs(stored.squadPlan.rejoinIndices or {}) do
+            local waypoint = stored.waypoints[rejoinIndex]
+            if waypoint then
+                waypoint.rejoinSuggested = true
+                waypoint.allowReform = true
+            end
+        end
+    end
+
+    return stored
 end
 
 local function SyncRouteOptions(route, opts)
@@ -814,31 +2723,125 @@ local function SyncRouteOptions(route, opts)
     if opts and opts.RouteSource ~= nil then
         route.routeSource = opts.RouteSource
     end
+    if opts and opts.RouteCacheTag ~= nil then
+        route.routeCacheTag = opts.RouteCacheTag
+    end
     if opts and opts.StartedOutsidePlayableArea ~= nil then
         route.startedOutsidePlayableArea = opts.StartedOutsidePlayableArea and true or false
     end
+    if opts and opts.RandomizeRoute ~= nil then
+        route.randomizeRoute = opts.RandomizeRoute and true or false
+    end
+    if opts and opts.RouteVariant ~= nil then
+        route.routeVariant = opts.RouteVariant
+    end
+    if opts and opts.GraphPolicyReason ~= nil then
+        route.graphPolicyReason = opts.GraphPolicyReason
+    end
+    if opts and opts.UseGraphRouting ~= nil then
+        route.useGraphRouting = opts.UseGraphRouting and true or false
+    end
+    if opts and (opts.RouteChain ~= nil or opts.Chain ~= nil or opts.ChainName ~= nil or opts.MarkerChain ~= nil) then
+        route.routeChain = opts.RouteChain or opts.Chain or opts.ChainName or opts.MarkerChain
+    end
+    if opts and opts.QueueWindow ~= nil then
+        route.queueWindow = math.max(1, opts.QueueWindow)
+    end
+    if opts and opts.AssaultRadius ~= nil then
+        route.assaultRadius = math.max(20, opts.AssaultRadius)
+    end
+    if opts and opts.StagingRadius ~= nil then
+        route.stagingRadius = math.max(route.assaultRadius or DefaultAssaultRadius, opts.StagingRadius)
+    end
+    if opts and opts.AssaultLeadDistance ~= nil then
+        route.assaultLeadDistance = math.max(0, opts.AssaultLeadDistance)
+    end
+    if opts and opts.Debug ~= nil then
+        route.debugEnabled = opts.Debug and true or false
+    end
 
-    for _, waypoint in ipairs(route.waypoints or {}) do
-        waypoint.useFormation = route.formation and route.formation ~= 'NoFormation' and true or false
-        waypoint.aggressiveMove = route.aggressiveMove
+    route.assaultRadius = route.assaultRadius or DefaultAssaultRadius
+    route.stagingRadius = route.stagingRadius or DefaultStagingRadius
+    route.assaultLeadDistance = route.assaultLeadDistance or DefaultAssaultLeadDistance
+    route.formationFootprint = route.formationFootprint or RoutingUtils.EstimatePlatoonFootprint(nil, route.formation, opts)
+    route.assaultTransitionRadius = RoutingUtils.ResolveAssaultTransitionRadius(route, opts)
+
+    local waypointCount = table.getn(route.waypoints or {})
+    for index, waypoint in ipairs(route.waypoints or {}) do
+        waypoint.aggressiveMove, waypoint.moveMode = RoutingUtils.DetermineSegmentAggression(route, waypoint, index, waypointCount, opts or route)
         if waypoint.segmentStart and waypoint.segmentEnd then
-            waypoint.arrivalFacing = HeadingDegrees(waypoint.segmentStart, waypoint.segmentEnd)
-            waypoint.facing = waypoint.arrivalFacing
+            waypoint.arrivalFacing, waypoint.departureFacing, waypoint.flowFacing, waypoint.commandFacing = DetermineWaypointFacing(
+                waypoint.segmentStart,
+                waypoint.segmentEnd,
+                waypoint.nextSegmentEnd,
+                waypoint.waypointType,
+                waypoint.continuous
+            )
+            waypoint.facing = waypoint.commandFacing
+            waypoint.segmentLength = SegmentLength(waypoint.segmentStart, waypoint.segmentEnd)
         end
         if waypoint.segmentEnd and waypoint.nextSegmentEnd then
-            waypoint.departureFacing = HeadingDegrees(waypoint.segmentEnd, waypoint.nextSegmentEnd)
+            waypoint.nextSegmentLength = SegmentLength(waypoint.segmentEnd, waypoint.nextSegmentEnd)
             if DistSq(waypoint.segmentEnd, waypoint.nextSegmentEnd) <= 1 then
                 waypoint.departureFacing = waypoint.arrivalFacing or waypoint.departureFacing
             end
         else
             waypoint.departureFacing = waypoint.arrivalFacing or waypoint.facing
+            waypoint.nextSegmentLength = 0
         end
+        waypoint.turnAngle = AngleDeltaDegrees(waypoint.arrivalFacing, waypoint.departureFacing)
+        waypoint.queueDistanceSq = waypoint.continuous
+            and DetermineWaypointQueueDistanceSq(
+                waypoint.waypointType,
+                waypoint.segmentLength or 0,
+                waypoint.nextSegmentLength or 0,
+                waypoint.turnAngle or 0
+            )
+            or (waypoint.reachDistanceSq or SegmentReachDistanceSq)
     end
 
+    route.queuedIndex = route.lastQueuedIndex and route.lastQueuedIndex > 0 and route.lastQueuedIndex or nil
     return route
 end
 
+local BuildPlatoonRouteContext = {
+    ResolveLayer = ResolveLayer,
+    DetermineStartState = DetermineStartState,
+    ClampToPlayableArea = ClampToPlayableArea,
+    CopyVec = CopyVec,
+    SetPointSurface = SetPointSurface,
+    ResolveRouteCacheKey = ResolveRouteCacheKey,
+    RestoreSavedRoute = RestoreSavedRoute,
+    SyncRouteOptions = SyncRouteOptions,
+    CreateRouteBuildContext = CreateRouteBuildContext,
+    RouteBuildLog = RouteBuildLog,
+    FormatRoutePosition = FormatRoutePosition,
+    VecX = VecX,
+    VecY = VecY,
+    VecZ = VecZ,
+    PlatoonNeedsIngress = PlatoonNeedsIngress,
+    RouteBuildSetStage = RouteBuildSetStage,
+    BuildCardinalIngress = BuildCardinalIngress,
+    CollectRouteCandidates = CollectRouteCandidates,
+    SelectRouteCandidate = SelectRouteCandidate,
+    MaybeYieldRouteBuild = MaybeYieldRouteBuild,
+    RemoveDuplicateRoutePoints = RemoveDuplicateRoutePoints,
+    RemoveRouteDoubleBack = RemoveRouteDoubleBack,
+    ResolveRouteChainNames = ResolveRouteChainNames,
+    ApplyMarkerChainGuidance = ApplyMarkerChainGuidance,
+    SimplifyRoutePreservingSafety = SimplifyRoutePreservingSafety,
+    EnforceStrictRouteSegments = EnforceStrictRouteSegments,
+    BuildWaypointMetadata = BuildWaypointMetadata,
+    FinalizeRouteBuildContext = FinalizeRouteBuildContext,
+    BuildRouteDebugSummary = BuildRouteDebugSummary,
+    SaveRouteTemplate = SaveRouteTemplate,
+    DefaultAssaultRadius = DefaultAssaultRadius,
+    DefaultStagingRadius = DefaultStagingRadius,
+    DefaultAssaultLeadDistance = DefaultAssaultLeadDistance,
+}
+
 function BuildPlatoonRoute(platoon, destination, opts)
+    local ctx = BuildPlatoonRouteContext
     if not (platoon and destination) then
         return nil
     end
@@ -848,48 +2851,198 @@ function BuildPlatoonRoute(platoon, destination, opts)
         return nil
     end
 
-    local layer = ResolveLayer(platoon, opts)
-    local startPos, area, startedOutside = DetermineStartState(platoon, opts)
+    local layer = ctx.ResolveLayer(platoon, opts)
+    local startPos, area, startedOutside, startSource = ctx.DetermineStartState(platoon, opts)
     if not startPos then
         return nil
     end
 
-    local target = area and ClampToPlayableArea(destination, area, 0) or CopyVec(destination)
-    SetPointSurface(target, layer)
+    local useGraphRouting, graphPolicyReason = ShouldUseGraphRouting(platoon, opts)
+    EnsureMissionRoutingGraph(platoon, opts, area)
 
-    local route = { CopyVec(startPos) }
-    local routingStart = CopyVec(startPos)
-    local ingressEdge = nil
+    local target = area and ctx.ClampToPlayableArea(destination, area, 0) or ctx.CopyVec(destination)
+    ctx.SetPointSurface(target, layer)
 
-    if PlatoonNeedsIngress(platoon, opts) then
-        local ingress
-        ingress, ingressEdge = BuildCardinalIngress(startPos, area, layer)
-        if ingress then
-            table.insert(route, CopyVec(ingress))
-            routingStart = CopyVec(ingress)
+    local cacheKey = ctx.ResolveRouteCacheKey(platoon, opts, layer, startPos, target)
+    if not (opts and opts.ForceRepath) then
+        local cached = ctx.RestoreSavedRoute(cacheKey)
+        if cached then
+            cached.destination = ctx.CopyVec(target)
+            cached.targetPosition = opts and opts.TargetPosition and ctx.CopyVec(opts.TargetPosition) or ctx.CopyVec(target)
+            cached.startPosition = ctx.CopyVec(startPos)
+            cached.routeCacheKey = cacheKey
+            ctx.SyncRouteOptions(cached, opts)
+            platoon._storedRoute = cached
+            return cached
         end
     end
 
-    local basePath = BuildBasePath(layer, routingStart, target)
-    if not basePath then
+    local buildContext = ctx.CreateRouteBuildContext(opts)
+    ActiveRouteBuildContext = buildContext
+
+    local route = { ctx.CopyVec(startPos) }
+    local routingStart = ctx.CopyVec(startPos)
+    local ingressEdge = nil
+
+    local ingressAllowed, ingressDecision = ctx.PlatoonNeedsIngress(platoon, opts)
+    ctx.RouteBuildLog(buildContext, ('route start selected source=%s position=%s'):format(
+        tostring(startSource or 'unknown'),
+        ctx.FormatRoutePosition(startPos)
+    ))
+    ctx.RouteBuildLog(buildContext, ('ingress routeSource=%s startSource=%s startPosition=(%.2f, %.2f, %.2f) startedOutsidePlayableArea=%s disableIngress=%s requested=%s allowed=%s currentOutsidePlayableArea=%s'):format(
+        tostring(ingressDecision and ingressDecision.routeSource or false),
+        tostring(startSource or 'unknown'),
+        ctx.VecX(startPos),
+        ctx.VecY(startPos),
+        ctx.VecZ(startPos),
+        tostring(ingressDecision and ingressDecision.startedOutsidePlayableArea or false),
+        tostring(ingressDecision and ingressDecision.disableIngress or false),
+        tostring(ingressDecision and ingressDecision.requested or false),
+        tostring(ingressAllowed),
+        tostring(ingressDecision and ingressDecision.currentOutsidePlayableArea or false)
+    ))
+    if ingressDecision and not ingressAllowed and ingressDecision.skipReason then
+        ctx.RouteBuildLog(buildContext, ('ingress skipped reason=%s'):format(tostring(ingressDecision.skipReason)))
+    end
+
+    if ingressAllowed then
+        ctx.RouteBuildSetStage(buildContext, 'ingress')
+        local ingress
+        ingress, ingressEdge = ctx.BuildCardinalIngress(startPos, area, layer)
+        if ingress then
+            table.insert(route, ctx.CopyVec(ingress))
+            routingStart = ctx.CopyVec(ingress)
+            ctx.RouteBuildLog(buildContext, ('ingress waypoint edge=%s position=(%.2f, %.2f, %.2f)'):format(
+                tostring(ingressEdge or rawget(ingress, '_ingressEdge') or false),
+                ctx.VecX(ingress),
+                ctx.VecY(ingress),
+                ctx.VecZ(ingress)
+            ))
+        else
+            ctx.RouteBuildLog(buildContext, 'ingress allowed but no playable ingress waypoint was found')
+        end
+    end
+
+    ctx.RouteBuildSetStage(buildContext, 'candidate-generation')
+    local candidateOpts = {}
+    if type(opts) == 'table' then
+        for key, value in pairs(opts) do
+            candidateOpts[key] = value
+        end
+    end
+    candidateOpts.UseGraphRouting = useGraphRouting
+    candidateOpts.GraphPolicyReason = graphPolicyReason
+    candidateOpts.GraphConfig = ResolveGraphConfig(opts, platoon)
+    local candidates = ctx.CollectRouteCandidates(layer, routingStart, target, candidateOpts, area)
+    local selected, debugSummary = ctx.SelectRouteCandidate(candidates, opts)
+    if not (selected and selected.path) then
+        ActiveRouteBuildContext = false
         return nil
     end
 
-    for i = 2, table.getn(basePath) do
-        table.insert(route, CopyVec(basePath[i]))
+    ctx.RouteBuildLog(buildContext, ('candidateCount=%d viableCount=%d chosenRouteType=%s randomize=%s uniform=%s'):format(
+        table.getn(candidates or {}),
+        debugSummary and debugSummary.viable or table.getn(candidates or {}),
+        tostring(debugSummary and debugSummary.selected or selected.routeType or 'default'),
+        tostring(debugSummary and debugSummary.randomized or false),
+        tostring(debugSummary and debugSummary.uniformRandom or false)
+    ))
+
+    for i = 2, table.getn(selected.path) do
+        table.insert(route, ctx.CopyVec(selected.path[i]))
+        ctx.MaybeYieldRouteBuild('selected-route-copy')
     end
 
-    route = RemoveDuplicateRoutePoints(route, 2)
-    route = RemoveRouteDoubleBack(route)
-    route = CenterRouteThroughCorridors(route, layer, area)
-    route = SmoothRouteCorners(route, layer, area)
-    route = CenterRouteThroughCorridors(route, layer, area)
-    route = SimplifyRoutePreservingSafety(route, layer)
+    ctx.RouteBuildSetStage(buildContext, 'route-shaping')
+    route = ctx.RemoveDuplicateRoutePoints(route, 2)
+    route = ctx.RemoveRouteDoubleBack(route)
+    local appliedChainName = nil
+    local chainNames = ctx.ResolveRouteChainNames(platoon, opts)
+    if table.getn(chainNames) > 0 then
+        route, appliedChainName = ctx.ApplyMarkerChainGuidance(route, layer, chainNames)
+    end
+    route = ctx.SimplifyRoutePreservingSafety(route, layer)
 
-    local stored = BuildWaypointMetadata(route, target, opts, layer, startedOutside, ingressEdge)
-    SyncRouteOptions(stored, opts)
+    ctx.RouteBuildSetStage(buildContext, 'strict-segment-repair')
+    -- Run a final strict center-line pass after all shaping so simplification or
+    -- smoothing cannot leave a visible waypoint-to-waypoint segment crossing
+    -- blocked terrain. Failed segments are rebuilt before movement begins.
+    local repaired
+    route, repaired, buildContext.strictFailures = ctx.EnforceStrictRouteSegments(route, layer)
+    buildContext.repairedAfterShaping = repaired and true or false
+    if not route then
+        ctx.RouteBuildLog(buildContext, 'strict segment repair failed after shaping')
+        ActiveRouteBuildContext = false
+        return nil
+    end
+
+    if repaired then
+        ctx.RouteBuildLog(buildContext, ('strict segment repair inserted bends for %d segment(s)'):format(table.getn(buildContext.strictFailures or {})))
+    end
+
+    local buildOpts = {}
+    if type(opts) == 'table' then
+        for k, v in pairs(opts) do
+            buildOpts[k] = v
+        end
+    end
+    buildOpts.RouteVariant = selected.routeType or 'default'
+
+    buildOpts.AssaultRadius = buildOpts.AssaultRadius or ctx.DefaultAssaultRadius
+    buildOpts.StagingRadius = buildOpts.StagingRadius or ctx.DefaultStagingRadius
+    buildOpts.AssaultLeadDistance = buildOpts.AssaultLeadDistance or ctx.DefaultAssaultLeadDistance
+    buildOpts.Debug = buildOpts.Debug and true or false
+
+    ctx.RouteBuildSetStage(buildContext, 'waypoint-metadata')
+    local stored = ctx.BuildWaypointMetadata(platoon, route, target, buildOpts, layer, startedOutside, ingressEdge, debugSummary)
+    ctx.FinalizeRouteBuildContext(buildContext)
+    debugSummary = ctx.BuildRouteDebugSummary(debugSummary, buildContext, selected.routeType or 'default')
+    ctx.RouteBuildLog(buildContext, ('routeBuildSeconds=%.4f stages={candidates=%.4f shaping=%.4f strict=%.4f metadata=%.4f} yielded=%s count=%d repaired=%s'):format(
+        debugSummary.totalBuildTime or 0,
+        (debugSummary.stageTimings and debugSummary.stageTimings['candidate-generation']) or 0,
+        (debugSummary.stageTimings and debugSummary.stageTimings['route-shaping']) or 0,
+        (debugSummary.stageTimings and debugSummary.stageTimings['strict-segment-repair']) or 0,
+        (debugSummary.stageTimings and debugSummary.stageTimings['waypoint-metadata']) or 0,
+        tostring(debugSummary.yielded or false),
+        debugSummary.yieldCount or 0,
+        tostring(debugSummary.repairedAfterShaping or false)
+    ))
+
+    stored.debugSummary = debugSummary
+    stored.routeCacheKey = cacheKey
+    stored.routeChainUsed = appliedChainName
+    SyncRouteOptions(stored, buildOpts)
     platoon._storedRoute = stored
+    ctx.SaveRouteTemplate(cacheKey, stored)
+    ActiveRouteBuildContext = false
     return stored
+end
+
+local function SelectPartialReplanAnchor(platoon, stored)
+    if not (platoon and stored and stored.waypoints and table.getn(stored.waypoints) > 0) then
+        return nil, nil
+    end
+
+    local platoonPos = platoon.GetPlatoonPosition and platoon:GetPlatoonPosition()
+    if not platoonPos then
+        return nil, nil
+    end
+
+    local startIndex = math.max(1, stored.currentIndex or 1)
+    local bestIndex = nil
+    local bestDistanceSq = HugeNumber
+    for index = startIndex, math.min(table.getn(stored.waypoints), startIndex + 8) do
+        local waypoint = stored.waypoints[index]
+        if waypoint and waypoint.position and DistSq(platoonPos, waypoint.position) < bestDistanceSq then
+            bestDistanceSq = DistSq(platoonPos, waypoint.position)
+            bestIndex = index
+        end
+    end
+
+    if bestIndex and bestDistanceSq <= (36 * 36) then
+        return CopyVec(stored.waypoints[bestIndex].position), bestIndex
+    end
+    return nil, nil
 end
 
 function RebuildPlatoonRouteIfNeeded(platoon, destination, opts)
@@ -901,6 +3054,8 @@ function RebuildPlatoonRouteIfNeeded(platoon, destination, opts)
     local layer = ResolveLayer(platoon, opts)
     local expectedSource = (opts and opts.RouteSource)
         or (platoon.PlatoonData and platoon.PlatoonData.RouteSource)
+    local expectedCacheTag = ResolveRouteCacheTag(platoon, opts)
+    local expectedRouteChain = opts and (opts.RouteChain or opts.Chain or opts.ChainName or opts.MarkerChain) or nil
     local expectedOutside = nil
     if opts and opts.StartedOutsidePlayableArea ~= nil then
         expectedOutside = opts.StartedOutsidePlayableArea and true or false
@@ -909,7 +3064,12 @@ function RebuildPlatoonRouteIfNeeded(platoon, destination, opts)
     end
 
     if opts and opts.ForceRepath then
-        return BuildPlatoonRoute(platoon, destination, opts)
+        local rebuiltOpts = RoutingUtils.CopyOptions(opts)
+        local anchor = stored and SelectPartialReplanAnchor(platoon, stored) or nil
+        if anchor then
+            rebuiltOpts.RouteStart = anchor
+        end
+        return BuildPlatoonRoute(platoon, destination, rebuiltOpts)
     end
 
     if not (stored and stored.destination and stored.waypoints and table.getn(stored.waypoints) > 0) then
@@ -928,37 +3088,223 @@ function RebuildPlatoonRouteIfNeeded(platoon, destination, opts)
         return BuildPlatoonRoute(platoon, destination, opts)
     end
 
+    if expectedCacheTag and stored.routeCacheTag ~= expectedCacheTag then
+        return BuildPlatoonRoute(platoon, destination, opts)
+    end
+
     if expectedOutside ~= nil and stored.startedOutsidePlayableArea ~= expectedOutside then
+        return BuildPlatoonRoute(platoon, destination, opts)
+    end
+
+    if opts and opts.RandomizeRoute ~= nil and stored.randomizeRoute ~= (opts.RandomizeRoute and true or false) then
+        return BuildPlatoonRoute(platoon, destination, opts)
+    end
+
+    if expectedRouteChain and stored.routeChain ~= expectedRouteChain then
         return BuildPlatoonRoute(platoon, destination, opts)
     end
 
     return SyncRouteOptions(stored, opts)
 end
 
-local function IssueWaypointCommand(platoon, units, route, waypoint)
+local function HasWaypointBeenPassed(platoonPos, waypoint, nextWaypoint)
+    if not (platoonPos and waypoint and waypoint.position) then
+        return false
+    end
+
+    local reachDistanceSq = waypoint.reachDistanceSq or SegmentReachDistanceSq
+    local distSq = DistSq(platoonPos, waypoint.position)
+    if distSq <= reachDistanceSq then
+        return true
+    end
+
+    local progress, segmentLength = ProjectionAlongSegment(platoonPos, waypoint.segmentStart, waypoint.segmentEnd)
+    if segmentLength > 0 and progress >= math.max(segmentLength - 2, segmentLength * 0.92) then
+        return true
+    end
+
+    if nextWaypoint and nextWaypoint.position and segmentLength > 0 and progress >= math.max(segmentLength * 0.70, segmentLength - 5) then
+        local nextDistSq = DistSq(platoonPos, nextWaypoint.position)
+        if nextDistSq + 16 < distSq then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function AdvanceStoredRouteIndex(stored, nextIndex)
+    stored.currentIndex = nextIndex
+    if stored.lastQueuedIndex and stored.lastQueuedIndex < nextIndex then
+        stored.lastQueuedIndex = nextIndex - 1
+    end
+    stored.queuedIndex = stored.lastQueuedIndex and stored.lastQueuedIndex > 0 and stored.lastQueuedIndex or nil
+end
+
+local function ResetQueuedTraversal(route, anchorIndex)
+    if not route then
+        return
+    end
+
+    route.lastQueuedIndex = math.max(0, (anchorIndex or route.currentIndex or 1) - 1)
+    route.queuedIndex = route.lastQueuedIndex > 0 and route.lastQueuedIndex or nil
+end
+
+local function QueueWaypointOrder(platoon, units, route, waypoint, clearQueue)
     if not (platoon and units and route and waypoint and waypoint.position) then
         return false
     end
 
+    if clearQueue then
+        IssueClearCommands(units)
+    end
+
     local formation = route.formation
-    local position = waypoint.position
-    if waypoint.useFormation and formation and formation ~= 'NoFormation' then
+    local useFormation = formation and formation ~= 'NoFormation'
+    local facing = waypoint.commandFacing or waypoint.arrivalFacing or waypoint.flowFacing or waypoint.facing or 0
+
+    if useFormation then
         platoon:SetPlatoonFormationOverride(formation)
         if waypoint.aggressiveMove then
-            IssueFormAggressiveMove(units, position, formation, waypoint.facing or 0)
+            IssueFormAggressiveMove(units, waypoint.position, formation, facing)
         else
-            IssueFormMove(units, position, formation, waypoint.facing or 0)
+            IssueFormMove(units, waypoint.position, formation, facing)
         end
+        return true
+    end
+
+    platoon:SetPlatoonFormationOverride('NoFormation')
+    if waypoint.aggressiveMove then
+        IssueAggressiveMove(units, waypoint.position)
     else
-        platoon:SetPlatoonFormationOverride('NoFormation')
-        if waypoint.aggressiveMove then
-            IssueAggressiveMove(units, position)
-        else
-            IssueMove(units, position)
+        IssueMove(units, waypoint.position)
+    end
+    return true
+end
+
+local function QueueTraversalWindow(platoon, units, route)
+    if not (platoon and units and route and route.waypoints) then
+        return false
+    end
+
+    local waypointCount = table.getn(route.waypoints)
+    if waypointCount == 0 then
+        return false
+    end
+
+    local currentIndex = math.max(1, math.min(route.currentIndex or 1, waypointCount))
+    local queueWindow = math.max(1, route.queueWindow or PlatoonTraversalQueueWindow)
+    local queueLimit = math.min(waypointCount, currentIndex + queueWindow - 1)
+    local nextIndex = math.max(currentIndex, (route.lastQueuedIndex or 0) + 1)
+
+    for waypointIndex = nextIndex, queueLimit do
+        local waypoint = route.waypoints[waypointIndex]
+        if not (waypoint and waypoint.position and PointPassable(route.layer, waypoint.position)) then
+            return false
+        end
+
+        if not QueueWaypointOrder(platoon, units, route, waypoint, false) then
+            return false
+        end
+
+        route.lastQueuedIndex = waypointIndex
+        route.lastIssuedIndex = waypointIndex
+        route.lastIssuedTime = GetGameTimeSeconds and GetGameTimeSeconds() or route.lastIssuedTime
+    end
+
+    route.queuedIndex = route.lastQueuedIndex and route.lastQueuedIndex > 0 and route.lastQueuedIndex or nil
+    return true
+end
+
+local function ShouldExtendTraversalQueue(route, waypoint, platoonPos)
+    if not (route and waypoint and platoonPos) then
+        return false
+    end
+
+    if waypoint.staging or waypoint.allowReform or not waypoint.continuous then
+        return false
+    end
+
+    local queueDistanceSq = waypoint.queueDistanceSq or waypoint.reachDistanceSq or ContinuousQueueDistanceSq
+    return DistSq(platoonPos, waypoint.position) <= queueDistanceSq
+end
+
+local function IssueFormationOrder(platoon, units, route, waypoint, waypointIndex, commandMode)
+    if not (platoon and units and route and waypoint and waypoint.position) then
+        return false
+    end
+
+    local gameTime = GetGameTimeSeconds and GetGameTimeSeconds() or 0
+
+    if not QueueWaypointOrder(platoon, units, route, waypoint, true) then
+        return false
+    end
+
+    if commandMode == 'initial-form' then
+        route.initialFormComplete = true
+        route.initialFormIssuedTime = gameTime
+        if waypoint and waypoint.staging then
+            waypoint.stagingIssued = true
+        end
+    elseif commandMode == 'staging-form' and waypoint then
+        waypoint.stagingIssued = true
+    end
+
+    route.lastIssuedIndex = waypointIndex or route.lastIssuedIndex
+    route.lastIssuedTime = gameTime
+    ResetQueuedTraversal(route, (waypointIndex or route.currentIndex or 1) + 1)
+    return true
+end
+
+local function IssueInitialFormationOrder(platoon, units, route, waypoint, waypointIndex)
+    return IssueFormationOrder(platoon, units, route, waypoint, waypointIndex, 'initial-form')
+end
+
+local function IssueDeliberateStagingOrder(platoon, units, route, waypoint, waypointIndex)
+    return IssueFormationOrder(platoon, units, route, waypoint, waypointIndex, 'staging-form')
+end
+
+local function ShouldRepath(platoon, route, opts)
+    if not platoon then
+        return true, 'missing-platoon'
+    end
+
+    local stored = route or platoon._storedRoute
+    if not (stored and stored.waypoints and table.getn(stored.waypoints) > 0) then
+        return true, 'missing-route'
+    end
+
+    local platoonPos = platoon.GetPlatoonPosition and platoon:GetPlatoonPosition()
+    if not platoonPos then
+        return true, 'missing-position'
+    end
+
+    local targetPos = opts and opts.TargetPosition or stored.targetPosition or stored.destination
+    if not targetPos then
+        return true, 'missing-target'
+    end
+
+    if opts and opts.ForceRepath then
+        return true, 'forced'
+    end
+
+    if DistSq(stored.destination, targetPos) > 24 * 24 then
+        return true, 'target-shifted'
+    end
+
+    local currentWaypoint = stored.waypoints[stored.currentIndex or 1]
+    if currentWaypoint and currentWaypoint.position and not PointPassable(stored.layer, currentWaypoint.position) then
+        return true, 'segment-invalid'
+    end
+
+    if stored.startedOutsidePlayableArea and stored.isIngressRoute and stored.ingressEdge then
+        local area = GetPlayableArea()
+        if area and PositionInPlayableArea(platoonPos, area) and (stored.routeState == 'INGRESS' or stored.routeStage == 'INGRESS') then
+            return true, 'ingress-complete'
         end
     end
 
-    return true
+    return false, nil
 end
 
 function FollowStoredPlatoonRoute(platoon, destination, opts)
@@ -976,112 +3322,160 @@ function FollowStoredPlatoonRoute(platoon, destination, opts)
         return 'repath'
     end
 
-    IssueClearCommands(units)
+    local needsRepath, reason = ShouldRepath(platoon, stored, opts)
+    if needsRepath and reason ~= 'ingress-complete' then
+        stored.repathReason = reason
+        return 'repath'
+    end
 
-    local queuedWaypointIndex = nil
-    local index = math.max(1, math.min(stored.currentIndex or 1, table.getn(stored.waypoints)))
-    while index <= table.getn(stored.waypoints) do
-        local waypoint = stored.waypoints[index]
-        if not waypoint then
-            return 'repath'
-        end
+    local waypointCount = table.getn(stored.waypoints)
+    stored.currentIndex = math.max(1, math.min(stored.currentIndex or 1, waypointCount))
+    stored.lastQueuedIndex = math.max(0, math.min(stored.lastQueuedIndex or 0, waypointCount))
+    stored.queuedIndex = stored.lastQueuedIndex > 0 and stored.lastQueuedIndex or nil
 
-        local position = waypoint.position
-        if not (position and PointPassable(stored.layer, position)) then
-            return 'repath'
-        end
+    local lastProgressTime = GetGameTimeSeconds and GetGameTimeSeconds() or 0
+    local initialPlatoonPos = platoon:GetPlatoonPosition()
+    local lastProgressPosition = initialPlatoonPos and CopyVec(initialPlatoonPos) or nil
+    local lastProgressIndex = stored.currentIndex
+    local lastProgressDistanceSq = HugeNumber
 
+    while PlatoonAlive(platoon) do
         local platoonPos = platoon:GetPlatoonPosition()
         if not platoonPos then
             return 'fail'
         end
 
-        if DistSq(platoonPos, stored.destination) <= FinalAttackDistanceSq then
-            stored.currentIndex = index
+        local assaultTransitionRadius = stored.assaultTransitionRadius
+            or RoutingUtils.ResolveAssaultTransitionRadius(stored, opts)
+            or (stored.assaultRadius or DefaultAssaultRadius)
+        if DistSq(platoonPos, stored.destination) <= (assaultTransitionRadius * assaultTransitionRadius) then
+            stored.routeStage = 'ASSAULT'
+            stored.routeState = 'ASSAULT'
             return 'attack'
         end
 
-        local reachDistanceSq = waypoint.reachDistanceSq or SegmentReachDistanceSq
-        if DistSq(platoonPos, position) <= reachDistanceSq then
-            index = index + 1
-            stored.currentIndex = index
+        local repath, repathReason = ShouldRepath(platoon, stored, opts)
+        if repath then
+            stored.routeStage = 'REPATH'
+            stored.routeState = 'REPATH'
+            stored.repathReason = repathReason
+            return 'repath'
+        end
+
+        while stored.currentIndex <= waypointCount do
+            local waypoint = stored.waypoints[stored.currentIndex]
+            local nextWaypoint = stored.waypoints[stored.currentIndex + 1]
+            if not waypoint then
+                stored.routeStage = 'REPATH'
+                stored.routeState = 'REPATH'
+                return 'repath'
+            end
+            if not (waypoint.position and PointPassable(stored.layer, waypoint.position)) then
+                stored.routeStage = 'REPATH'
+                stored.routeState = 'REPATH'
+                return 'repath'
+            end
+            if not HasWaypointBeenPassed(platoonPos, waypoint, nextWaypoint) then
+                break
+            end
+            AdvanceStoredRouteIndex(stored, stored.currentIndex + 1)
+        end
+
+        if stored.currentIndex > waypointCount then
+            stored.routeStage = 'ASSAULT'
+            stored.routeState = 'ASSAULT'
+            if destination and DistSq(platoonPos, destination) <= (assaultTransitionRadius * assaultTransitionRadius) then
+                return 'attack'
+            end
+            return 'success'
+        end
+
+        local currentWaypoint = stored.waypoints[stored.currentIndex]
+        if not currentWaypoint then
+            stored.routeStage = 'REPATH'
+            stored.routeState = 'REPATH'
+            return 'repath'
+        end
+        stored.routeStage = DetermineRouteStage(stored, currentWaypoint)
+        stored.routeState = stored.routeStage
+
+        if not stored.initialFormComplete then
+            if not IssueInitialFormationOrder(platoon, units, stored, currentWaypoint, stored.currentIndex) then
+                stored.routeStage = 'REPATH'
+                stored.routeState = 'REPATH'
+                return 'repath'
+            end
+            if ShouldExtendTraversalQueue(stored, currentWaypoint, platoonPos)
+                and not QueueTraversalWindow(platoon, units, stored)
+            then
+                stored.routeStage = 'REPATH'
+                stored.routeState = 'REPATH'
+                return 'repath'
+            end
+            lastProgressTime = GetGameTimeSeconds and GetGameTimeSeconds() or lastProgressTime
+            lastProgressPosition = CopyVec(platoonPos)
+            lastProgressIndex = stored.currentIndex
+            lastProgressDistanceSq = DistSq(platoonPos, currentWaypoint.position)
         else
-            if not SegmentPassable(stored.layer, platoonPos, position) and index > 1 then
-                return 'repath'
-            end
+            UpdateRouteCohesionState(stored, units)
 
-            local commandQueued = queuedWaypointIndex == index
-            if commandQueued then
-                queuedWaypointIndex = nil
-            end
-
-            if not commandQueued and not IssueWaypointCommand(platoon, units, stored, waypoint) then
-                return 'repath'
-            end
-
-            local segmentTimeout = math.max(10, math.min(45, math.floor(SegmentLength(platoonPos, position) * 0.75) + 8))
-            local stuckSeconds = 0
-            local lastPos = CopyVec(platoonPos)
-            local lastDistSq = DistSq(platoonPos, position)
-            local nextWaypoint = stored.waypoints[index + 1]
-            local queuedNextWaypoint = false
-
-            while segmentTimeout > 0 do
-                WaitSeconds(1)
-                segmentTimeout = segmentTimeout - 1
-
-                local currentPos = platoon:GetPlatoonPosition()
-                if not currentPos then
-                    return 'fail'
-                end
-
-                if DistSq(currentPos, stored.destination) <= FinalAttackDistanceSq then
-                    stored.currentIndex = index
-                    return 'attack'
-                end
-
-                local distSq = DistSq(currentPos, position)
-                if waypoint.continuous and not queuedNextWaypoint and nextWaypoint and distSq <= (waypoint.queueDistanceSq or reachDistanceSq) then
-                    if not IssueWaypointCommand(platoon, units, stored, nextWaypoint) then
-                        return 'repath'
-                    end
-                    queuedWaypointIndex = index + 1
-                    queuedNextWaypoint = true
-                end
-
-                if distSq <= reachDistanceSq then
-                    index = index + 1
-                    stored.currentIndex = index
-                    break
-                end
-
-                local movedSq = DistSq(currentPos, lastPos)
-                if (lastDistSq - distSq) > 4 or movedSq > 4 then
-                    stuckSeconds = 0
-                else
-                    stuckSeconds = stuckSeconds + 1
-                end
-
-                if stuckSeconds >= 6 then
+            if currentWaypoint.staging and currentWaypoint.allowReform and not currentWaypoint.stagingIssued then
+                if not IssueDeliberateStagingOrder(platoon, units, stored, currentWaypoint, stored.currentIndex) then
+                    stored.routeStage = 'REPATH'
+                    stored.routeState = 'REPATH'
                     return 'repath'
                 end
-
-                lastPos = CopyVec(currentPos)
-                lastDistSq = distSq
-            end
-
-            if segmentTimeout <= 0 and index <= table.getn(stored.waypoints) then
-                return 'repath'
+                if ShouldExtendTraversalQueue(stored, currentWaypoint, platoonPos)
+                    and not QueueTraversalWindow(platoon, units, stored)
+                then
+                    stored.routeStage = 'REPATH'
+                    stored.routeState = 'REPATH'
+                    return 'repath'
+                end
+                lastProgressTime = GetGameTimeSeconds and GetGameTimeSeconds() or lastProgressTime
+                lastProgressPosition = CopyVec(platoonPos)
+                lastProgressIndex = stored.currentIndex
+                lastProgressDistanceSq = DistSq(platoonPos, currentWaypoint.position)
+            elseif (stored.lastQueuedIndex or 0) < math.min(waypointCount, stored.currentIndex + math.max(1, stored.queueWindow or PlatoonTraversalQueueWindow) - 1) then
+                if ShouldExtendTraversalQueue(stored, currentWaypoint, platoonPos)
+                    and not QueueTraversalWindow(platoon, units, stored)
+                then
+                    stored.routeStage = 'REPATH'
+                    stored.routeState = 'REPATH'
+                    return 'repath'
+                end
             end
         end
+
+        local distanceToWaypointSq = DistSq(platoonPos, currentWaypoint.position)
+        local movedSq = lastProgressPosition and DistSq(platoonPos, lastProgressPosition) or HugeNumber
+        local routeAdvanced = stored.currentIndex > lastProgressIndex
+        local madeMovementProgress = movedSq > 9
+        local madePathProgress = routeAdvanced or (lastProgressDistanceSq - distanceToWaypointSq) > 16
+
+        if routeAdvanced or madeMovementProgress or madePathProgress then
+            lastProgressTime = GetGameTimeSeconds and GetGameTimeSeconds() or lastProgressTime
+            lastProgressPosition = CopyVec(platoonPos)
+            lastProgressIndex = stored.currentIndex
+            lastProgressDistanceSq = distanceToWaypointSq
+            if stored.currentIndex <= waypointCount then
+                stored.routeStage = DetermineRouteStage(stored, stored.waypoints[stored.currentIndex])
+                stored.routeState = stored.routeStage
+            else
+                stored.routeStage = 'ASSAULT'
+                stored.routeState = 'ASSAULT'
+            end
+        elseif (GetGameTimeSeconds and GetGameTimeSeconds() or 0) >= (lastProgressTime + RouteStuckTimeout) then
+            stored.routeStage = 'REPATH'
+            stored.routeState = 'REPATH'
+            stored.repathReason = 'stuck'
+            return 'repath'
+        end
+
+        WaitSeconds(1)
     end
 
-    stored.currentIndex = table.getn(stored.waypoints) + 1
-    if destination and DistSq(platoon:GetPlatoonPosition(), destination) <= FinalAttackDistanceSq then
-        return 'attack'
-    end
-
-    return 'success'
+    return 'fail'
 end
 
 function CanPathBetween(layer, fromPos, toPos)
@@ -1113,10 +3507,16 @@ function BuildPathSegment(layer, startPos, destination)
         return nil
     end
 
-    local centered = CenterRouteThroughCorridors(base, layer, area)
-    centered = SmoothRouteCorners(centered, layer, area)
-    centered = CenterRouteThroughCorridors(centered, layer, area)
+    local buildContext = CreateRouteBuildContext()
+    ActiveRouteBuildContext = buildContext
+
+    local centered = base
     centered = SimplifyRoutePreservingSafety(centered, layer)
+    centered = EnforceStrictRouteSegments(centered, layer)
+    ActiveRouteBuildContext = false
+    if not centered then
+        return nil
+    end
 
     local out = {}
     for i = 2, table.getn(centered) do
@@ -1181,6 +3581,40 @@ function RecomputePathWithFallback(platoon, layer, destination, opts)
     return path
 end
 
+function InitializeRoutingSystem(opts)
+    MissionGraphInitialized = false
+    EnsureMissionRoutingGraph(nil, opts, GetPlayableArea())
+    return RoutingGraph.GetMetrics(GetPlayableArea())
+end
+
+function GetRoutingMetrics()
+    return RoutingGraph.GetMetrics(GetPlayableArea())
+end
+
+function BuildRoute(platoon, startPos, targetPos, opts)
+    local buildOpts = {}
+    if type(opts) == 'table' then
+        for key, value in pairs(opts) do
+            buildOpts[key] = value
+        end
+    end
+    if startPos then
+        buildOpts.RouteStart = CopyVec(startPos)
+    end
+    if buildOpts.Debug and LOG then
+        LOG(('[PlatoonRouting] BuildRoute routeStart=%s'):format(FormatRoutePosition(buildOpts.RouteStart)))
+    end
+    return BuildPlatoonRoute(platoon, targetPos, buildOpts)
+end
+
+function FollowRoute(platoon, route, opts)
+    if route then
+        platoon._storedRoute = route
+    end
+    local destination = route and route.destination or route and route.targetPosition or opts and opts.TargetPosition
+    return FollowStoredPlatoonRoute(platoon, destination, opts)
+end
+
 function MoveAlongPath(platoon, path, formation, aggressiveFinal, layer, aggressiveRoute)
     if not (platoon and path and table.getn(path) > 0) then
         return false
@@ -1201,7 +3635,7 @@ function MoveAlongPath(platoon, path, formation, aggressiveFinal, layer, aggress
         table.insert(routePoints, CopyVec(waypoint))
     end
 
-    local metadata = BuildWaypointMetadata(routePoints, destination, {
+    local metadata = BuildWaypointMetadata(platoon, routePoints, destination, {
         Formation = formation,
         AggressiveMove = aggressiveRoute and true or false,
     }, layer or ResolveLayer(platoon, nil), false, nil)
@@ -1252,6 +3686,11 @@ function MoveToNearestPlayableIngress(platoon, layer, area, formation, destinati
 end
 
 return {
+    InitializeRoutingSystem = InitializeRoutingSystem,
+    GetRoutingMetrics = GetRoutingMetrics,
+    BuildRoute = BuildRoute,
+    FollowRoute = FollowRoute,
+    ShouldRepath = ShouldRepath,
     BuildPlatoonRoute = BuildPlatoonRoute,
     FollowStoredPlatoonRoute = FollowStoredPlatoonRoute,
     RebuildPlatoonRouteIfNeeded = RebuildPlatoonRouteIfNeeded,
