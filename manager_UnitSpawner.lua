@@ -5,9 +5,9 @@
 -- What it does
 --   • Spawns a platoon at a given marker using a composition { {bp, {e,n,h}, [label], [waveStart]}, ... }
 --   • Hands the platoon to your attack function immediately (ForkAIThread)
---   • Four modes:
+--   • Five modes:
+--       0) Single-shot: spawn one platoon, hand off, then stop and return the platoon from Start(...)
 --       1) Wave: spawn → handoff → wait waveCooldown → next wave
---       2) Loss-gated: spawn → handoff → wait until the platoon has lost >= mode2LossThreshold, then apply waveCooldown before spawning again.
 --       3) Limited waves: spawn → handoff → wait a shrinking waveCooldown → next wave, until mode3WaveCount is reached.
 --          Composition entries can specify the wave they join via a 4th field (wave start, 1-indexed).
 --       4) Batched window: spawn a fixed number of platoons (mode4PlatoonCount) evenly spaced over waveCooldown, then stop.
@@ -33,8 +33,8 @@
 --     },
 --   }
 --
---   -- One-shot normal spawn (same spawn/handoff path as SpawnMgr.Start) -----
---   local platoon = SpawnMgr.StartSinglePlatoon{
+--   -- One-shot normal spawn (same spawn/handoff path as other modes) ---------
+--   local platoon = SpawnMgr.Start{
 --     brain = ArmyBrains[ScenarioInfo.Cybran],
 --     spawnMarker = 'AREA1_SPAWN_EAST_3',
 --     composition = {
@@ -42,8 +42,8 @@
 --         {'url0107', 6},
 --     },
 --     attackFn = plaAtk.WaveAttack,
---     attackData = {
---         Type = 'cluster',
+--     mode = 0,
+--     attackFn = plaAtk.WaveAttack,
 --         TargetArmy = {ScenarioInfo.Player1},
 --         Formation = 'AttackFormation',
 --         AggressiveMove = true,
@@ -61,7 +61,7 @@
 --     difficulty         = ScenarioInfo.Options.Difficulty or 2,  -- 1..3
 --     attackFn           = 'Platoon_BasicAttack',                 -- function or global function name
 --     waveCooldown       = 15,                                    -- seconds; in mode 2 it starts once threshold is met
---     mode               = 1,                                     -- 1: cooldown, 2: gate by losses, 3: finite waves, 4: batched waves
+--     mode               = 1,                                     -- 0: single-shot, 1: cooldown, 2: gate by losses, 3: finite waves, 4: batched waves
 --     mode2LossThreshold = 0.50,                                  -- fraction lost to trigger next wave
 --     mode3WaveCount     = 5,                                     -- number of waves for mode 3
 --     mode4PlatoonCount  = 3,                                     -- platoons per cooldown window for mode 4
@@ -807,6 +807,18 @@ function Spawner:RunMode4()
     self.stopped = true
 end
 
+function Spawner:RunMode0()
+    local wave = 1
+    local wanted = self:BuildWantedForWave(wave)
+    local platoon, _, unitCount, usedWanted = self:SpawnWave(wave, wanted)
+    local keepRunning = self:InvokeBooleanCallbacks('OnWaveNumber', true, wave, platoon, unitCount, usedWanted)
+    if keepRunning ~= false then
+        self:InvokeBooleanCallbacks('OnWaveCreated', keepRunning, wave, platoon, unitCount, usedWanted)
+    end
+    self.stopped = true
+    return platoon
+end
+
 function Spawner:MainLoop()
     local mode = self.params.mode or 1
     if mode == 2 then
@@ -883,20 +895,15 @@ local function BuildSpawner(params, tagPrefix)
     return o
 end
 
-local function SumWantedUnits(wanted)
-    local total = 0
-    for _, count in pairs(wanted or {}) do
-        total = total + (count or 0)
-    end
-    return total
-end
-
  -- ========== Public API ==========
  function Start(params)
      assert(params and params.brain and params.spawnMarker, 'brain and spawnMarker are required')
     local o = BuildSpawner(params, 'US_')
     o:RegisterInitialCallbacks()
     o:DebugEscalation()
+    if (o.params.mode or 1) == 0 then
+        return o:RunMode0()
+    end
     o:Start()
     return o
 end
@@ -905,40 +912,14 @@ function Stop(handle)
      if handle and handle.Stop then handle:Stop() end
  end
 
-function StartSinglePlatoon(params)
-    assert(params and params.brain and params.spawnMarker, 'brain and spawnMarker are required')
-    assert(params.composition, 'composition is required')
-
-    local spawner = BuildSpawner(params, 'US1_')
-    local waveNo = 1
-    local wanted = spawner:BuildWantedForWave(waveNo)
-    local requested = SumWantedUnits(wanted)
-
-    spawner:Log(('StartSinglePlatoon begin marker=%s tag=%s'):format(tostring(spawner.params.spawnMarker), tostring(spawner.tag)))
-    local platoon, units, unitCount, usedWanted, attackLaunched = spawner:SpawnWave(waveNo, wanted)
-    local spawnPos = platoon and platoon._spawnerStartPosition
-    local selectedIndex = spawner.lastSpawnIndex or 0
-    spawner:Log(('StartSinglePlatoon spawn markerIndex=%s position=%s'):format(
-        tostring(selectedIndex),
-        spawnPos and ('(%.2f, %.2f, %.2f)'):format(spawnPos[1] or 0, spawnPos[2] or 0, spawnPos[3] or 0) or 'nil'
-    ))
-    spawner:Log(('StartSinglePlatoon units requested=%d created=%d label=%s'):format(
-        requested,
-        unitCount or 0,
-        tostring((platoon and platoon.PlatoonData and platoon.PlatoonData.PlatoonLabel) or (spawner.tag .. '_Wave_1'))
-    ))
-    spawner:Log(('StartSinglePlatoon attackLaunched=%s'):format(tostring(attackLaunched and true or false)))
-
-    return platoon
-end
-
 function LaunchPlatoon(params)
-    return StartSinglePlatoon(params)
+    params = params or {}
+    params.mode = 0
+    return Start(params)
 end
 
 return {
     Start = Start,
     Stop = Stop,
-    StartSinglePlatoon = StartSinglePlatoon,
     LaunchPlatoon = LaunchPlatoon,
 }
