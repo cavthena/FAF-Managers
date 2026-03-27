@@ -611,13 +611,34 @@ local function SmoothPath(points, layer, opts)
     local smoothed = { CopyVec(points[1]) }
     local anchor = 1
     local probe = 3
+    local simplifyBudget = 0
+    local simplifyYieldInterval = 64
 
     while probe <= table.getn(points) do
+        simplifyBudget = simplifyBudget + 1
+        if simplifyBudget >= simplifyYieldInterval then
+            simplifyBudget = 0
+            if WaitTicks and coroutine and coroutine.running and coroutine.running() then
+                WaitTicks(1)
+            end
+        end
+
         if DirectClear(layer, points[anchor], points[probe], opts) then
             probe = probe + 1
         else
-            table.insert(smoothed, CopyVec(points[probe - 1]))
-            anchor = probe - 1
+            local pivot = probe - 1
+            if DistSq(smoothed[table.getn(smoothed)], points[pivot]) > 1 then
+                table.insert(smoothed, CopyVec(points[pivot]))
+            end
+
+            -- Keep forward progress even when adjacent graph points fail direct
+            -- clearance checks (for example narrow chokepoints). Without this
+            -- guard the smoothing loop can get stuck retrying the same pair.
+            if pivot <= anchor then
+                probe = probe + 1
+            else
+                anchor = pivot
+            end
         end
     end
 
