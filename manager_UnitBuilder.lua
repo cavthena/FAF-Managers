@@ -156,36 +156,54 @@ local function normalizeParams(p)
     }
 end
 
-local function _ForkAttack(platoon, fn, opts, tag)
-    -- resolve by name if needed
-    if type(fn) == 'string' then
-        fn = rawget(_G, fn)
+local function ResolveAttackFunction(attackFn)
+    if type(attackFn) == 'string' and attackFn ~= '' then
+        return _G and rawget(_G, attackFn)
     end
-    if type(fn) ~= 'function' then
+    return attackFn
+end
+
+local function _ForkAttack(platoon, attackFn, attackData, tag, debugLog)
+    local resolvedAttackFn = ResolveAttackFunction(attackFn)
+    if type(resolvedAttackFn) ~= 'function' then
         WARN(('[UB:%s] No valid attackFn; not forking AI thread'):format(tag or '?'))
-        return
+        if debugLog then debugLog(false, 'invalidAttackFn') end
+        return false
     end
 
     local brain = platoon and platoon:GetBrain()
     if not (brain and brain.PlatoonExists and brain:PlatoonExists(platoon)) then
         WARN(('[UB:%s] attack platoon missing at handoff'):format(tag or '?'))
-        return
+        if debugLog then debugLog(false, 'platoonMissingAtHandoff') end
+        return false
     end
 
-    -- Trampoline on a brain thread, then fork the AI on the platoon
     brain:ForkThread(function()
-        -- let platoon membership/queues settle
         WaitTicks(2)
         if brain:PlatoonExists(platoon) then
-            -- clear any transient orders from staging/rally
             local units = platoon:GetPlatoonUnits() or {}
             if table.getn(units) > 0 then
                 IssueClearCommands(units)
             end
-            platoon.PlatoonData = opts or platoon.PlatoonData or {}
-            platoon:ForkAIThread(function(p) return fn(p, p.PlatoonData) end)
+
+            platoon:ForkAIThread(function(p)
+                if type(attackFn) == 'string' and attackFn ~= '' then
+                    local namedFn = _G and rawget(_G, attackFn)
+                    if type(namedFn) == 'function' then
+                        return namedFn(p, attackData)
+                    end
+                    return
+                end
+                return resolvedAttackFn(p, attackData)
+            end)
+            if debugLog then debugLog(true, 'threadStarted') end
+        else
+            WARN(('[UB:%s] attack platoon missing after handoff delay'):format(tag or '?'))
+            if debugLog then debugLog(false, 'platoonMissingAfterDelay') end
         end
     end)
+
+    return true
 end
 
 local function _NormalizeCallbacks(spec, defaultEvent, tag)
@@ -311,11 +329,198 @@ local function scaledWanted(baseWanted, factor)
 end
 
 local function markerPos(mark)
-    return mark and ScenarioUtils.MarkerToPosition(mark) or nil
+    if not mark then return nil end
+    local t = type(mark)
+    if t == 'string' then
+        return ScenarioUtils.MarkerToPosition(mark)
+    elseif t == 'table' then
+        if mark.position then return mark.position end
+        if mark.Position then return mark.Position end
+        if mark.Pos then return mark.Pos end
+        if type(mark[1]) == 'number' and type(mark[2]) == 'number' and type(mark[3]) == 'number' then
+            return mark
+        end
+    end
+    return nil
 end
 
 local function getRallyPos(params)
     return markerPos(params.rallyMarker) or markerPos(params.baseMarker)
+end
+
+local function CopyPosition(pos)
+    if not pos then
+        return nil
+    end
+    return { pos[1], pos[2], pos[3] }
+end
+
+local function ShallowCopyTable(src)
+    if type(src) ~= 'table' then
+        return nil
+    end
+    local out = {}
+    for k, v in pairs(src) do
+        out[k] = v
+    end
+    return out
+end
+
+local function GetPlayableArea()
+    if not ScenarioInfo then
+        return nil
+    end
+    if ScenarioInfo.PlayableArea then
+        return ScenarioInfo.PlayableArea
+    end
+    local size = ScenarioInfo.size or ScenarioInfo.MapSize
+    if size then
+        return { 0, 0, size[1], size[2] }
+    end
+    return nil
+end
+
+local function PositionInPlayableArea(position, area)
+    if not (position and area) then
+        return true
+    end
+
+    return position[1] >= area[1]
+        and position[1] <= area[3]
+        and position[3] >= area[2]
+        and position[3] <= area[4]
+end
+
+local function ResolveStartedOutsidePlayableArea(position, override)
+    if override ~= nil then
+        return override and true or false
+    end
+
+    local area = GetPlayableArea()
+    if area and position then
+        return not PositionInPlayableArea(position, area)
+    end
+
+    return false
+end
+
+local function ResolveBuilderStartPositionContext(builder, platoon, platoonData)
+    local params = builder and builder.params or nil
+    local source = nil
+    local position = nil
+
+    if builder and builder.rallyPos then
+        position = builder.rallyPos
+        source = 'rallyPosition'
+    end
+
+    if not position and params and params.rallyMarker ~= nil then
+        position = markerPos(params.rallyMarker)
+        if position then
+            source = 'rallyMarker'
+        end
+    end
+
+    if not position and platoon and platoon.GetPlatoonPosition then
+        position = platoon:GetPlatoonPosition()
+        if position then
+            source = 'GetPlatoonPosition'
+        end
+    end
+
+    if not position and params and params.baseMarker ~= nil then
+        position = markerPos(params.baseMarker)
+        if position then
+            source = 'baseMarker'
+        end
+    end
+
+    if not position and builder and builder.basePos then
+        position = builder.basePos
+        source = 'basePosition'
+    end
+
+    if not position and platoonData and platoonData.StartPosition then
+        position = platoonData.StartPosition
+        source = source or 'storedStartPosition'
+    end
+
+    return position and CopyPosition(position) or nil, source or 'unknown'
+end
+
+local function ApplyBuilderPlatoonMetadata(builder, platoon, label)
+    if not (builder and platoon) then
+        return nil
+    end
+
+    local params = builder.params or {}
+    local existing = platoon.PlatoonData
+    local platoonData = {}
+    if type(existing) == 'table' then
+        for key, value in pairs(existing) do
+            platoonData[key] = value
+        end
+    end
+
+    local rawAttackData = type(params.attackData) == 'table' and params.attackData or nil
+    local mergedAttackData = ShallowCopyTable(rawAttackData)
+    if mergedAttackData then
+        if mergedAttackData.Type == nil and mergedAttackData.TargetType ~= nil then
+            mergedAttackData.Type = mergedAttackData.TargetType
+        elseif mergedAttackData.TargetType == nil and mergedAttackData.Type ~= nil then
+            mergedAttackData.TargetType = mergedAttackData.Type
+        end
+
+        for key, value in pairs(mergedAttackData) do
+            if platoonData[key] == nil then
+                platoonData[key] = value
+            end
+        end
+    end
+
+    if platoonData.Type == nil and platoonData.TargetType ~= nil then
+        platoonData.Type = platoonData.TargetType
+    elseif platoonData.TargetType == nil and platoonData.Type ~= nil then
+        platoonData.TargetType = platoonData.Type
+    end
+
+    local startPos, startPosSource = ResolveBuilderStartPositionContext(builder, platoon, platoonData)
+    local startedOutside = ResolveStartedOutsidePlayableArea(startPos, params.startedOutsidePlayableArea)
+    local disableIngress = nil
+    if params.DisableIngress ~= nil then
+        disableIngress = params.DisableIngress and true or false
+    elseif mergedAttackData and mergedAttackData.DisableIngress ~= nil then
+        disableIngress = mergedAttackData.DisableIngress and true or false
+    elseif platoonData.DisableIngress ~= nil then
+        disableIngress = platoonData.DisableIngress and true or false
+    end
+
+    platoonData.RouteSource = platoonData.RouteSource or 'UnitBuilder'
+    platoonData.BuilderTag = platoonData.BuilderTag or builder.tag
+    platoonData.Formation = platoonData.Formation or params.formation or 'GrowthFormation'
+    platoonData.StartPositionSource = startPosSource
+    platoonData.StartSource = platoonData.StartPositionSource
+    platoonData.StartedOutsidePlayableArea = startedOutside
+    if disableIngress ~= nil then
+        platoonData.DisableIngress = disableIngress
+    end
+
+    if platoonData.PlatoonLabel == nil then
+        platoonData.PlatoonLabel = label or (platoon.GetPlatoonLabel and platoon:GetPlatoonLabel()) or (builder.tag .. '_Attack')
+    end
+    if params.rallyMarker ~= nil and platoonData.SpawnMarker == nil then
+        platoonData.SpawnMarker = params.rallyMarker
+    end
+    if startPos then
+        platoonData.StartPosition = CopyPosition(startPos)
+        platoonData.SpawnPosition = CopyPosition(startPos)
+    end
+    if mergedAttackData and platoonData.AttackData == nil then
+        platoonData.AttackData = mergedAttackData
+    end
+
+    platoon.PlatoonData = platoonData
+    return platoonData
 end
 
 local function setFactoryRally(factory, pos)
@@ -670,10 +875,25 @@ function Builder:_HandOffPlatoon(units, label)
     end
 
     if self.params.attackFn then
-        platoon.PlatoonData = self.params.attackData or {}
-        platoon.PlatoonData.RouteSource = platoon.PlatoonData.RouteSource or 'UnitBuilder'
-        platoon.PlatoonData.BuilderTag = platoon.PlatoonData.BuilderTag or self.tag
-        _ForkAttack(platoon, self.params.attackFn, platoon.PlatoonData, self.tag)
+        local platoonData = ApplyBuilderPlatoonMetadata(self, platoon, label)
+        self:Dbg(('Handoff metadata: label=%s startPos=(%.2f, %.2f, %.2f) startSource=%s startedOutside=%s routeSource=%s')
+            :format(
+                tostring(platoonData and platoonData.PlatoonLabel or label or 'unknown'),
+                (platoonData and platoonData.StartPosition and platoonData.StartPosition[1]) or 0,
+                (platoonData and platoonData.StartPosition and platoonData.StartPosition[2]) or 0,
+                (platoonData and platoonData.StartPosition and platoonData.StartPosition[3]) or 0,
+                tostring(platoonData and platoonData.StartPositionSource or 'unknown'),
+                tostring(platoonData and platoonData.StartedOutsidePlayableArea),
+                tostring(platoonData and platoonData.RouteSource or 'UnitBuilder')
+            ))
+        local launchOk = _ForkAttack(
+            platoon,
+            self.params.attackFn,
+            (platoonData and platoonData.AttackData) or platoonData or {},
+            self.tag
+        )
+        self:Dbg(('Handoff attack launch: label=%s success=%s')
+            :format(tostring(platoonData and platoonData.PlatoonLabel or label or 'unknown'), tostring(launchOk)))
     else
         self:Warn('No attackFn provided; platoon will idle')
     end
@@ -1651,7 +1871,25 @@ function Builder:Mode3Loop(p)
             end
             -- start AI if needed
             if self.params.attackFn then
-                _ForkAttack(p, self.params.attackFn, self.params.attackData or {}, self.tag)
+                local platoonData = ApplyBuilderPlatoonMetadata(self, p, self.attackName)
+                self:Dbg(('Mode3 metadata: label=%s startPos=(%.2f, %.2f, %.2f) startSource=%s startedOutside=%s routeSource=%s')
+                    :format(
+                        tostring(platoonData and platoonData.PlatoonLabel or self.attackName or 'unknown'),
+                        (platoonData and platoonData.StartPosition and platoonData.StartPosition[1]) or 0,
+                        (platoonData and platoonData.StartPosition and platoonData.StartPosition[2]) or 0,
+                        (platoonData and platoonData.StartPosition and platoonData.StartPosition[3]) or 0,
+                        tostring(platoonData and platoonData.StartPositionSource or 'unknown'),
+                        tostring(platoonData and platoonData.StartedOutsidePlayableArea),
+                        tostring(platoonData and platoonData.RouteSource or 'UnitBuilder')
+                    ))
+                local launchOk = _ForkAttack(
+                    p,
+                    self.params.attackFn,
+                    (platoonData and platoonData.AttackData) or platoonData or {},
+                    self.tag
+                )
+                self:Dbg(('Mode3 attack launch: label=%s success=%s')
+                    :format(tostring(platoonData and platoonData.PlatoonLabel or self.attackName or 'unknown'), tostring(launchOk)))
             else
                 self:Warn('Mode3: no attackFn provided; sustain platoon will idle')
             end
@@ -1774,6 +2012,7 @@ function Start(params)
     end
 
     o.basePos = ScenarioUtils.MarkerToPosition(o.params.baseMarker) or o.base.basePos
+    o.rallyPos = markerPos(o.params.rallyMarker) or markerPos(o.params.baseMarker)
     o.handedOff = {}
     o.stopped = false
     if not o.basePos then error('Invalid baseMarker: '.. tostring(params.baseMarker)) end

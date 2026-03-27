@@ -1,70 +1,33 @@
--- Mission-scoped navigation graph for platoon routing.
+-- Mission-scoped graph router for platoon navigation.
+-- Rebuilt to provide deterministic, domain-aware, scalable routing on both
+-- open and tight maps.
+
 local NavUtils = import('/lua/sim/NavUtils.lua')
 
-local function ImportFirstAvailable(paths)
-    for _, path in ipairs(paths or {}) do
-        if type(path) == 'string' and path ~= '' then
-            local okImport, mod = pcall(import, path)
-            if okImport and mod then
-                return mod
-            end
-        end
-    end
-    return nil
-end
-
-local function AppendCaseVariants(paths, path)
-    if type(path) ~= 'string' or path == '' then
-        return
-    end
-
-    table.insert(paths, path)
-
-    local lower = string.lower(path)
-    if lower ~= path then
-        table.insert(paths, lower)
-    end
-end
-
-local function ResolveSiblingModule(fileName, fallbackPath)
-    local candidates = {}
-
-    local ok, info = pcall(debug.getinfo, 1, 'S')
-    if ok and info and info.source then
-        local src = info.source
-        if type(src) == 'string' and string.sub(src, 1, 1) == '@' then
-            local dir = string.match(src, '^@(.*/)[^/]*$')
-            if dir then
-                AppendCaseVariants(candidates, dir .. fileName)
-            end
-        end
-    end
-
-    if ScenarioInfo and ScenarioInfo.MapPath then
-        local mp = ScenarioInfo.MapPath
-        if type(mp) == 'string' then
-            local dir = string.match(mp, '^(.-)/[^/]*$') or mp
-            if dir then
-                if string.sub(dir, 1, 1) ~= '/' then
-                    dir = '/' .. dir
-                end
-                AppendCaseVariants(candidates, dir .. '/' .. fileName)
-            end
-        end
-    end
-
-    AppendCaseVariants(candidates, fallbackPath)
-
-    local mod = ImportFirstAvailable(candidates)
-    if mod then
-        return mod
-    end
-
-    return import(fallbackPath)
-end
-
-local Utils = ResolveSiblingModule('platoon_RoutingUtils.lua', '/maps/faf_coop_U01.v0001/platoon_RoutingUtils.lua')
 local HugeNumber = math.huge or 1e9
+local Sqrt2 = math.sqrt(2)
+
+local BaseConfig = {
+    resolution = 24,
+    obstacleProbeDistance = 8,
+    obstacleProbeStep = 2,
+    inflationHardBlock = 2.5,
+    inflationSoftPenalty = 8,
+    diagonalCost = Sqrt2,
+}
+
+local Directions = {
+    { 1, 0, 1 }, { -1, 0, 1 }, { 0, 1, 1 }, { 0, -1, 1 },
+    { 1, 1, Sqrt2 }, { -1, 1, Sqrt2 }, { 1, -1, Sqrt2 }, { -1, -1, Sqrt2 },
+}
+
+local Domains = {
+    Land = 'Land',
+    Water = 'Water',
+    Air = 'Air',
+}
+
+local GraphCache = false
 
 local function ReadVecComponent(v, numericIndex, axisName)
     if v == nil then
@@ -93,15 +56,12 @@ local function VecX(v)
     return ReadVecComponent(v, 1, 'x') or 0
 end
 
-local function VecZ(v)
-    return ReadVecComponent(v, 3, 'z') or 0
+local function VecY(v)
+    return ReadVecComponent(v, 2, 'y') or 0
 end
 
-local function CopyVec(v)
-    if not v then
-        return nil
-    end
-    return { VecX(v), ReadVecComponent(v, 2, 'y') or 0, VecZ(v) }
+local function VecZ(v)
+    return ReadVecComponent(v, 3, 'z') or 0
 end
 
 local function DistSq(a, b)
@@ -114,59 +74,72 @@ local function DistSq(a, b)
     return dx * dx + dz * dz
 end
 
-local function HeadingDegrees(a, b)
+local function Dist(a, b)
+    return math.sqrt(DistSq(a, b))
+end
+
+local function CopyVec(v)
+    if not v then
+        return nil
+    end
+
+    return { VecX(v), VecY(v), VecZ(v) }
+end
+
+local function SurfaceHeightForLayer(layer, x, z)
+    if layer == 'Water' or layer == 'Naval' then
+        return GetSurfaceHeight(x, z)
+    end
+
+    return math.max(GetTerrainHeight(x, z), GetSurfaceHeight(x, z))
+end
+
+local function IsWaterAt(x, z)
+    return (GetSurfaceHeight(x, z) - GetTerrainHeight(x, z)) > 0.05
+end
+
+local function SegmentPassable(layer, a, b)
+    local ok, passable = pcall(NavUtils.CanPathTo, layer, a, b)
+    return ok and passable
+end
+
+local function ResolveDomainForLayer(layer)
+    if layer == 'Air' then
+        return Domains.Air
+    end
+
+    if layer == 'Water' or layer == 'Naval' then
+        return Domains.Water
+    end
+
+    return Domains.Land
+end
+
+local function ResolveConfig(opts)
+    local config = {}
+    for key, value in pairs(BaseConfig) do
+        config[key] = value
+    end
+
+    for key, value in pairs(opts or {}) do
+        config[key] = value
+    end
+
+    return config
+end
+
+local function ConfigMatches(a, b)
     if not (a and b) then
-        return 0
+        return false
     end
 
-    local dx = VecX(b) - VecX(a)
-    local dz = VecZ(b) - VecZ(a)
-    if math.abs(dx) < 0.001 and math.abs(dz) < 0.001 then
-        return 0
-    end
-
-    return math.deg((math.atan2 or math.atan)(dz, dx))
+    return a.resolution == b.resolution
+        and a.obstacleProbeDistance == b.obstacleProbeDistance
+        and a.obstacleProbeStep == b.obstacleProbeStep
+        and a.inflationHardBlock == b.inflationHardBlock
+        and a.inflationSoftPenalty == b.inflationSoftPenalty
+        and a.diagonalCost == b.diagonalCost
 end
-
-local function NormalizeAngleDegrees(angle)
-    local value = angle or 0
-    local turns = value >= 0 and math.floor(value / 360) or math.ceil(value / 360)
-    local normalized = value - (turns * 360)
-    if normalized > 180 then
-        normalized = normalized - 360
-    elseif normalized < -180 then
-        normalized = normalized + 360
-    end
-    return normalized
-end
-
-local function AngleDeltaDegrees(a, b)
-    return math.abs(NormalizeAngleDegrees((b or 0) - (a or 0)))
-end
-
-local BaseConfig = {
-    resolution = 32,
-    obstacleProbeDistance = 7,
-    obstacleProbeStep = 2,
-    inflationHardBlock = 2.5,
-    inflationSoftPenalty = 8,
-    diagonalCost = math.sqrt(2),
-}
-
-local Domains = {
-    LAND = 'Land',
-    SEA = 'Water',
-    AIR = 'Air',
-}
-
-local Directions = {
-    { 1, 0, 1 }, { -1, 0, 1 }, { 0, 1, 1 }, { 0, -1, 1 },
-    { 1, 1, BaseConfig.diagonalCost }, { -1, 1, BaseConfig.diagonalCost },
-    { 1, -1, BaseConfig.diagonalCost }, { -1, -1, BaseConfig.diagonalCost },
-}
-
-local RandomizedRouteLengthSlack = 1.55
-local GraphCache = false
 
 local function ResolveMapKey(area)
     local mapName = ScenarioInfo and (ScenarioInfo.name or ScenarioInfo.map or ScenarioInfo.MapName) or 'unknown-map'
@@ -176,319 +149,359 @@ local function ResolveMapKey(area)
     return tostring(mapName)
 end
 
-local function GetPlayableArea(area)
-    if area then
-        return area
+local function GridDimensions(area, resolution)
+    local width = math.max(1, math.floor(((area[3] - area[1]) / resolution) + 0.5))
+    local height = math.max(1, math.floor(((area[4] - area[2]) / resolution) + 0.5))
+    return width, height
+end
+
+local function CellCenter(area, resolution, gx, gz)
+    return {
+        area[1] + ((gx + 0.5) * resolution),
+        0,
+        area[2] + ((gz + 0.5) * resolution),
+    }
+end
+
+local function GridIndex(width, gx, gz)
+    return (gz * width) + gx + 1
+end
+
+local function DecodeGridIndex(width, index)
+    local i = index - 1
+    local gx = math.mod(i, width)
+    local gz = math.floor(i / width)
+    return gx, gz
+end
+
+local function Clamp(value, minValue, maxValue)
+    if value < minValue then
+        return minValue
+    end
+    if value > maxValue then
+        return maxValue
+    end
+    return value
+end
+
+local function CellFromPosition(graph, position)
+    local cfg = graph.config
+    local area = graph.area
+    local gx = Clamp(math.floor((VecX(position) - area[1]) / cfg.resolution), 0, graph.width - 1)
+    local gz = Clamp(math.floor((VecZ(position) - area[2]) / cfg.resolution), 0, graph.height - 1)
+    return gx, gz, GridIndex(graph.width, gx, gz)
+end
+
+local function IsHardBlocked(domainState)
+    return domainState.hardBlocked and true or false
+end
+
+local function DomainCellPassable(graph, cell, domain)
+    if domain == Domains.Air then
+        return true
     end
 
-    if ScenarioInfo and ScenarioInfo.PlayableArea then
-        return ScenarioInfo.PlayableArea
+    local state = cell[domain]
+    if not state then
+        return false
     end
 
-    local size = ScenarioInfo and (ScenarioInfo.size or ScenarioInfo.MapSize)
-    if size then
-        return { 0, 0, size[1], size[2] }
-    end
-
-    return { 0, 0, 512, 512 }
+    return not IsHardBlocked(state)
 end
 
-local function PointPassable(layer, pos)
-    local ok, passable = pcall(NavUtils.CanPathTo, layer, pos, pos)
-    return ok and passable
-end
+local function CollectNeighbors(graph, index, domain)
+    local neighbors = {}
+    local gx, gz = DecodeGridIndex(graph.width, index)
+    local current = graph.cells[index]
 
-local function SegmentPassable(layer, a, b)
-    local ok, passable = pcall(NavUtils.CanPathTo, layer, a, b)
-    return ok and passable
-end
-
-local function ProbeClearance(layer, node, cfg)
-    local maxDist = cfg.obstacleProbeDistance
-    local step = cfg.obstacleProbeStep
-    local x = node.position[1]
-    local z = node.position[3]
-    local clear = maxDist
-
-    local distance = step
-    while distance <= maxDist do
-        local points = {
-            { x + distance, 0, z },
-            { x - distance, 0, z },
-            { x, 0, z + distance },
-            { x, 0, z - distance },
-        }
-        local blocked = false
-        for _, point in ipairs(points) do
-            if not PointPassable(layer, point) then
-                blocked = true
-                break
-            end
-        end
-        if blocked then
-            clear = distance - step
-            break
-        end
-        distance = distance + step
-    end
-
-    return math.max(0, clear)
-end
-
-local function DomainKeyFromLayer(layer)
-    if layer == 'Air' then
-        return 'AIR'
-    elseif layer == 'Water' or layer == 'Naval' then
-        return 'SEA'
-    end
-    return 'LAND'
-end
-
-local function BuildNodes(area, cfg)
-    local minX, minZ, maxX, maxZ = area[1], area[2], area[3], area[4]
-    local step = cfg.resolution
-    local width = math.max(1, math.floor((maxX - minX) / step) + 1)
-    local height = math.max(1, math.floor((maxZ - minZ) / step) + 1)
-
-    local nodes = {}
-    local indexByGrid = {}
-    local id = 1
-
-    for gz = 0, height - 1 do
-        for gx = 0, width - 1 do
-            local x = minX + (gx * step)
-            local z = minZ + (gz * step)
-            local node = {
-                id = id,
-                gx = gx,
-                gz = gz,
-                position = { x, 0, z },
-                reachability = { LAND = false, SEA = false, AIR = true },
-                clearance = { LAND = 0, SEA = 0, AIR = cfg.obstacleProbeDistance },
-                penalty = { LAND = 0, SEA = 0, AIR = 0 },
-                component = { LAND = 0, SEA = 0, AIR = 1 },
-                neighbors = {},
-            }
-            nodes[id] = node
-            indexByGrid[gz * width + gx] = id
-            id = id + 1
-        end
-    end
-
-    return nodes, indexByGrid, width, height
-end
-
-local function ResolveNode(indexByGrid, width, gx, gz)
-    return indexByGrid[gz * width + gx]
-end
-
-local function BuildConnectivity(nodes, indexByGrid, width, height, cfg)
-    for _, node in ipairs(nodes) do
-        for _, direction in ipairs(Directions) do
-            local ngx = node.gx + direction[1]
-            local ngz = node.gz + direction[2]
-            if ngx >= 0 and ngz >= 0 and ngx < width and ngz < height then
-                local nId = ResolveNode(indexByGrid, width, ngx, ngz)
-                if nId then
-                    table.insert(node.neighbors, {
-                        id = nId,
-                        baseCost = direction[3],
-                        diagonal = (direction[1] ~= 0 and direction[2] ~= 0) and true or false,
-                    })
+    for _, dir in ipairs(Directions) do
+        local nx = gx + dir[1]
+        local nz = gz + dir[2]
+        if nx >= 0 and nx < graph.width and nz >= 0 and nz < graph.height then
+            local nidx = GridIndex(graph.width, nx, nz)
+            local nextCell = graph.cells[nidx]
+            if DomainCellPassable(graph, nextCell, domain) then
+                if math.abs(dir[1]) + math.abs(dir[2]) == 2 and domain ~= Domains.Air then
+                    local idxA = GridIndex(graph.width, gx + dir[1], gz)
+                    local idxB = GridIndex(graph.width, gx, gz + dir[2])
+                    if not (DomainCellPassable(graph, graph.cells[idxA], domain) and DomainCellPassable(graph, graph.cells[idxB], domain)) then
+                        -- Prevent diagonal corner-cutting in tight choke points.
+                    else
+                        table.insert(neighbors, { id = nidx, cost = dir[3] })
+                    end
+                else
+                    table.insert(neighbors, { id = nidx, cost = dir[3] })
                 end
             end
         end
     end
+
+    current.neighbors = current.neighbors or {}
+    current.neighbors[domain] = neighbors
+    return neighbors
 end
 
-local function LabelComponents(graph, domain)
-    local component = 0
-    local visited = {}
+local function GetNeighbors(graph, index, domain)
+    local cell = graph.cells[index]
+    local bucket = cell.neighbors and cell.neighbors[domain]
+    if bucket then
+        return bucket
+    end
+    return CollectNeighbors(graph, index, domain)
+end
 
-    for _, node in ipairs(graph.nodes) do
-        if node.reachability[domain] and not visited[node.id] then
-            component = component + 1
-            local queue = { node.id }
-            local head = 1
-            visited[node.id] = true
-            node.component[domain] = component
+local function ComputeInflationCost(graph, domain, gx, gz)
+    if domain == Domains.Air then
+        return 1
+    end
 
-            while head <= table.getn(queue) do
-                local current = graph.nodes[queue[head]]
-                head = head + 1
+    local cfg = graph.config
+    local center = CellCenter(graph.area, cfg.resolution, gx, gz)
+    local x = center[1]
+    local z = center[3]
 
-                for _, edge in ipairs(current.neighbors) do
-                    local neighbor = graph.nodes[edge.id]
-                    if neighbor and neighbor.reachability[domain] and not visited[neighbor.id] then
-                        visited[neighbor.id] = true
-                        neighbor.component[domain] = component
-                        table.insert(queue, neighbor.id)
+    local passSample = { x, SurfaceHeightForLayer(domain == Domains.Water and 'Water' or 'Land', x, z), z }
+    if not SegmentPassable(domain == Domains.Water and 'Water' or 'Land', passSample, passSample) then
+        return false, true
+    end
+
+    local isWater = IsWaterAt(x, z)
+    if (domain == Domains.Land and isWater) or (domain == Domains.Water and not isWater) then
+        return false, true
+    end
+
+    local minObstacle = HugeNumber
+    local maxRadius = cfg.obstacleProbeDistance
+    local step = math.max(1, cfg.obstacleProbeStep)
+
+    local probeLayer = domain == Domains.Water and 'Water' or 'Land'
+
+    local radius = step
+    while radius <= maxRadius do
+        local blockedDirections = 0
+        for _, dir in ipairs(Directions) do
+            local px = x + (dir[1] * radius)
+            local pz = z + (dir[2] * radius)
+            local probe = { px, SurfaceHeightForLayer(probeLayer, px, pz), pz }
+            if not SegmentPassable(probeLayer, passSample, probe) then
+                blockedDirections = blockedDirections + 1
+            end
+        end
+
+        if blockedDirections > 0 then
+            minObstacle = radius
+            break
+        end
+
+        radius = radius + step
+    end
+
+    if minObstacle <= cfg.inflationHardBlock then
+        return false, true
+    end
+
+    local penalty = 1
+    if minObstacle < HugeNumber and minObstacle <= cfg.inflationSoftPenalty then
+        local softness = (cfg.inflationSoftPenalty - minObstacle) / math.max(0.01, cfg.inflationSoftPenalty - cfg.inflationHardBlock)
+        penalty = penalty + (softness * 2.2)
+    end
+
+    return penalty, false
+end
+
+local function BuildComponents(graph, domain)
+    local components = {}
+    local compIndex = {}
+    local compCount = 0
+
+    for idx, cell in ipairs(graph.cells) do
+        if DomainCellPassable(graph, cell, domain) and not compIndex[idx] then
+            compCount = compCount + 1
+            local queue = { idx }
+            local qh = 1
+            compIndex[idx] = compCount
+            local size = 0
+
+            while qh <= table.getn(queue) do
+                local current = queue[qh]
+                qh = qh + 1
+                size = size + 1
+
+                local neighbors = GetNeighbors(graph, current, domain)
+                for _, n in ipairs(neighbors) do
+                    if not compIndex[n.id] then
+                        compIndex[n.id] = compCount
+                        queue[table.getn(queue) + 1] = n.id
                     end
                 end
             end
+
+            components[compCount] = size
         end
     end
 
-    graph.metrics.componentCounts[domain] = component
+    graph.components[domain] = {
+        index = compIndex,
+        sizes = components,
+        count = compCount,
+    }
 end
 
-local function BuildMissionGraph(area, opts)
-    local cfg = {}
-    for k, v in pairs(BaseConfig) do
-        cfg[k] = v
-    end
-    for k, v in pairs(opts or {}) do
-        cfg[k] = v
+local function BuildCellState(graph)
+    local cfg = graph.config
+    local validLand = 0
+    local validWater = 0
+
+    for gz = 0, graph.height - 1 do
+        for gx = 0, graph.width - 1 do
+            local idx = GridIndex(graph.width, gx, gz)
+            local cell = {
+                id = idx,
+                gx = gx,
+                gz = gz,
+                center = CellCenter(graph.area, cfg.resolution, gx, gz),
+                neighbors = {},
+                Land = {},
+                Water = {},
+                Air = { hardBlocked = false, moveCost = 1 },
+            }
+
+            local landCost, landBlocked = ComputeInflationCost(graph, Domains.Land, gx, gz)
+            cell.Land.hardBlocked = landBlocked and true or false
+            cell.Land.moveCost = landCost or HugeNumber
+            if not cell.Land.hardBlocked then
+                validLand = validLand + 1
+            end
+
+            local waterCost, waterBlocked = ComputeInflationCost(graph, Domains.Water, gx, gz)
+            cell.Water.hardBlocked = waterBlocked and true or false
+            cell.Water.moveCost = waterCost or HugeNumber
+            if not cell.Water.hardBlocked then
+                validWater = validWater + 1
+            end
+
+            graph.cells[idx] = cell
+        end
     end
 
-    local playable = GetPlayableArea(area)
-    local nodes, indexByGrid, width, height = BuildNodes(playable, cfg)
-    local startedAt = GetGameTimeSeconds and GetGameTimeSeconds() or 0
+    graph.validCells = {
+        Land = validLand,
+        Water = validWater,
+        Air = table.getn(graph.cells),
+    }
+
+    BuildComponents(graph, Domains.Land)
+    BuildComponents(graph, Domains.Water)
+    BuildComponents(graph, Domains.Air)
+end
+
+local function BuildGraph(area, config)
+    local started = GetSystemTimeSeconds and GetSystemTimeSeconds() or 0
+    local width, height = GridDimensions(area, config.resolution)
 
     local graph = {
-        key = ResolveMapKey(playable),
-        area = playable,
-        config = cfg,
+        area = { area[1], area[2], area[3], area[4] },
+        config = config,
         width = width,
         height = height,
-        nodes = nodes,
-        indexByGrid = indexByGrid,
+        cells = {},
+        components = {},
+        mapKey = ResolveMapKey(area),
         metrics = {
             buildSeconds = 0,
-            routeQueries = 0,
-            directShortcuts = 0,
-            astarSearches = 0,
-            disconnectedFastFails = 0,
-            fallbackPathTo = 0,
             pathToCalls = 0,
-            routeBuildSecondsTotal = 0,
-            routeBuildTimes = {},
-            componentCounts = { LAND = 0, SEA = 0, AIR = 1 },
-        },
-        variantSpecs = {
-            { routeType = 'left-wide', sideSign = -1, lateralScale = 0.30, fractions = { { 0.22, 0.65 }, { 0.48, 1.0 }, { 0.74, 0.85 } }, approachOffset = 0.95, approachBackoff = 0.20, maxOffset = 96, bias = 'wide-flank' },
-            { routeType = 'left-deep', sideSign = -1, lateralScale = 0.38, fractions = { { 0.18, 0.75 }, { 0.42, 1.10 }, { 0.68, 1.0 } }, approachOffset = 1.15, approachBackoff = 0.24, maxOffset = 112, bias = 'deep-flank' },
-            { routeType = 'right-wide', sideSign = 1, lateralScale = 0.30, fractions = { { 0.22, 0.65 }, { 0.48, 1.0 }, { 0.74, 0.85 } }, approachOffset = 0.95, approachBackoff = 0.20, maxOffset = 96, bias = 'wide-flank' },
-            { routeType = 'right-deep', sideSign = 1, lateralScale = 0.38, fractions = { { 0.18, 0.75 }, { 0.42, 1.10 }, { 0.68, 1.0 } }, approachOffset = 1.15, approachBackoff = 0.24, maxOffset = 112, bias = 'deep-flank' },
+            pathToFallbacks = 0,
+            requests = 0,
+            solved = 0,
+            failed = 0,
         },
     }
 
-    BuildConnectivity(graph.nodes, graph.indexByGrid, graph.width, graph.height, cfg)
+    BuildCellState(graph)
 
-    for _, node in ipairs(graph.nodes) do
-        node.reachability.LAND = PointPassable(Domains.LAND, node.position)
-        node.reachability.SEA = PointPassable(Domains.SEA, node.position)
-        node.clearance.LAND = ProbeClearance(Domains.LAND, node, cfg)
-        node.clearance.SEA = ProbeClearance(Domains.SEA, node, cfg)
+    local finished = GetSystemTimeSeconds and GetSystemTimeSeconds() or started
+    graph.metrics.buildSeconds = math.max(0, finished - started)
+    graph.metrics.totalNodes = table.getn(graph.cells)
+    graph.metrics.validLand = graph.validCells.Land
+    graph.metrics.validSea = graph.validCells.Water
+    graph.metrics.validAir = graph.validCells.Air
+    graph.metrics.componentsLand = graph.components.Land and graph.components.Land.count or 0
+    graph.metrics.componentsSea = graph.components.Water and graph.components.Water.count or 0
 
-        if node.reachability.LAND then
-            if node.clearance.LAND < cfg.inflationHardBlock then
-                node.reachability.LAND = false
-            elseif node.clearance.LAND < cfg.inflationSoftPenalty then
-                node.penalty.LAND = (cfg.inflationSoftPenalty - node.clearance.LAND) * 3
-            end
-        end
-
-        if node.reachability.SEA then
-            if node.clearance.SEA < cfg.inflationHardBlock then
-                node.reachability.SEA = false
-            elseif node.clearance.SEA < cfg.inflationSoftPenalty then
-                node.penalty.SEA = (cfg.inflationSoftPenalty - node.clearance.SEA) * 3
-            end
-        end
-    end
-
-    LabelComponents(graph, 'LAND')
-    LabelComponents(graph, 'SEA')
-
-    local endedAt = GetGameTimeSeconds and GetGameTimeSeconds() or startedAt
-    graph.metrics.buildSeconds = math.max(0, endedAt - startedAt)
     return graph
 end
 
-local function EnsureScenarioGraph(area, opts)
-    local key = ResolveMapKey(GetPlayableArea(area))
-    if not GraphCache or GraphCache.key ~= key then
-        GraphCache = BuildMissionGraph(area, opts)
-    end
-    return GraphCache
+local function Heuristic(graph, a, b)
+    local cellA = graph.cells[a]
+    local cellB = graph.cells[b]
+    return Dist(cellA.center, cellB.center) / math.max(1, graph.config.resolution)
 end
 
-local function NearestNode(graph, domain, position, maxRadius)
-    local best = nil
-    local bestDistSq = (maxRadius or (graph.config.resolution * 5)) ^ 2
-
-    for _, node in ipairs(graph.nodes) do
-        if node.reachability[domain] then
-            local distSq = DistSq(node.position, position)
-            if distSq < bestDistSq then
-                best = node
-                bestDistSq = distSq
-            end
-        end
+local function ResolveVariantBias(opts)
+    if opts and opts.variantSpec and opts.variantSpec.sideSign then
+        return opts.variantSpec.sideSign, (opts.variantSpec.bias or 0.28)
     end
 
-    return best
+    return 0, 0
 end
 
-local function Heuristic(a, b)
-    return math.sqrt(DistSq(a.position, b.position))
-end
-
-local function ReconstructPath(nodes, cameFrom, currentId)
-    local path = {}
-    local cursor = currentId
-    while cursor do
-        table.insert(path, 1, CopyVec(nodes[cursor].position))
-        cursor = cameFrom[cursor]
+local function SideBiasCost(graph, fromId, toId, startPos, targetPos, sideSign, bias)
+    if sideSign == 0 or bias <= 0 then
+        return 0
     end
-    return path
+
+    local from = graph.cells[fromId].center
+    local to = graph.cells[toId].center
+
+    local ax = VecX(targetPos) - VecX(startPos)
+    local az = VecZ(targetPos) - VecZ(startPos)
+    local bx = VecX(to) - VecX(from)
+    local bz = VecZ(to) - VecZ(from)
+
+    local cross = (ax * bz) - (az * bx)
+    local signed = cross * sideSign
+    if signed >= 0 then
+        return 0
+    end
+
+    return math.abs(signed) * bias * 0.0025
 end
 
-local function FindPathAStar(graph, domain, startNode, goalNode, opts)
-    local open = { startNode.id }
-    local inOpen = { [startNode.id] = true }
-    local cameFrom = {}
-    local gScore = { [startNode.id] = 0 }
-    local fScore = { [startNode.id] = Heuristic(startNode, goalNode) }
+local function DomainConnected(graph, domain, a, b)
+    if domain == Domains.Air then
+        return true
+    end
 
-    while table.getn(open) > 0 do
-        local currentIndex = 1
-        local currentId = open[1]
-        local currentScore = fScore[currentId] or HugeNumber
+    local comps = graph.components[domain]
+    if not comps then
+        return false
+    end
 
-        for i = 2, table.getn(open) do
-            local candidateId = open[i]
-            local candidateScore = fScore[candidateId] or HugeNumber
-            if candidateScore < currentScore then
-                currentIndex = i
-                currentId = candidateId
-                currentScore = candidateScore
-            end
-        end
+    local ia = comps.index[a]
+    local ib = comps.index[b]
+    return ia and ib and ia == ib
+end
 
-        table.remove(open, currentIndex)
-        inOpen[currentId] = nil
+local function FindNearestPassableCell(graph, domain, position, maxRing)
+    local gx, gz, centerIndex = CellFromPosition(graph, position)
+    local centerCell = graph.cells[centerIndex]
+    if centerCell and DomainCellPassable(graph, centerCell, domain) then
+        return centerIndex
+    end
 
-        if currentId == goalNode.id then
-            return ReconstructPath(graph.nodes, cameFrom, currentId)
-        end
+    local limit = maxRing or 5
+    for ring = 1, limit do
+        local minX = math.max(0, gx - ring)
+        local maxX = math.min(graph.width - 1, gx + ring)
+        local minZ = math.max(0, gz - ring)
+        local maxZ = math.min(graph.height - 1, gz + ring)
 
-        local currentNode = graph.nodes[currentId]
-        for _, edge in ipairs(currentNode.neighbors) do
-            local neighbor = graph.nodes[edge.id]
-            if neighbor and neighbor.reachability[domain] then
-                if not edge.diagonal or (graph.nodes[ResolveNode(graph.indexByGrid, graph.width, currentNode.gx, neighbor.gz)] and graph.nodes[ResolveNode(graph.indexByGrid, graph.width, neighbor.gx, currentNode.gz)]) then
-                    local temporaryPenalty = opts and opts.TemporaryNodePenalty and (opts.TemporaryNodePenalty[neighbor.id] or 0) or 0
-                    local tentative = (gScore[currentId] or HugeNumber) + edge.baseCost + (neighbor.penalty[domain] or 0) + temporaryPenalty
-                    if tentative < (gScore[neighbor.id] or HugeNumber) then
-                        cameFrom[neighbor.id] = currentId
-                        gScore[neighbor.id] = tentative
-                        fScore[neighbor.id] = tentative + Heuristic(neighbor, goalNode)
-                        if not inOpen[neighbor.id] then
-                            table.insert(open, neighbor.id)
-                            inOpen[neighbor.id] = true
-                        end
+        for z = minZ, maxZ do
+            for x = minX, maxX do
+                if x == minX or x == maxX or z == minZ or z == maxZ then
+                    local idx = GridIndex(graph.width, x, z)
+                    if DomainCellPassable(graph, graph.cells[idx], domain) then
+                        return idx
                     end
                 end
             end
@@ -498,110 +511,292 @@ local function FindPathAStar(graph, domain, startNode, goalNode, opts)
     return nil
 end
 
-function InitializeMissionGraph(area, opts)
-    return EnsureScenarioGraph(area, opts)
+local function AStarRoute(graph, domain, startId, targetId, startPos, targetPos, opts)
+    local open = { startId }
+    local openSet = { [startId] = true }
+    local gScore = { [startId] = 0 }
+    local fScore = { [startId] = Heuristic(graph, startId, targetId) }
+    local cameFrom = {}
+
+    local sideSign, sideBias = ResolveVariantBias(opts)
+
+    while table.getn(open) > 0 do
+        local bestIndex = 1
+        local current = open[1]
+        local currentF = fScore[current] or HugeNumber
+
+        for i = 2, table.getn(open) do
+            local id = open[i]
+            local score = fScore[id] or HugeNumber
+            if score < currentF then
+                currentF = score
+                current = id
+                bestIndex = i
+            end
+        end
+
+        table.remove(open, bestIndex)
+        openSet[current] = nil
+
+        if current == targetId then
+            local nodes = { current }
+            while cameFrom[current] do
+                current = cameFrom[current]
+                table.insert(nodes, 1, current)
+            end
+            return nodes
+        end
+
+        local neighbors = GetNeighbors(graph, current, domain)
+        for _, n in ipairs(neighbors) do
+            local nCell = graph.cells[n.id]
+            local moveCost = n.cost
+            if domain ~= Domains.Air then
+                local domainState = nCell[domain]
+                moveCost = moveCost * (domainState.moveCost or 1)
+            end
+
+            moveCost = moveCost + SideBiasCost(graph, current, n.id, startPos, targetPos, sideSign, sideBias)
+
+            local tentative = (gScore[current] or HugeNumber) + moveCost
+            if tentative < (gScore[n.id] or HugeNumber) then
+                cameFrom[n.id] = current
+                gScore[n.id] = tentative
+                fScore[n.id] = tentative + Heuristic(graph, n.id, targetId)
+                if not openSet[n.id] then
+                    openSet[n.id] = true
+                    table.insert(open, n.id)
+                end
+            end
+        end
+    end
+
+    return nil
 end
 
-function GetScenarioGraph(area)
-    return EnsureScenarioGraph(area)
+local function DirectClear(routeLayer, fromPos, toPos, opts)
+    if opts and type(opts.DirectCheck) == 'function' then
+        local ok, clear = pcall(opts.DirectCheck, routeLayer, fromPos, toPos)
+        return ok and clear
+    end
+    return SegmentPassable(routeLayer, fromPos, toPos)
+end
+
+local function PathNodesToPoints(graph, domain, nodes, layer)
+    local points = {}
+    for _, id in ipairs(nodes or {}) do
+        local c = graph.cells[id]
+        local p = CopyVec(c.center)
+        p[2] = SurfaceHeightForLayer(layer, p[1], p[3])
+        table.insert(points, p)
+    end
+    return points
+end
+
+local function SmoothPath(points, layer, opts)
+    if not (points and table.getn(points) > 2) then
+        return points
+    end
+
+    local smoothed = { CopyVec(points[1]) }
+    local anchor = 1
+    local probe = 3
+
+    while probe <= table.getn(points) do
+        if DirectClear(layer, points[anchor], points[probe], opts) then
+            probe = probe + 1
+        else
+            table.insert(smoothed, CopyVec(points[probe - 1]))
+            anchor = probe - 1
+        end
+    end
+
+    local finalPoint = points[table.getn(points)]
+    if DistSq(smoothed[table.getn(smoothed)], finalPoint) > 1 then
+        table.insert(smoothed, CopyVec(finalPoint))
+    end
+
+    return smoothed
+end
+
+local function RouteLength(path)
+    if not (path and table.getn(path) > 1) then
+        return 0
+    end
+
+    local total = 0
+    for i = 2, table.getn(path) do
+        total = total + Dist(path[i - 1], path[i])
+    end
+    return total
+end
+
+function InitializeMissionGraph(area, opts)
+    local requested = ResolveConfig(opts or {})
+    local mapKey = ResolveMapKey(area)
+
+    if GraphCache
+        and GraphCache.mapKey == mapKey
+        and ConfigMatches(GraphCache.config, requested)
+    then
+        return GraphCache
+    end
+
+    GraphCache = BuildGraph(area, requested)
+    return GraphCache
+end
+
+function GetScenarioGraph()
+    return GraphCache
+end
+
+local function ResolveGraph(area, opts)
+    local cfg = (opts and opts.GraphConfig) or nil
+    if not GraphCache then
+        return InitializeMissionGraph(area, cfg)
+    end
+
+    local requested = ResolveConfig(cfg or GraphCache.config)
+    local key = ResolveMapKey(area)
+    if GraphCache.mapKey ~= key or not ConfigMatches(GraphCache.config, requested) then
+        return InitializeMissionGraph(area, requested)
+    end
+
+    return GraphCache
 end
 
 function FindGraphRoute(area, layer, startPos, targetPos, opts)
-    local graph = EnsureScenarioGraph(area, opts and opts.GraphConfig)
-    graph.metrics.routeQueries = graph.metrics.routeQueries + 1
-    local startedAt = GetGameTimeSeconds and GetGameTimeSeconds() or 0
+    if not (startPos and targetPos) then
+        return nil
+    end
 
-    local domain = DomainKeyFromLayer(layer)
+    local graph = ResolveGraph(area, opts)
+    graph.metrics.requests = (graph.metrics.requests or 0) + 1
 
-    if opts and opts.DirectCheck and opts.DirectCheck(layer, startPos, targetPos) then
-        graph.metrics.directShortcuts = graph.metrics.directShortcuts + 1
+    local domain = ResolveDomainForLayer(layer)
+
+    if domain == Domains.Air then
+        local airRoute = { CopyVec(startPos), CopyVec(targetPos) }
+        graph.metrics.solved = (graph.metrics.solved or 0) + 1
         return {
-            path = { CopyVec(startPos), CopyVec(targetPos) },
-            routeType = 'direct',
+            path = airRoute,
+            routeType = 'graph-air-direct',
             graphUsed = true,
+            domain = domain,
+            length = RouteLength(airRoute),
         }
     end
 
-    local startNode = NearestNode(graph, domain, startPos, graph.config.resolution * 7)
-    local endNode = NearestNode(graph, domain, targetPos, graph.config.resolution * 7)
-    if not (startNode and endNode) then
+    local startId = FindNearestPassableCell(graph, domain, startPos, 7)
+    local targetId = FindNearestPassableCell(graph, domain, targetPos, 7)
+
+    if not (startId and targetId) then
+        graph.metrics.failed = (graph.metrics.failed or 0) + 1
         return nil
     end
 
-    if (startNode.component[domain] or 0) ~= (endNode.component[domain] or 0) then
-        graph.metrics.disconnectedFastFails = graph.metrics.disconnectedFastFails + 1
+    if not DomainConnected(graph, domain, startId, targetId) then
+        graph.metrics.failed = (graph.metrics.failed or 0) + 1
         return nil
     end
 
-    graph.metrics.astarSearches = graph.metrics.astarSearches + 1
-    local nodePath = FindPathAStar(graph, domain, startNode, endNode, opts)
-    if not nodePath then
+    local nodePath = AStarRoute(graph, domain, startId, targetId, startPos, targetPos, opts)
+    if not nodePath or table.getn(nodePath) == 0 then
+        graph.metrics.failed = (graph.metrics.failed or 0) + 1
         return nil
     end
 
-    local path = { CopyVec(startPos) }
-    for _, point in ipairs(nodePath) do
-        table.insert(path, point)
-    end
-    table.insert(path, CopyVec(targetPos))
+    local path = PathNodesToPoints(graph, domain, nodePath, layer)
+    path[1] = CopyVec(startPos)
+    path[table.getn(path)] = CopyVec(targetPos)
+    path = SmoothPath(path, layer, opts)
 
-    local endedAt = GetGameTimeSeconds and GetGameTimeSeconds() or startedAt
-    local elapsed = math.max(0, endedAt - startedAt)
-    graph.metrics.routeBuildSecondsTotal = graph.metrics.routeBuildSecondsTotal + elapsed
-    table.insert(graph.metrics.routeBuildTimes, elapsed)
+    graph.metrics.solved = (graph.metrics.solved or 0) + 1
+
+    local routeType = 'graph'
+    if opts and opts.variantSpec and opts.variantSpec.routeType then
+        routeType = opts.variantSpec.routeType
+    end
 
     return {
         path = path,
-        routeType = 'graph',
+        routeType = routeType,
         graphUsed = true,
-        sourceNodeId = startNode.id,
-        targetNodeId = endNode.id,
-        sourceComponent = startNode.component[domain],
-        targetComponent = endNode.component[domain],
+        domain = domain,
+        nodes = table.getn(nodePath),
+        length = RouteLength(path),
     }
 end
 
-function ReportPathToFallback()
-    local graph = EnsureScenarioGraph()
-    graph.metrics.fallbackPathTo = graph.metrics.fallbackPathTo + 1
-    graph.metrics.pathToCalls = graph.metrics.pathToCalls + 1
-end
-
 function RecordPathToCall()
-    local graph = EnsureScenarioGraph()
-    graph.metrics.pathToCalls = graph.metrics.pathToCalls + 1
-end
-
-function GetMetrics(area)
-    local graph = EnsureScenarioGraph(area)
-    return graph and graph.metrics or {}
-end
-
-local function DeepCopyVariantSpecs(specs)
-    local copy = {}
-    for _, spec in ipairs(specs or {}) do
-        local specCopy = {}
-        for key, value in pairs(spec) do
-            specCopy[key] = value
-        end
-        table.insert(copy, specCopy)
+    if GraphCache and GraphCache.metrics then
+        GraphCache.metrics.pathToCalls = (GraphCache.metrics.pathToCalls or 0) + 1
     end
-    return copy
+end
+
+function ReportPathToFallback()
+    if GraphCache and GraphCache.metrics then
+        GraphCache.metrics.pathToFallbacks = (GraphCache.metrics.pathToFallbacks or 0) + 1
+    end
+end
+
+function GetMetrics()
+    if not (GraphCache and GraphCache.metrics) then
+        return {}
+    end
+
+    local m = {}
+    for key, value in pairs(GraphCache.metrics) do
+        m[key] = value
+    end
+
+    m.totalNodes = GraphCache.metrics.totalNodes
+    m.validLand = GraphCache.metrics.validLand
+    m.validSea = GraphCache.metrics.validSea
+    m.validAir = GraphCache.metrics.validAir
+    m.componentsLand = GraphCache.metrics.componentsLand
+    m.componentsSea = GraphCache.metrics.componentsSea
+    m.resolution = GraphCache.config and GraphCache.config.resolution
+    return m
 end
 
 function GetVariantSpecs(area, opts)
-    local cache = EnsureScenarioGraph(area)
-    local specs = DeepCopyVariantSpecs(cache.variantSpecs)
+    local specs = {
+        { routeType = 'graph-left', sideSign = -1, bias = 0.30 },
+        { routeType = 'graph-right', sideSign = 1, bias = 0.30 },
+    }
+
     if opts and opts.FlankPreference == 'left' then
-        table.sort(specs, function(a, b)
-            return (a.sideSign or 0) < (b.sideSign or 0)
-        end)
+        return { specs[1], specs[2] }
     elseif opts and opts.FlankPreference == 'right' then
-        table.sort(specs, function(a, b)
-            return (a.sideSign or 0) > (b.sideSign or 0)
-        end)
+        return { specs[2], specs[1] }
     end
+
     return specs
+end
+
+function MeasureTerminalFlank(route, target)
+    if not (route and target and table.getn(route) >= 2) then
+        return 0
+    end
+
+    local finalPoint = route[table.getn(route)]
+    local prevPoint = route[table.getn(route) - 1] or finalPoint
+    local approachX = VecX(finalPoint) - VecX(prevPoint)
+    local approachZ = VecZ(finalPoint) - VecZ(prevPoint)
+
+    local directX = VecX(target) - VecX(route[1])
+    local directZ = VecZ(target) - VecZ(route[1])
+
+    local approachLen = math.sqrt((approachX * approachX) + (approachZ * approachZ))
+    local directLen = math.sqrt((directX * directX) + (directZ * directZ))
+    if approachLen < 0.01 or directLen < 0.01 then
+        return 0
+    end
+
+    local dot = ((approachX * directX) + (approachZ * directZ)) / (approachLen * directLen)
+    dot = math.max(-1, math.min(1, dot))
+    return math.deg(math.acos(dot))
 end
 
 function RoutePathSeparation(route, reference)
@@ -616,9 +811,9 @@ function RoutePathSeparation(route, reference)
         if point then
             local nearestSq = HugeNumber
             for _, other in ipairs(reference) do
-                local distanceSq = DistSq(point, other)
-                if distanceSq < nearestSq then
-                    nearestSq = distanceSq
+                local dsq = DistSq(point, other)
+                if dsq < nearestSq then
+                    nearestSq = dsq
                 end
             end
             total = total + math.sqrt(nearestSq)
@@ -629,35 +824,25 @@ function RoutePathSeparation(route, reference)
     return samples > 0 and (total / samples) or 0
 end
 
-function MeasureTerminalFlank(route, target)
-    if not (route and target and table.getn(route) >= 2) then
-        return 0
-    end
-
-    local finalPoint = route[table.getn(route)]
-    local prevPoint = route[table.getn(route) - 1] or finalPoint
-    local approachHeading = HeadingDegrees(prevPoint, finalPoint)
-    local directHeading = HeadingDegrees(route[1], target)
-    return AngleDeltaDegrees(directHeading, approachHeading)
-end
-
 function ScoreCandidates(candidates)
     if not (candidates and table.getn(candidates) > 0) then
         return candidates
     end
 
     local reference = candidates[1] and candidates[1].path or nil
-    for _, candidate in ipairs(candidates) do
-        candidate.separation = reference and RoutePathSeparation(candidate.path, reference) or 0
-        candidate.flankAngle = candidate.flankAngle or MeasureTerminalFlank(candidate.path, candidate.target)
-        local clearance = candidate.clearance or { minimum = 0, average = 0, centeredness = 0 }
-        local clearanceScore = (clearance.minimum * 10) + (clearance.average * 3) + (clearance.centeredness * 14)
-        local lengthPenalty = (candidate.length or HugeNumber) * 0.75
-        local edgePenalty = candidate.edgePenalty or 0
-        local turnPenalty = candidate.turnPenalty or 0
-        candidate.selectionScore = clearanceScore - lengthPenalty - edgePenalty - turnPenalty
-        if candidate.routeType ~= 'default' then
-            candidate.selectionScore = candidate.selectionScore + (candidate.separation * 1.5) + (candidate.flankAngle * 0.14)
+    for _, c in ipairs(candidates) do
+        c.separation = reference and RoutePathSeparation(c.path, reference) or 0
+        c.flankAngle = c.flankAngle or MeasureTerminalFlank(c.path, c.target)
+
+        local clearance = c.clearance or { minimum = 0, average = 0, centeredness = 0 }
+        local clearanceScore = (clearance.minimum * 8.5) + (clearance.average * 2.5) + (clearance.centeredness * 12)
+        local lengthPenalty = (c.length or HugeNumber) * 0.75
+        local turnPenalty = c.turnPenalty or 0
+        local edgePenalty = c.edgePenalty or 0
+
+        c.selectionScore = clearanceScore - lengthPenalty - turnPenalty - edgePenalty
+        if c.routeType ~= 'default' and c.routeType ~= 'graph-default' then
+            c.selectionScore = c.selectionScore + (c.separation * 1.2) + (c.flankAngle * 0.11)
         end
     end
 
@@ -687,19 +872,10 @@ function SelectCandidate(candidates, opts)
 
     local viable = {}
     local bestLength = best.length or HugeNumber
-    local bestMinimumClearance = best.clearance and best.clearance.minimum or 0
 
     for _, candidate in ipairs(candidates) do
         local length = candidate.length or HugeNumber
-        local minClearance = candidate.clearance and candidate.clearance.minimum or 0
-        local sufficientlyDistinct = candidate.routeType == 'default'
-            or candidate.separation >= 10
-            or candidate.flankAngle >= 22
-
-        if length <= (bestLength * RandomizedRouteLengthSlack)
-            and minClearance >= math.max(4, bestMinimumClearance - 2)
-            and sufficientlyDistinct
-        then
+        if length <= (bestLength * 1.55) then
             table.insert(viable, candidate)
         end
     end
@@ -708,18 +884,16 @@ function SelectCandidate(candidates, opts)
         return best, {
             selected = best.routeType or 'default',
             randomized = false,
-            uniformRandom = false,
             candidates = table.getn(candidates),
             viable = 0,
         }
     end
 
     local choiceIndex = Random and Random(1, table.getn(viable)) or math.random(1, table.getn(viable))
-    local choice = viable[choiceIndex] or viable[table.getn(viable)] or best
-    return choice, {
-        selected = choice.routeType or 'default',
+    local selected = viable[choiceIndex] or best
+    return selected, {
+        selected = selected.routeType or 'default',
         randomized = true,
-        uniformRandom = true,
         candidates = table.getn(candidates),
         viable = table.getn(viable),
     }
@@ -737,17 +911,20 @@ function BuildSquadPlan(route, footprintWidth)
         return plan
     end
 
+    local splitThreshold = math.max(8, footprintWidth * 0.78)
+    local rejoinThreshold = math.max(12, footprintWidth * 1.08)
+
     local inSplit = false
     for index, waypoint in ipairs(route.waypoints) do
         local width = waypoint and waypoint.corridorWidth or nil
-        if width and width > 0 and width < math.max(8, footprintWidth * 0.80) then
+        if width and width > 0 and width < splitThreshold then
             plan.requiresSplit = true
             table.insert(plan.chokepoints, { index = index, width = width })
             if not inSplit then
                 inSplit = true
                 table.insert(plan.splitIndices, index)
             end
-        elseif inSplit and width and width >= math.max(12, footprintWidth * 1.10) then
+        elseif inSplit and width and width >= rejoinThreshold then
             inSplit = false
             table.insert(plan.rejoinIndices, index)
         end

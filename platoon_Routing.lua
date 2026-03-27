@@ -95,7 +95,7 @@ local DefaultAssaultLeadDistance = 24
 local RouteBuildYieldInterval = 18
 local StrictSegmentSampleStep = 1.25
 local StrictSegmentRepairMaxDepth = 6
-local DefaultGraphResolution = 32
+local DefaultGraphResolution = 24
 local DefaultGraphHardInflation = 2.5
 local DefaultGraphSoftInflation = 8
 
@@ -108,6 +108,7 @@ local PlatoonTraversalQueueWindow = 3
 local RouteStuckTimeout = 10
 local ActiveRouteBuildContext = false
 local MissionGraphInitialized = false
+local MissionGraphConfig = false
 
 local function RouteBuildClock()
     return GetGameTimeSeconds()
@@ -766,14 +767,47 @@ local function ShouldUseGraphRouting(platoon, opts)
     return true, 'standard'
 end
 
-local function EnsureMissionRoutingGraph(platoon, opts, area)
-    if MissionGraphInitialized and not (opts and opts.ForceGraphRebuild) then
-        return
+local function EnsureMissionRoutingGraph(platoon, opts, area, allowInitialize)
+    if MissionGraphInitialized then
+        if opts and opts.Debug and LOG then
+            local cfg = MissionGraphConfig or ResolveGraphConfig(opts, platoon)
+            LOG(('[PlatoonRouting] GraphInit skipped (already initialized) requestedResolution=%s requestedHard=%s requestedSoft=%s forceRebuild=%s'):format(
+                tostring(cfg and cfg.resolution),
+                tostring(cfg and cfg.inflationHardBlock),
+                tostring(cfg and cfg.inflationSoftPenalty),
+                tostring(false)
+            ))
+        end
+        return true
+    end
+
+    if not allowInitialize then
+        if opts and opts.Debug and LOG then
+            LOG('[PlatoonRouting] GraphInit skipped (InitializeRoutingSystem() has not been called)')
+        end
+        return false
     end
 
     local graphConfig = ResolveGraphConfig(opts, platoon)
     RoutingGraph.InitializeMissionGraph(area or GetPlayableArea(), graphConfig)
     MissionGraphInitialized = true
+    MissionGraphConfig = graphConfig
+    if opts and opts.Debug and LOG then
+        local metrics = RoutingGraph.GetMetrics(area or GetPlayableArea()) or {}
+        LOG(('[PlatoonRouting] GraphInit applied resolution=%s hard=%s soft=%s totalNodes=%s validLand=%s validSea=%s validAir=%s buildSeconds=%s componentsLand=%s componentsSea=%s'):format(
+            tostring(graphConfig and graphConfig.resolution),
+            tostring(graphConfig and graphConfig.inflationHardBlock),
+            tostring(graphConfig and graphConfig.inflationSoftPenalty),
+            tostring(metrics and metrics.nodeCount or false),
+            tostring(metrics and metrics.validNodeCounts and metrics.validNodeCounts.LAND or false),
+            tostring(metrics and metrics.validNodeCounts and metrics.validNodeCounts.SEA or false),
+            tostring(metrics and metrics.validNodeCounts and metrics.validNodeCounts.AIR or false),
+            tostring(metrics and metrics.buildSeconds or false),
+            tostring(metrics and metrics.componentCounts and metrics.componentCounts.LAND or false),
+            tostring(metrics and metrics.componentCounts and metrics.componentCounts.SEA or false)
+        ))
+    end
+    return true
 end
 
 local function PositionInPlayableArea(pos, area)
@@ -874,6 +908,22 @@ local function ResolveRouteChainNames(platoon, opts)
     addValue(platoonData and (platoonData.MarkerChains or platoonData.MarkerChain))
     addValue(platoonData and (platoonData.ChainNames or platoonData.ChainName))
     addValue(platoonData and platoonData.Chain)
+
+    if table.getn(names) == 0 then
+        local function addFromChainTable(chains)
+            if type(chains) ~= 'table' then
+                return
+            end
+            for chainName, _ in pairs(chains) do
+                addName(chainName)
+            end
+        end
+
+        addFromChainTable(Scenario and Scenario.MasterChain)
+        addFromChainTable(Scenario and Scenario.Chains)
+        addFromChainTable(ScenarioInfo and ScenarioInfo.MasterChain)
+        addFromChainTable(ScenarioInfo and ScenarioInfo.Chains)
+    end
 
     return names
 end
@@ -1617,6 +1667,68 @@ local function BuildMarkerChainTransitSegment(layer, fromPos, toPos, chainName)
     return route
 end
 
+local function BuildRouteFromMarkerChain(layer, startPos, target, chainName)
+    if not (layer and startPos and target and chainName) then
+        return nil
+    end
+
+    local chainPoints = ResolveMarkerChainPoints(chainName, layer)
+    if table.getn(chainPoints or {}) == 0 then
+        return nil
+    end
+
+    local route = { CopyVec(startPos) }
+    local first = chainPoints[1]
+    local joinIn = BuildMarkerChainTransitSegment(layer, startPos, first, chainName)
+    if not joinIn then
+        return nil
+    end
+    AppendRouteSegment(route, joinIn)
+
+    local previous = first
+    for index = 2, table.getn(chainPoints) do
+        local nextPoint = chainPoints[index]
+        local transitSegment = BuildMarkerChainTransitSegment(layer, previous, nextPoint, chainName)
+        if not transitSegment then
+            return nil
+        end
+        AppendRouteSegment(route, transitSegment)
+        previous = nextPoint
+        MaybeYieldRouteBuild('chain-route-build')
+    end
+
+    local joinOut = BuildMarkerChainTransitSegment(layer, previous, target, chainName)
+    if not joinOut then
+        return nil
+    end
+    AppendRouteSegment(route, joinOut)
+    return RemoveDuplicateRoutePoints(route, 2)
+end
+
+local function CollectMarkerChainCandidates(layer, startPos, target, chainNames)
+    local candidates = {}
+    for _, chainName in ipairs(chainNames or {}) do
+        local route = BuildRouteFromMarkerChain(layer, startPos, target, tostring(chainName))
+        if route and table.getn(route) > 1 then
+            table.insert(candidates, {
+                path = route,
+                routeType = 'chain-' .. tostring(chainName),
+                length = ComputeRouteLength(route),
+                clearance = {
+                    minimum = RouteMinimumBalancedClearance,
+                    average = RouteMinimumBalancedClearance,
+                    centeredness = 0,
+                },
+                flankAngle = RoutingGraph.MeasureTerminalFlank(route, target),
+                target = target,
+                chainName = tostring(chainName),
+            })
+        end
+    end
+
+    return candidates
+end
+
 local function FindMarkerChainWindow(route, chainPoints)
     if not (route and chainPoints and table.getn(route) > 1 and table.getn(chainPoints) >= 2) then
         return nil
@@ -1800,6 +1912,20 @@ end
 local function BuildRandomizedRouteVariant(layer, startPos, target, area, variant, opts)
     if not (startPos and target and variant) then
         return nil
+    end
+
+    -- Primary variant generation now comes from the graph router so flank
+    -- variants stay topologically valid in both open fields and tight chokepoints.
+    local graphResult = RoutingGraph.FindGraphRoute(area, layer, startPos, target, {
+        GraphConfig = opts and opts.GraphConfig,
+        TemporaryNodePenalty = opts and opts.TemporaryNodePenalty,
+        variantSpec = variant,
+        DirectCheck = function(routeLayer, fromPos, toPos)
+            return SegmentHasClearance(routeLayer, fromPos, toPos, DirectClearance)
+        end,
+    })
+    if graphResult and graphResult.path and table.getn(graphResult.path) > 1 then
+        return graphResult.path
     end
 
     local dirX, dirZ, totalLength = DirectionBetween(startPos, target)
@@ -2823,6 +2949,7 @@ local BuildPlatoonRouteContext = {
     RouteBuildSetStage = RouteBuildSetStage,
     BuildCardinalIngress = BuildCardinalIngress,
     CollectRouteCandidates = CollectRouteCandidates,
+    CollectMarkerChainCandidates = CollectMarkerChainCandidates,
     SelectRouteCandidate = SelectRouteCandidate,
     MaybeYieldRouteBuild = MaybeYieldRouteBuild,
     RemoveDuplicateRoutePoints = RemoveDuplicateRoutePoints,
@@ -2858,7 +2985,21 @@ function BuildPlatoonRoute(platoon, destination, opts)
     end
 
     local useGraphRouting, graphPolicyReason = ShouldUseGraphRouting(platoon, opts)
-    EnsureMissionRoutingGraph(platoon, opts, area)
+    local graphReady = EnsureMissionRoutingGraph(platoon, opts, area, false)
+    if not graphReady then
+        useGraphRouting = false
+        graphPolicyReason = 'graph-not-initialized'
+    end
+    if opts and opts.Debug then
+        local chainRequest = opts.RouteChain or opts.Chain or opts.ChainName or opts.MarkerChain
+        if LOG then
+            LOG(('[PlatoonRouting] policy useGraphRouting=%s reason=%s routeChainRequest=%s'):format(
+                tostring(useGraphRouting and true or false),
+                tostring(graphPolicyReason or 'unknown'),
+                tostring(chainRequest or false)
+            ))
+        end
+    end
 
     local target = area and ctx.ClampToPlayableArea(destination, area, 0) or ctx.CopyVec(destination)
     ctx.SetPointSurface(target, layer)
@@ -2933,7 +3074,15 @@ function BuildPlatoonRoute(platoon, destination, opts)
     candidateOpts.UseGraphRouting = useGraphRouting
     candidateOpts.GraphPolicyReason = graphPolicyReason
     candidateOpts.GraphConfig = ResolveGraphConfig(opts, platoon)
+    local chainNames = ctx.ResolveRouteChainNames(platoon, opts)
     local candidates = ctx.CollectRouteCandidates(layer, routingStart, target, candidateOpts, area)
+    if not candidates and table.getn(chainNames) > 0 then
+        candidates = ctx.CollectMarkerChainCandidates(layer, routingStart, target, chainNames)
+        if candidates and table.getn(candidates) > 0 then
+            candidates = RoutingGraph.ScoreCandidates(candidates)
+            ctx.RouteBuildLog(buildContext, ('candidate-generation fallback=marker-chain chainCandidates=%d'):format(table.getn(candidates)))
+        end
+    end
     local selected, debugSummary = ctx.SelectRouteCandidate(candidates, opts)
     if not (selected and selected.path) then
         ActiveRouteBuildContext = false
@@ -2956,8 +3105,7 @@ function BuildPlatoonRoute(platoon, destination, opts)
     ctx.RouteBuildSetStage(buildContext, 'route-shaping')
     route = ctx.RemoveDuplicateRoutePoints(route, 2)
     route = ctx.RemoveRouteDoubleBack(route)
-    local appliedChainName = nil
-    local chainNames = ctx.ResolveRouteChainNames(platoon, opts)
+    local appliedChainName = selected.chainName or nil
     if table.getn(chainNames) > 0 then
         route, appliedChainName = ctx.ApplyMarkerChainGuidance(route, layer, chainNames)
     end
@@ -3011,6 +3159,12 @@ function BuildPlatoonRoute(platoon, destination, opts)
     stored.debugSummary = debugSummary
     stored.routeCacheKey = cacheKey
     stored.routeChainUsed = appliedChainName
+    if opts and opts.Debug then
+        ctx.RouteBuildLog(buildContext, ('route-chain-summary requested=%s used=%s'):format(
+            tostring((opts.RouteChain or opts.Chain or opts.ChainName or opts.MarkerChain) or false),
+            tostring(appliedChainName or false)
+        ))
+    end
     SyncRouteOptions(stored, buildOpts)
     platoon._storedRoute = stored
     ctx.SaveRouteTemplate(cacheKey, stored)
@@ -3582,13 +3736,41 @@ function RecomputePathWithFallback(platoon, layer, destination, opts)
 end
 
 function InitializeRoutingSystem(opts)
-    MissionGraphInitialized = false
-    EnsureMissionRoutingGraph(nil, opts, GetPlayableArea())
+    EnsureMissionRoutingGraph(nil, opts, GetPlayableArea(), true)
     return RoutingGraph.GetMetrics(GetPlayableArea())
+end
+
+function PrimeRoutingGraph(opts)
+    return InitializeRoutingSystem(opts)
 end
 
 function GetRoutingMetrics()
     return RoutingGraph.GetMetrics(GetPlayableArea())
+end
+
+local function GetPlatoonRouteValidity(platoon)
+    if not platoon then
+        return false, 'platoon=nil', 0, false
+    end
+
+    local brain = platoon.GetBrain and platoon:GetBrain() or nil
+    if not brain then
+        return false, 'brain=nil', 0, false
+    end
+
+    local exists = brain.PlatoonExists and brain:PlatoonExists(platoon) or false
+    local units = platoon.GetPlatoonUnits and platoon:GetPlatoonUnits() or {}
+    local unitCount = table.getn(units or {})
+    local valid = exists and unitCount > 0
+
+    if not exists then
+        return false, 'platoon-missing', unitCount, false
+    end
+    if unitCount <= 0 then
+        return false, 'no-units', 0, true
+    end
+
+    return valid, 'ok', unitCount, true
 end
 
 function BuildRoute(platoon, startPos, targetPos, opts)
@@ -3602,9 +3784,31 @@ function BuildRoute(platoon, startPos, targetPos, opts)
         buildOpts.RouteStart = CopyVec(startPos)
     end
     if buildOpts.Debug and LOG then
-        LOG(('[PlatoonRouting] BuildRoute routeStart=%s'):format(FormatRoutePosition(buildOpts.RouteStart)))
+        local valid, reason, unitCount, exists = GetPlatoonRouteValidity(platoon)
+        local graphCfg = ResolveGraphConfig(buildOpts, platoon)
+        LOG(('[PlatoonRouting] BuildRoute routeStart=%s target=%s platoonValid=%s reason=%s platoonExists=%s unitCount=%d graphResolution=%s graphInflationHard=%s graphInflationSoft=%s'):format(
+            FormatRoutePosition(buildOpts.RouteStart),
+            FormatRoutePosition(targetPos),
+            tostring(valid),
+            tostring(reason),
+            tostring(exists),
+            unitCount or 0,
+            tostring(graphCfg and graphCfg.resolution),
+            tostring(graphCfg and graphCfg.inflationHardBlock),
+            tostring(graphCfg and graphCfg.inflationSoftPenalty)
+        ))
     end
-    return BuildPlatoonRoute(platoon, targetPos, buildOpts)
+    local route = BuildPlatoonRoute(platoon, targetPos, buildOpts)
+    if buildOpts.Debug and LOG then
+        LOG(('[PlatoonRouting] BuildRoute result routeBuilt=%s routeType=%s graphUsed=%s chainUsed=%s waypoints=%d'):format(
+            tostring(route and true or false),
+            tostring(route and route.routeType or false),
+            tostring(route and route.graphUsed and true or false),
+            tostring(route and route.routeChainUsed or false),
+            route and table.getn(route.waypoints or {}) or 0
+        ))
+    end
+    return route
 end
 
 function FollowRoute(platoon, route, opts)
@@ -3687,6 +3891,7 @@ end
 
 return {
     InitializeRoutingSystem = InitializeRoutingSystem,
+    PrimeRoutingGraph = PrimeRoutingGraph,
     GetRoutingMetrics = GetRoutingMetrics,
     BuildRoute = BuildRoute,
     FollowRoute = FollowRoute,
