@@ -217,17 +217,78 @@ local function GetPlayableArea(area)
     return { 0, 0, 512, 512 }
 end
 
-local function PointPassable(layer, pos)
-    local ok, passable = pcall(NavUtils.CanPathTo, layer, pos, pos)
-    return ok and passable
-end
-
 local function SegmentPassable(layer, a, b)
     local ok, passable = pcall(NavUtils.CanPathTo, layer, a, b)
     return ok and passable
 end
 
-local function ProbeClearance(layer, node, cfg)
+local function SurfaceHeightForLayer(layer, x, z)
+    if layer == 'Water' or layer == 'Naval' then
+        return GetSurfaceHeight(x, z)
+    end
+
+    return math.max(GetTerrainHeight(x, z), GetSurfaceHeight(x, z))
+end
+
+local function IsWaterAt(x, z)
+    return (GetSurfaceHeight(x, z) - GetTerrainHeight(x, z)) > 0.05
+end
+
+local function ReadTerrainTypeToken(x, z)
+    if type(GetTerrainType) ~= 'function' then
+        return nil
+    end
+
+    local ok, terrain = pcall(GetTerrainType, x, z)
+    if not ok then
+        return nil
+    end
+
+    if type(terrain) == 'string' then
+        return string.lower(terrain)
+    end
+
+    if type(terrain) == 'table' then
+        for _, key in ipairs({ 'Name', 'name', 'Type', 'type', 1 }) do
+            local value = terrain[key]
+            if type(value) == 'string' then
+                return string.lower(value)
+            end
+        end
+    end
+
+    return nil
+end
+
+local function IsBlockedTerrainType(x, z)
+    local token = ReadTerrainTypeToken(x, z)
+    if not token then
+        return false
+    end
+
+    -- FAF editor terrain types used for impassable ground in this mission context.
+    if token == 'lava01' or token == 'dirt09' then
+        return true
+    end
+
+    return false
+end
+
+local function IsLandNodeUsable(x, z)
+    if IsWaterAt(x, z) then
+        return false
+    end
+    if IsBlockedTerrainType(x, z) then
+        return false
+    end
+    return true
+end
+
+local function IsSeaNodeUsable(x, z)
+    return IsWaterAt(x, z)
+end
+
+local function ProbeClearance(node, cfg, isUsable)
     local maxDist = cfg.obstacleProbeDistance
     local step = cfg.obstacleProbeStep
     local x = node.position[1]
@@ -237,14 +298,14 @@ local function ProbeClearance(layer, node, cfg)
     local distance = step
     while distance <= maxDist do
         local points = {
-            { x + distance, 0, z },
-            { x - distance, 0, z },
-            { x, 0, z + distance },
-            { x, 0, z - distance },
+            { x + distance, z },
+            { x - distance, z },
+            { x, z + distance },
+            { x, z - distance },
         }
         local blocked = false
         for _, point in ipairs(points) do
-            if not PointPassable(layer, point) then
+            if not isUsable(point[1], point[2]) then
                 blocked = true
                 break
             end
@@ -286,7 +347,7 @@ local function BuildNodes(area, cfg)
                 id = id,
                 gx = gx,
                 gz = gz,
-                position = { x, 0, z },
+                position = { x, SurfaceHeightForLayer(Domains.LAND, x, z), z },
                 reachability = { LAND = false, SEA = false, AIR = true },
                 clearance = { LAND = 0, SEA = 0, AIR = cfg.obstacleProbeDistance },
                 penalty = { LAND = 0, SEA = 0, AIR = 0 },
@@ -396,11 +457,14 @@ local function BuildMissionGraph(area, opts)
     BuildConnectivity(graph.nodes, graph.indexByGrid, graph.width, graph.height, cfg)
 
     for _, node in ipairs(graph.nodes) do
-        node.reachability.LAND = PointPassable(Domains.LAND, node.position)
-        node.reachability.SEA = PointPassable(Domains.SEA, node.position)
-        node.reachability.AIR = PointPassable(Domains.AIR, node.position)
-        node.clearance.LAND = ProbeClearance(Domains.LAND, node, cfg)
-        node.clearance.SEA = ProbeClearance(Domains.SEA, node, cfg)
+        local x = node.position[1]
+        local z = node.position[3]
+
+        node.reachability.LAND = IsLandNodeUsable(x, z)
+        node.reachability.SEA = IsSeaNodeUsable(x, z)
+        node.reachability.AIR = true
+        node.clearance.LAND = ProbeClearance(node, cfg, IsLandNodeUsable)
+        node.clearance.SEA = ProbeClearance(node, cfg, IsSeaNodeUsable)
 
         if node.reachability.LAND then
             if node.clearance.LAND < cfg.inflationHardBlock then
