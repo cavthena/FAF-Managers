@@ -154,10 +154,13 @@ WaveAttack specifics
             When true, the platoon halts at its longest weapon range and
             attacks from distance instead of pushing into direct fire.
         RandomizeRoute (boolean, default = false)
-            Chooses from multiple distinct valid corridors (including flank
-            routes) instead of always taking the shortest route.
+            Chooses uniformly from all viable valid corridors instead of
+            always taking the shortest route.
         AggressiveMove (boolean, default = false)
             Optional. Uses aggressive move while routing to each target area.
+        AssaultLeadDistance (number, default = 24)
+            Starts the final assault transition earlier to keep larger
+            formations from waiting until they are too close to the target.
 
 RaidAttack specifics
         Category (string, default = 'ECO')
@@ -165,10 +168,13 @@ RaidAttack specifics
             Areas are 25 units wide.  The priority chain is always
             Requested > ECO > BLD > INT > DEF.
         RandomizeRoute (boolean, default = false)
-            Chooses from multiple distinct valid corridors (including flank
-            routes) instead of always taking the shortest route.
+            Chooses uniformly from all viable valid corridors instead of
+            always taking the shortest route.
         AggressiveMove (boolean, default = false)
             Optional. Uses aggressive move while routing to each target area.
+        AssaultLeadDistance (number, default = 24)
+            Starts the final assault transition earlier to keep larger
+            formations from waiting until they are too close to the target.
 
 ScoutAttack specifics
         Designed for AIR platoons.  Each unit continuously receives move
@@ -224,18 +230,41 @@ DefensePatrol specifics
 local ScenarioFramework = import('/lua/ScenarioFramework.lua')
 local ScenarioUtils     = import('/lua/sim/ScenarioUtilities.lua')
 
+local function ImportFirstAvailable(paths)
+    for _, path in ipairs(paths or {}) do
+        if type(path) == 'string' and path ~= '' then
+            local okImport, mod = pcall(import, path)
+            if okImport and mod then
+                return mod
+            end
+        end
+    end
+    return nil
+end
+
+local function AppendCaseVariants(paths, path)
+    if type(path) ~= 'string' or path == '' then
+        return
+    end
+
+    table.insert(paths, path)
+
+    local lower = string.lower(path)
+    if lower ~= path then
+        table.insert(paths, lower)
+    end
+end
+
 local function ResolveBaseManagerModule()
+    local candidates = {}
+
     local ok, info = pcall(debug.getinfo, 1, 'S')
     if ok and info and info.source then
         local src = info.source
         if type(src) == 'string' and string.sub(src, 1, 1) == '@' then
             local dir = string.match(src, '^@(.*/)[^/]*$')
             if dir then
-                local path = dir .. 'manager_BaseEngineer.lua'
-                local okImport, mod = pcall(import, path)
-                if okImport and mod then
-                    return mod
-                end
+                AppendCaseVariants(candidates, dir .. 'manager_BaseEngineer.lua')
             end
         end
     end
@@ -248,13 +277,16 @@ local function ResolveBaseManagerModule()
                 if string.sub(dir, 1, 1) ~= '/' then
                     dir = '/' .. dir
                 end
-                local path = dir .. '/manager_BaseEngineer.lua'
-                local okImport, mod = pcall(import, path)
-                if okImport and mod then
-                    return mod
-                end
+                AppendCaseVariants(candidates, dir .. '/manager_BaseEngineer.lua')
             end
         end
+    end
+
+    AppendCaseVariants(candidates, '/maps/faf_coop_U01.v0001/manager_BaseEngineer.lua')
+
+    local mod = ImportFirstAvailable(candidates)
+    if mod then
+        return mod
     end
 
     return import('/maps/faf_coop_U01.v0001/manager_BaseEngineer.lua')
@@ -263,17 +295,15 @@ end
 local BaseManager = ResolveBaseManagerModule()
 
 local function ResolveRoutingModule()
+    local candidates = {}
+
     local ok, info = pcall(debug.getinfo, 1, 'S')
     if ok and info and info.source then
         local src = info.source
         if type(src) == 'string' and string.sub(src, 1, 1) == '@' then
             local dir = string.match(src, '^@(.*/)[^/]*$')
             if dir then
-                local path = dir .. 'platoon_Routing.lua'
-                local okImport, mod = pcall(import, path)
-                if okImport and mod then
-                    return mod
-                end
+                AppendCaseVariants(candidates, dir .. 'platoon_Routing.lua')
             end
         end
     end
@@ -286,19 +316,23 @@ local function ResolveRoutingModule()
                 if string.sub(dir, 1, 1) ~= '/' then
                     dir = '/' .. dir
                 end
-                local path = dir .. '/platoon_Routing.lua'
-                local okImport, mod = pcall(import, path)
-                if okImport and mod then
-                    return mod
-                end
+                AppendCaseVariants(candidates, dir .. '/platoon_Routing.lua')
             end
         end
+    end
+
+    AppendCaseVariants(candidates, '/maps/faf_coop_U01.v0001/platoon_Routing.lua')
+
+    local mod = ImportFirstAvailable(candidates)
+    if mod then
+        return mod
     end
 
     return import('/maps/faf_coop_U01.v0001/platoon_Routing.lua')
 end
 
 local Routing = ResolveRoutingModule()
+local RoutingShouldRepath = type(Routing) == 'table' and rawget(Routing, 'ShouldRepath') or nil
 GetTerrainHeight  = GetTerrainHeight
 GetSurfaceHeight  = GetSurfaceHeight
 
@@ -444,6 +478,27 @@ local function CopyVector(vec)
     return { vec[1], vec[2], vec[3] }
 end
 
+local function IsValidPositionVector(vec)
+    if type(vec) ~= 'table' then
+        return false
+    end
+
+    return type(vec[1]) == 'number'
+        and type(vec[3]) == 'number'
+end
+
+local function FormatPositionVector(vec)
+    if not IsValidPositionVector(vec) then
+        return 'nil'
+    end
+
+    return ('(%.2f, %.2f, %.2f)'):format(
+        vec[1],
+        type(vec[2]) == 'number' and vec[2] or 0,
+        vec[3]
+    )
+end
+
 local function VectorAdd(a, b)
     return { a[1] + b[1], a[2] + b[2], a[3] + b[3] }
 end
@@ -536,8 +591,40 @@ local function CopyOptions(data)
     end
     opts.AggressiveMove = aggressiveMove and true or false
     opts.RandomizeRoute = opts.RandomizeRoute and true or false
+    if opts.DisableIngress ~= nil then
+        opts.DisableIngress = opts.DisableIngress and true or false
+    end
+    if opts.Debug == nil and opts.debug ~= nil then
+        opts.Debug = opts.debug
+    end
+    opts.Debug = (opts.Debug == true)
     opts.Formation   = ValidateFormation(opts.Formation)
     return opts
+end
+
+local function MergeAttackData(platoon, data)
+    local merged = {}
+
+    if platoon and type(platoon.PlatoonData) == 'table' then
+        for key, value in pairs(platoon.PlatoonData) do
+            merged[key] = value
+        end
+    end
+
+    if type(data) == 'table' then
+        for key, value in pairs(data) do
+            merged[key] = value
+        end
+    end
+
+    return merged
+end
+
+local function ReadStoredValue(platoon, key, fallback)
+    if platoon and platoon.PlatoonData and platoon.PlatoonData[key] ~= nil then
+        return platoon.PlatoonData[key]
+    end
+    return fallback
 end
 
 local function GetPlatoonPosition(platoon)
@@ -1190,6 +1277,7 @@ local function LeastDefendedStructures(brain, layer, structures)
 end
 
 local CanPathTo
+local DebugAttackRoute
 
 local function ChooseBestArea(brain, platoon, opts, layer, areaRadius, mode, category)
     local startPos = GetPlatoonPosition(platoon)
@@ -1200,6 +1288,10 @@ local function ChooseBestArea(brain, platoon, opts, layer, areaRadius, mode, cat
     local enemies = BrainEnemies(brain, opts.TargetArmy)
     local bestScore = -1e9
     local best = nil
+    local candidateCount = table.getn(candidates or {})
+    local candidatesWithTargets = 0
+    local rejectedByPathing = 0
+    local acceptedCandidates = 0
 
     for _, entry in ipairs(candidates) do
         local pos = entry.pos
@@ -1207,14 +1299,17 @@ local function ChooseBestArea(brain, platoon, opts, layer, areaRadius, mode, cat
             local units = AreaUnits(brain, enemies, pos, areaRadius, category, opts.IntelOnly)
             units = FilterUnits(units, layer, opts.Submersible)
             if table.getn(units) > 0 then
+                candidatesWithTargets = candidatesWithTargets + 1
                 if not opts.Transport and not CanPathTo(platoon, layer, pos) then
                     -- Skip unreachable areas so wave attacks don't repeatedly
                     -- retarget locations they cannot move toward.
+                    rejectedByPathing = rejectedByPathing + 1
                     units = {}
                 end
             end
 
             if table.getn(units) > 0 then
+                acceptedCandidates = acceptedCandidates + 1
                 local distance = Distance(startPos, pos)
                 local score = ScoreStructureCluster(units, mode, distance)
                 if opts.AvoidDef then
@@ -1232,6 +1327,19 @@ local function ChooseBestArea(brain, platoon, opts, layer, areaRadius, mode, cat
             end
         end
     end
+
+    DebugAttackRoute(opts, ('resolver-summary mode=%s layer=%s start=(%.2f, %.2f, %.2f) candidates=%d withTargets=%d pathRejected=%d accepted=%d bestScore=%s'):format(
+        tostring(mode or 'unknown'),
+        tostring(layer or 'unknown'),
+        startPos[1] or 0,
+        startPos[2] or 0,
+        startPos[3] or 0,
+        candidateCount,
+        candidatesWithTargets,
+        rejectedByPathing,
+        acceptedCandidates,
+        tostring(best and best.score or false)
+    ))
 
     return best
 end
@@ -1375,7 +1483,7 @@ CanPathTo = function(platoon, layer, destination)
     return Routing.CanPathTo(platoon, layer, destination)
 end
 
-CanPathBetween = function(layer, a, b)
+local function CanPathBetween(layer, a, b)
     if not (Routing and Routing.CanPathBetween) then
         return false
     end
@@ -1403,7 +1511,7 @@ local function RecomputePathWithFallback(platoon, layer, destination, opts)
     return Routing.RecomputePathWithFallback(platoon, layer, destination, CopyOptions(opts))
 end
 
-ClampPathToPlayableArea = function(path, buffer)
+local function ClampPathToPlayableArea(path, buffer)
     return path
 end
 
@@ -1520,9 +1628,9 @@ local function ExtractStoredRoutePath(route)
     return path
 end
 
-local function RebuildAttackRoute(platoon, targetPos, routeOpts)
+local function RebuildAttackRoute(platoon, startPos, targetPos, routeOpts)
     routeOpts.ForceRepath = true
-    return Routing.BuildPlatoonRoute(platoon, targetPos, routeOpts)
+    return Routing.BuildRoute(platoon, startPos, targetPos, routeOpts)
 end
 
 local function AttackTargetArea(platoon, target, opts)
@@ -1533,8 +1641,8 @@ local function AttackTargetArea(platoon, target, opts)
 
     local layer = DetermineLayer(platoon, opts.Amphibious)
     local area = GetPlayableArea()
-    local startPos = GetPlatoonPosition(platoon)
-    if not startPos then
+    local liveStartPos = GetPlatoonPosition(platoon)
+    if not liveStartPos then
         return 'fail'
     end
 
@@ -1545,18 +1653,54 @@ local function AttackTargetArea(platoon, target, opts)
         targetPos = CopyVector(targetPos)
     end
 
-    local startedOutside = area and not PositionInPlayableArea(startPos, area)
+    local startedOutsideLive = area and not PositionInPlayableArea(liveStartPos, area)
+    local storedStartPos = ReadStoredValue(platoon, 'StartPosition', nil)
+    local storedStartedOutside = ReadStoredValue(platoon, 'StartedOutsidePlayableArea', startedOutsideLive)
+    local routeSource = ReadStoredValue(platoon, 'RouteSource', opts.RouteSource)
+    local startSource = ReadStoredValue(platoon, 'StartSource', ReadStoredValue(platoon, 'StartPositionSource', nil))
+
+    local startPos = liveStartPos
+    if storedStartedOutside then
+        if IsValidPositionVector(storedStartPos) then
+            startPos = CopyVector(storedStartPos)
+        else
+            RoutingLog('Warning: StartedOutsidePlayableArea=true but StartPosition missing/malformed; falling back to live position')
+        end
+    end
+
+    RoutingLog(
+        ('AttackTargetArea route handoff routeSource=%s startSource=%s liveStart=%s storedStart=%s startedOutside=%s selectedRouteStart=%s'):format(
+            tostring(routeSource or 'unknown'),
+            tostring(startSource or 'unknown'),
+            FormatPositionVector(liveStartPos),
+            FormatPositionVector(storedStartPos),
+            tostring(storedStartedOutside and true or false),
+            FormatPositionVector(startPos)
+        )
+    )
+
     local routeOpts = {
         Formation = opts.Formation,
         AggressiveMove = opts.AggressiveMove,
         Amphibious = opts.Amphibious,
         RandomizeRoute = opts.RandomizeRoute and true or false,
         RequireFinalStaging = opts.RequireFinalStaging and true or false,
+        DisableIngress = ReadStoredValue(platoon, 'DisableIngress', opts.DisableIngress),
+        Debug = opts.Debug,
         RouteLayer = layer,
-        RouteSource = (platoon.PlatoonData and platoon.PlatoonData.RouteSource) or opts.RouteSource,
-        StartedOutsidePlayableArea = (platoon.PlatoonData and platoon.PlatoonData.StartedOutsidePlayableArea) or startedOutside,
+        RouteSource = routeSource,
+        RouteCacheTag = opts.RouteCacheTag
+            or ReadStoredValue(platoon, 'SpawnerTag',
+                ReadStoredValue(platoon, 'BuilderTag',
+                    ReadStoredValue(platoon, 'Tag', opts.Tag))),
+        StartedOutsidePlayableArea = storedStartedOutside and true or false,
         TargetPosition = targetPos,
         TargetZone = target,
+        AssaultLeadDistance = opts.AssaultLeadDistance,
+        RouteChain = opts.RouteChain or opts.MarkerChain or opts.Chain or opts.ChainName,
+        RouteChains = opts.RouteChains or opts.MarkerChains or opts.ChainNames,
+        RouteMode = opts.RouteMode or 'AttackMove',
+        RoutePhase = 'TRANSIT',
     }
 
     local bombardRange = nil
@@ -1567,22 +1711,40 @@ local function AttackTargetArea(platoon, target, opts)
         end
     end
 
-    local route = Routing.BuildPlatoonRoute(platoon, targetPos, routeOpts)
+    local route = Routing.BuildRoute(platoon, startPos, targetPos, routeOpts)
     local canPath = route and true or CanPathTo(platoon, layer, targetPos)
+    DebugAttackRoute(opts, ('route-eval routeBuilt=%s canPathToTarget=%s'):format(
+        tostring(route and true or false),
+        tostring(canPath and true or false)
+    ))
     if not canPath then
         if opts.Transport then
             if not TransportAndMove(platoon, targetPos, opts) then
                 return 'fail'
             end
-            route = RebuildAttackRoute(platoon, targetPos, routeOpts)
+            route = RebuildAttackRoute(platoon, startPos, targetPos, routeOpts)
         else
             return 'fail'
         end
     end
 
     if not route then
+        local metrics = (Routing and Routing.GetRoutingMetrics and Routing.GetRoutingMetrics()) or nil
+        DebugAttackRoute(opts, ('route-selected=false repath=true metrics={queries=%s astar=%s fallback=%s disconnected=%s}'):format(
+            tostring(metrics and metrics.routeQueries or false),
+            tostring(metrics and metrics.astarSearches or false),
+            tostring(metrics and metrics.fallbackPathTo or false),
+            tostring(metrics and metrics.disconnectedFastFails or false)
+        ))
         return 'repath'
     end
+
+    DebugAttackRoute(opts, ('route-selected type=%s chainUsed=%s graphUsed=%s waypointCount=%d'):format(
+        tostring(route.routeType or 'unknown'),
+        tostring(route.routeChainUsed or false),
+        tostring(route.graphUsed and true or false),
+        table.getn(route.waypoints or {})
+    ))
 
     local routeStatus = nil
     if bombardRange then
@@ -1591,7 +1753,7 @@ local function AttackTargetArea(platoon, target, opts)
             return 'repath'
         end
         if not MoveAlongPath(platoon, path, opts.Formation, false, layer, opts.AggressiveMove) then
-            route = RebuildAttackRoute(platoon, targetPos, routeOpts)
+            route = RebuildAttackRoute(platoon, startPos, targetPos, routeOpts)
             if not (route and route.waypoints) then
                 return 'repath'
             end
@@ -1605,21 +1767,28 @@ local function AttackTargetArea(platoon, target, opts)
         -- Traversal stays under the routing queue so platoons do not clear and
         -- reform between route nodes; only the final attack handoff below may
         -- issue a fresh attack command at the destination.
-        routeStatus = Routing.FollowStoredPlatoonRoute(platoon, targetPos, routeOpts)
+        local repathRequired = type(RoutingShouldRepath) == 'function'
+            and select(1, RoutingShouldRepath(platoon, route, routeOpts))
+            or false
+        if repathRequired then
+            route = RebuildAttackRoute(platoon, startPos, targetPos, routeOpts)
+        end
+
+        routeStatus = Routing.FollowRoute(platoon, route, routeOpts)
         if routeStatus == 'repath' then
             RoutingLog('Initial route follow requested repath; rebuilding authoritative route')
-            route = RebuildAttackRoute(platoon, targetPos, routeOpts)
+            route = RebuildAttackRoute(platoon, startPos, targetPos, routeOpts)
             if not route and opts.Transport then
                 RoutingLog('Route rebuild failed; attempting transport fallback')
                 if not TransportAndMove(platoon, targetPos, opts) then
                     return 'repath'
                 end
-                route = RebuildAttackRoute(platoon, targetPos, routeOpts)
+                route = RebuildAttackRoute(platoon, startPos, targetPos, routeOpts)
             end
             if not route then
                 return 'repath'
             end
-            routeStatus = Routing.FollowStoredPlatoonRoute(platoon, targetPos, routeOpts)
+            routeStatus = Routing.FollowRoute(platoon, route, routeOpts)
         end
 
         if routeStatus ~= 'attack' and routeStatus ~= 'success' then
@@ -1702,6 +1871,12 @@ local function WaitForTargets(brain, delay)
     SafeWait(delay or RecheckDelay)
 end
 
+DebugAttackRoute = function(opts, message)
+    if opts and opts.Debug and LOG then
+        LOG(('[AttackRouting] %s'):format(tostring(message or '')))
+    end
+end
+
 local function AttackLoop(platoon, resolver, opts)
     local brain = platoon:GetBrain()
     if not brain then return end
@@ -1712,6 +1887,17 @@ local function AttackLoop(platoon, resolver, opts)
     while PlatoonAlive(platoon) do
         if not currentTarget then
             currentTarget = resolver(brain, platoon, opts, layer)
+            if currentTarget then
+                local pos = currentTarget.position
+                DebugAttackRoute(opts, ('target-found=true position=(%.2f, %.2f, %.2f) score=%s'):format(
+                    pos and pos[1] or 0,
+                    pos and pos[2] or 0,
+                    pos and pos[3] or 0,
+                    tostring(currentTarget.score)
+                ))
+            else
+                DebugAttackRoute(opts, 'target-found=false (resolver returned nil)')
+            end
             if not currentTarget then
                 WaitForTargets(brain, RecheckDelay)
             end
@@ -2415,6 +2601,7 @@ local function TrackHuntTarget(platoon, targetInfo, opts, layer)
 end
 
 function WaveAttack(platoon, data)
+    data = MergeAttackData(platoon, data)
     local opts = CopyOptions(data)
     opts.AggressiveMove = opts.AggressiveMove and true or false
     if not data or data.RandomizeRoute == nil then
@@ -2428,6 +2615,7 @@ function WaveAttack(platoon, data)
 end
 
 function RaidAttack(platoon, data)
+    data = MergeAttackData(platoon, data)
     local opts = CopyOptions(data)
     opts.AggressiveMove = opts.AggressiveMove and true or false
     if not data or data.RandomizeRoute == nil then
@@ -2441,6 +2629,7 @@ function RaidAttack(platoon, data)
 end
 
 function ScoutAttack(platoon, data)
+    data = MergeAttackData(platoon, data)
     local opts = CopyOptions(data)
     local brain = platoon:GetBrain()
     if not brain then return end
@@ -2478,6 +2667,7 @@ function ScoutAttack(platoon, data)
 end
 
 function AreaPatrol(platoon, data)
+    data = MergeAttackData(platoon, data)
     local opts = CopyOptions(data)
     opts.AggressiveMove = true
     local layer = DetermineLayer(platoon, opts.Amphibious)
@@ -2561,6 +2751,7 @@ function AreaPatrol(platoon, data)
 end
 
 function Firebase(platoon, data)
+    data = MergeAttackData(platoon, data)
     local opts = CopyOptions(data)
     local brain = platoon:GetBrain()
     if not brain then return end
@@ -2610,6 +2801,7 @@ function Firebase(platoon, data)
 end
 
 function Supportbase(platoon, data)
+    data = MergeAttackData(platoon, data)
     local opts = CopyOptions(data)
     local brain = platoon:GetBrain()
     if not brain then return end
@@ -2673,6 +2865,7 @@ function Supportbase(platoon, data)
 end
 
 function HuntAttack(platoon, data)
+    data = MergeAttackData(platoon, data)
     local opts = CopyOptions(data)
     opts.AggressiveMove = opts.AggressiveMove and true or false
     opts.Vulnerable = opts.Vulnerable and true or false
@@ -2733,6 +2926,7 @@ function HuntAttack(platoon, data)
 end
 
 function DefensePatrol(platoon, data)
+    data = MergeAttackData(platoon, data)
     local opts = CopyOptions(data)
     opts.AggressiveMove = true
     local brain = platoon:GetBrain()

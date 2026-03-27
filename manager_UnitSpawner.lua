@@ -5,9 +5,9 @@
 -- What it does
 --   • Spawns a platoon at a given marker using a composition { {bp, {e,n,h}, [label], [waveStart]}, ... }
 --   • Hands the platoon to your attack function immediately (ForkAIThread)
---   • Four modes:
+--   • Five modes:
+--       0) Single-shot: spawn one platoon, hand off, then stop and return the platoon from Start(...)
 --       1) Wave: spawn → handoff → wait waveCooldown → next wave
---       2) Loss-gated: spawn → handoff → wait until the platoon has lost >= mode2LossThreshold, then apply waveCooldown before spawning again.
 --       3) Limited waves: spawn → handoff → wait a shrinking waveCooldown → next wave, until mode3WaveCount is reached.
 --          Composition entries can specify the wave they join via a 4th field (wave start, 1-indexed).
 --       4) Batched window: spawn a fixed number of platoons (mode4PlatoonCount) evenly spaced over waveCooldown, then stop.
@@ -15,8 +15,43 @@
 --   • Safe to run multiple spawners in parallel (unique tag per instance; no shared state)
 --
 -- Public API
---   local Spawner = import('/maps/.../manager_UnitSpawner.lua')
---   local handle = Spawner.Start{
+--   local SpawnMgr = import('/maps/.../manager_UnitSpawner.lua')
+--
+--   -- Existing spawner usage -------------------------------------------------
+--   local handle = SpawnMgr.Start{
+--     brain = ArmyBrains[ScenarioInfo.Cybran],
+--     spawnMarker = 'AREA3_SPAWNER_CENTER',
+--     composition = {
+--         {'url0107', 8},
+--     },
+--     attackFn = plaAtk.WaveAttack,
+--     attackData = {
+--         Type = 'cluster',
+--         TargetArmy = {ScenarioInfo.Player1},
+--         Formation = 'AttackFormation',
+--         AggressiveMove = true,
+--     },
+--   }
+--
+--   -- One-shot normal spawn (same spawn/handoff path as other modes) ---------
+--   local platoon = SpawnMgr.Start{
+--     brain = ArmyBrains[ScenarioInfo.Cybran],
+--     spawnMarker = 'AREA1_SPAWN_EAST_3',
+--     composition = {
+--         {'url0106', 6},
+--         {'url0107', 6},
+--     },
+--     attackFn = plaAtk.WaveAttack,
+--     mode = 0,
+--     attackFn = plaAtk.WaveAttack,
+--         TargetArmy = {ScenarioInfo.Player1},
+--         Formation = 'AttackFormation',
+--         AggressiveMove = true,
+--     },
+--   }
+--
+--  --------------------------------------------------------------------------
+--   local handle = SpawnMgr.Start{
 --     brain              = ArmyBrains[ScenarioInfo.Cybran],
 --     spawnMarker        = 'AREA2_NORTHATTACK_SPAWNER',
 --     composition        = {
@@ -26,7 +61,7 @@
 --     difficulty         = ScenarioInfo.Options.Difficulty or 2,  -- 1..3
 --     attackFn           = 'Platoon_BasicAttack',                 -- function or global function name
 --     waveCooldown       = 15,                                    -- seconds; in mode 2 it starts once threshold is met
---     mode               = 1,                                     -- 1: cooldown, 2: gate by losses, 3: finite waves, 4: batched waves
+--     mode               = 1,                                     -- 0: single-shot, 1: cooldown, 2: gate by losses, 3: finite waves, 4: batched waves
 --     mode2LossThreshold = 0.50,                                  -- fraction lost to trigger next wave
 --     mode3WaveCount     = 5,                                     -- number of waves for mode 3
 --     mode4PlatoonCount  = 3,                                     -- platoons per cooldown window for mode 4
@@ -263,6 +298,198 @@ local function _PickIndex(n, avoid)
     return i
 end
 
+local function CopyPosition(pos)
+    if not pos then
+        return nil
+    end
+    return { pos[1], pos[2], pos[3] }
+end
+
+local function ResolveEntryCount(entry, difficulty)
+    local d = math.max(1, math.min(3, difficulty or 2))
+    local want = entry and entry.counts and entry.counts[d] or 0
+    return math.max(0, math.floor(want or 0))
+end
+
+local function ResolveStartedOutsidePlayableArea(position, override)
+    if override ~= nil then
+        return override and true or false
+    end
+
+    local area = GetPlayableArea()
+    if area and position then
+        return not PositionInPlayableArea(position, area)
+    end
+
+    return false
+end
+
+local function ResolveStartPositionContext(params, context, platoon, platoonData)
+    local source = context and context.startPosSource
+    local position = context and context.spawnPos
+
+    if not position and params and params.position ~= nil then
+        position = markerPos(params.position)
+        if position then
+            source = source or 'position'
+        end
+    end
+
+    if not position and params and params.spawnMarker ~= nil then
+        position = markerPos(params.spawnMarker)
+        if position then
+            source = source or 'spawnMarker'
+        end
+    end
+
+    if not position then
+        position = platoon and platoon._spawnerStartPosition
+        if position then
+            source = source or 'spawnMarker'
+        end
+    end
+
+    if not position and platoonData and platoonData.SpawnPosition then
+        position = platoonData.SpawnPosition
+        if position then
+            source = source or 'storedSpawnPosition'
+        end
+    end
+
+    if not position and platoon and platoon.GetPlatoonPosition then
+        position = platoon:GetPlatoonPosition()
+        if position then
+            source = source or 'GetPlatoonPosition'
+        end
+    end
+
+    return position and CopyPosition(position) or nil, source or 'unknown'
+end
+
+local function MetadataDebugLog(params, message)
+    if params and params.debug and LOG then
+        LOG(('[US:%s] %s'):format(tostring(params.spawnerTag or '?'), message))
+    end
+end
+
+local function ApplyPlatoonMetadata(platoon, params, context)
+    if not platoon then
+        return nil
+    end
+
+    local platoonData = platoon.PlatoonData or {}
+    local attackData = type(params and params.attackData) == 'table' and params.attackData or nil
+    if attackData then
+        for key, value in pairs(attackData) do
+            if platoonData[key] == nil then
+                platoonData[key] = value
+            end
+        end
+    end
+
+    local spawnPos, startPosSource = ResolveStartPositionContext(params, context, platoon, platoonData)
+    local routeSource = (params and params.routeSource) or platoonData.RouteSource or 'UnitSpawner'
+    local startedOutside = ResolveStartedOutsidePlayableArea(spawnPos, params and params.startedOutsidePlayableArea)
+    local disableIngress = nil
+    if params and params.DisableIngress ~= nil then
+        disableIngress = params.DisableIngress and true or false
+    elseif attackData and attackData.DisableIngress ~= nil then
+        disableIngress = attackData.DisableIngress and true or false
+    elseif platoonData.DisableIngress ~= nil then
+        disableIngress = platoonData.DisableIngress and true or false
+    end
+
+    platoonData.RouteSource = routeSource
+    platoonData.StartedOutsidePlayableArea = startedOutside
+    platoonData.Formation = platoonData.Formation or (params and params.formation) or 'GrowthFormation'
+    platoonData.StartPositionSource = startPosSource
+    if disableIngress ~= nil then
+        platoonData.DisableIngress = disableIngress
+    end
+
+    if params and params.spawnerTag and platoonData.SpawnerTag == nil then
+        platoonData.SpawnerTag = params.spawnerTag
+    end
+    if params and params.label and platoonData.PlatoonLabel == nil then
+        platoonData.PlatoonLabel = params.label
+    end
+    if params and params.spawnMarker ~= nil and platoonData.SpawnMarker == nil then
+        platoonData.SpawnMarker = params.spawnMarker
+    end
+    if spawnPos then
+        platoonData.SpawnPosition = CopyPosition(spawnPos)
+        platoonData.StartPosition = CopyPosition(spawnPos)
+    end
+    platoonData.StartSource = platoonData.StartPositionSource
+    if params and params.startedOutsidePlayableArea ~= nil then
+        platoonData.StartedOutsidePlayableArea = params.startedOutsidePlayableArea and true or false
+    end
+    if attackData and platoonData.AttackData == nil then
+        platoonData.AttackData = attackData
+    end
+
+    MetadataDebugLog(params, ('ApplyPlatoonMetadata routeSource=%s startSource=%s startPosition=%s startedOutsidePlayableArea=%s disableIngress=%s'):format(
+        tostring(routeSource),
+        tostring(startPosSource),
+        spawnPos and ('(%.2f, %.2f, %.2f)'):format(spawnPos[1] or 0, spawnPos[2] or 0, spawnPos[3] or 0) or 'false',
+        tostring(startedOutside),
+        tostring(disableIngress)
+    ))
+
+    platoon.PlatoonData = platoonData
+    return platoonData
+end
+
+local function ResolveAttackFunction(attackFn)
+    if type(attackFn) == 'string' and attackFn ~= '' then
+        return _G and rawget(_G, attackFn)
+    end
+    return attackFn
+end
+
+local function LaunchAttackThread(platoon, attackFn, attackData, warnFn)
+    local resolvedAttackFn = ResolveAttackFunction(attackFn)
+    if type(resolvedAttackFn) ~= 'function' then
+        if warnFn then
+            warnFn('AttackWrapper: attackFn is not callable: ' .. tostring(attackFn))
+        end
+        return false
+    end
+
+    local brain = platoon and platoon.GetBrain and platoon:GetBrain()
+    if not (brain and brain.PlatoonExists and brain:PlatoonExists(platoon)) then
+        if warnFn then
+            warnFn('AttackWrapper: platoon missing at handoff')
+        end
+        return false
+    end
+
+    brain:ForkThread(function()
+        WaitTicks(2)
+        if brain:PlatoonExists(platoon) then
+            local units = platoon:GetPlatoonUnits() or {}
+            if table.getn(units) > 0 then
+                IssueClearCommands(units)
+            end
+
+            platoon:ForkAIThread(function(p)
+                if type(attackFn) == 'string' and attackFn ~= '' then
+                    local namedFn = _G and rawget(_G, attackFn)
+                    if type(namedFn) == 'function' then
+                        return namedFn(p, attackData)
+                    end
+                    return
+                end
+                return resolvedAttackFn(p, attackData)
+            end)
+        elseif warnFn then
+            warnFn('AttackWrapper: platoon missing after handoff delay')
+        end
+    end)
+
+    return true
+end
+
 -- ========== class ==========
 local Spawner = {}
 Spawner.__index = Spawner
@@ -271,10 +498,7 @@ function Spawner:Log(msg) LOG(('[US:%s] %s'):format(self.tag, msg)) end
  function Spawner:Warn(msg) WARN(('[US:%s] %s'):format(self.tag, msg)) end
 
  function Spawner:GetEntryCount(entry)
-     local d = math.max(1, math.min(3, self.params.difficulty or 2))
-     local want = entry.counts[d] or 0
-     want = math.max(0, math.floor(want))
-     return want
+     return ResolveEntryCount(entry, self.params.difficulty)
  end
 
 function Spawner:GetEscalationFactor(waveNo)
@@ -405,51 +629,15 @@ function Spawner:HandOffToAttack(platoon)
     local attackFn = self.params.attackFn
     if not attackFn then
         self:Warn('No attackFn provided; spawned platoon will idle.')
-        return
+        return false
     end
 
-    if type(attackFn) == 'string' and attackFn ~= '' then
-        attackFn = _G and rawget(_G, attackFn)
-    end
+    local platoonData = ApplyPlatoonMetadata(platoon, self.params, {
+        spawnPos = platoon and platoon._spawnerStartPosition,
+    })
 
-    if type(attackFn) ~= 'function' then
-        self:Warn('AttackWrapper: attackFn is not callable: '.. tostring(self.params.attackFn))
-        return
-    end
-
-    local brain = platoon and platoon.GetBrain and platoon:GetBrain()
-    if not (brain and brain.PlatoonExists and brain:PlatoonExists(platoon)) then
-        self:Warn('AttackWrapper: platoon missing at handoff')
-        return
-    end
-
-    brain:ForkThread(function()
-        WaitTicks(2)
-        if brain:PlatoonExists(platoon) then
-            local units = platoon:GetPlatoonUnits() or {}
-            if table.getn(units) > 0 then
-                IssueClearCommands(units)
-            end
-
-            local platoonData = platoon.PlatoonData or {}
-            if type(self.params.attackData) == 'table' then
-                for key, value in pairs(self.params.attackData) do
-                    platoonData[key] = value
-                end
-            end
-
-            local spawnPos = platoon._spawnerStartPosition
-            local area = GetPlayableArea()
-            platoonData.RouteSource = 'UnitSpawner'
-            platoonData.StartedOutsidePlayableArea = area and spawnPos and not PositionInPlayableArea(spawnPos, area) or false
-            platoonData.SpawnPosition = spawnPos and { spawnPos[1], spawnPos[2], spawnPos[3] } or nil
-            platoonData.Formation = platoonData.Formation or self.params.formation or 'GrowthFormation'
-            platoon.PlatoonData = platoonData
-
-            platoon:ForkAIThread(function(p)
-                return attackFn(p, p.PlatoonData)
-            end)
-        end
+    return LaunchAttackThread(platoon, attackFn, platoonData or self.params.attackData, function(msg)
+        self:Warn(msg)
     end)
 end
 
@@ -482,10 +670,10 @@ function Spawner:SpawnWave(waveNo, wanted)
         platoon._spawnerStartPosition = { pos[1], pos[2], pos[3] }
     end
 
-    self:HandOffToAttack(platoon)
+    local attackLaunched = self:HandOffToAttack(platoon)
 
     local unitCount = resolveUnitCount(spawned)
-    return platoon, spawned, unitCount, wanted
+    return platoon, spawned, unitCount, wanted, attackLaunched
 end
 
  function Spawner:WaitForLossGate(platoon, expectedCount)
@@ -619,6 +807,18 @@ function Spawner:RunMode4()
     self.stopped = true
 end
 
+function Spawner:RunMode0()
+    local wave = 1
+    local wanted = self:BuildWantedForWave(wave)
+    local platoon, _, unitCount, usedWanted = self:SpawnWave(wave, wanted)
+    local keepRunning = self:InvokeBooleanCallbacks('OnWaveNumber', true, wave, platoon, unitCount, usedWanted)
+    if keepRunning ~= false then
+        self:InvokeBooleanCallbacks('OnWaveCreated', keepRunning, wave, platoon, unitCount, usedWanted)
+    end
+    self.stopped = true
+    return platoon
+end
+
 function Spawner:MainLoop()
     local mode = self.params.mode or 1
     if mode == 2 then
@@ -669,29 +869,41 @@ end
         onMode2ThresholdMet = p.onMode2ThresholdMet,
         escalationPercent  = p.escalationPercent or 0,
         escalationFrequency= p.escalationFrequency or 0,
+        routeSource        = p.routeSource,
+        label              = p.label or p.platoonLabel,
+        startedOutsidePlayableArea = p.startedOutsidePlayableArea,
+        position           = p.position,
     }
 end
 
- -- ========== Public API ==========
- function Start(params)
-     assert(params and params.brain and params.spawnMarker, 'brain and spawnMarker are required')
-     local o = setmetatable({}, Spawner)
-     o.params      = normalizeParams(params)
-     o.brain       = o.params.brain
-     o.tag         = o.params.spawnerTag or ('US_'.. math.floor(100000 * Random()))
-     o.params.spawnerTag = o.tag
-     o.spawnPositions = resolveSpawnList(o.params.spawnMarker)
-     if table.getn(o.spawnPositions) == 0 then
-         error('Invalid spawnMarker: '.. tostring(o.params.spawnMarker))
-     end
+local function BuildSpawner(params, tagPrefix)
+    local o = setmetatable({}, Spawner)
+    o.params      = normalizeParams(params)
+    o.brain       = o.params.brain
+    o.tag         = o.params.spawnerTag or ((tagPrefix or 'US_') .. math.floor(100000 * Random()))
+    o.params.spawnerTag = o.tag
+    o.spawnPositions = resolveSpawnList(o.params.spawnMarker)
+    if table.getn(o.spawnPositions) == 0 then
+        error('Invalid spawnMarker: '.. tostring(o.params.spawnMarker))
+    end
     o.lastSpawnIndex = 0
     o.stopped     = false
     o.wave        = 0
     o.composition = o.params.composition
     o.baseWanted  = o:BuildWantedForWave(1)
     o.callbacks   = {}
+    return o
+end
+
+ -- ========== Public API ==========
+ function Start(params)
+     assert(params and params.brain and params.spawnMarker, 'brain and spawnMarker are required')
+    local o = BuildSpawner(params, 'US_')
     o:RegisterInitialCallbacks()
     o:DebugEscalation()
+    if (o.params.mode or 1) == 0 then
+        return o:RunMode0()
+    end
     o:Start()
     return o
 end
@@ -699,3 +911,15 @@ end
 function Stop(handle)
      if handle and handle.Stop then handle:Stop() end
  end
+
+function LaunchPlatoon(params)
+    params = params or {}
+    params.mode = 0
+    return Start(params)
+end
+
+return {
+    Start = Start,
+    Stop = Stop,
+    LaunchPlatoon = LaunchPlatoon,
+}
