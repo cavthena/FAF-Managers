@@ -517,10 +517,20 @@ local function AStarRoute(graph, domain, startId, targetId, startPos, targetPos,
     local gScore = { [startId] = 0 }
     local fScore = { [startId] = Heuristic(graph, startId, targetId) }
     local cameFrom = {}
+    local searchBudget = 0
+    local yieldInterval = 96
 
     local sideSign, sideBias = ResolveVariantBias(opts)
 
     while table.getn(open) > 0 do
+        searchBudget = searchBudget + 1
+        if searchBudget >= yieldInterval then
+            searchBudget = 0
+            if WaitTicks and coroutine and coroutine.running and coroutine.running() then
+                WaitTicks(1)
+            end
+        end
+
         local bestIndex = 1
         local current = open[1]
         local currentF = fScore[current] or HugeNumber
