@@ -1701,10 +1701,6 @@ local function AttackTargetArea(platoon, target, opts)
         RouteChains = opts.RouteChains or opts.MarkerChains or opts.ChainNames,
         RouteMode = opts.RouteMode or 'AttackMove',
         RoutePhase = 'TRANSIT',
-        GraphResolution = opts.GraphResolution,
-        GraphInflationHardBlock = opts.GraphInflationHardBlock,
-        GraphInflationSoftPenalty = opts.GraphInflationSoftPenalty,
-        ForceGraphRebuild = opts.ForceGraphRebuild and true or false,
     }
 
     local bombardRange = nil
