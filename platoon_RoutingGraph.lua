@@ -200,15 +200,7 @@ local function ResolveMapKey(area)
     return tostring(mapName)
 end
 
-local function GetPlayableArea(area)
-    if area then
-        return area
-    end
-
-    if ScenarioInfo and ScenarioInfo.PlayableArea then
-        return ScenarioInfo.PlayableArea
-    end
-
+local function GetMapArea()
     local size = ScenarioInfo and (ScenarioInfo.size or ScenarioInfo.MapSize)
     if size then
         return { 0, 0, size[1], size[2] }
@@ -274,18 +266,43 @@ local function IsBlockedTerrainType(x, z)
     return false
 end
 
-local function IsLandNodeUsable(x, z)
+local function CanTraverseFromNode(layer, x, z, sampleDistance)
+    local distance = math.max(1, sampleDistance or 1)
+    local from = { x, SurfaceHeightForLayer(layer, x, z), z }
+    local probes = {
+        { x + distance, z },
+        { x - distance, z },
+        { x, z + distance },
+        { x, z - distance },
+    }
+
+    for _, probe in ipairs(probes) do
+        local tx = probe[1]
+        local tz = probe[2]
+        local to = { tx, SurfaceHeightForLayer(layer, tx, tz), tz }
+        if SegmentPassable(layer, from, to) then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function IsLandNodeUsable(x, z, cfg)
     if IsWaterAt(x, z) then
         return false
     end
     if IsBlockedTerrainType(x, z) then
         return false
     end
-    return true
+    return CanTraverseFromNode(Domains.LAND, x, z, (cfg and cfg.obstacleProbeStep) or 1)
 end
 
-local function IsSeaNodeUsable(x, z)
-    return IsWaterAt(x, z)
+local function IsSeaNodeUsable(x, z, cfg)
+    if not IsWaterAt(x, z) then
+        return false
+    end
+    return CanTraverseFromNode(Domains.SEA, x, z, (cfg and cfg.obstacleProbeStep) or 1)
 end
 
 local function ProbeClearance(node, cfg, isUsable)
@@ -420,13 +437,13 @@ end
 local function BuildMissionGraph(area, opts)
     local cfg = ResolveConfig(opts)
 
-    local playable = GetPlayableArea(area)
-    local nodes, indexByGrid, width, height = BuildNodes(playable, cfg)
+    local mapArea = GetMapArea()
+    local nodes, indexByGrid, width, height = BuildNodes(mapArea, cfg)
     local startedAt = GetGameTimeSeconds and GetGameTimeSeconds() or 0
 
     local graph = {
-        key = ResolveMapKey(playable),
-        area = playable,
+        key = ResolveMapKey(mapArea),
+        area = mapArea,
         config = cfg,
         width = width,
         height = height,
@@ -456,15 +473,23 @@ local function BuildMissionGraph(area, opts)
 
     BuildConnectivity(graph.nodes, graph.indexByGrid, graph.width, graph.height, cfg)
 
+    local function landUsable(x, z)
+        return IsLandNodeUsable(x, z, cfg)
+    end
+
+    local function seaUsable(x, z)
+        return IsSeaNodeUsable(x, z, cfg)
+    end
+
     for _, node in ipairs(graph.nodes) do
         local x = node.position[1]
         local z = node.position[3]
 
-        node.reachability.LAND = IsLandNodeUsable(x, z)
-        node.reachability.SEA = IsSeaNodeUsable(x, z)
+        node.reachability.LAND = landUsable(x, z)
+        node.reachability.SEA = seaUsable(x, z)
         node.reachability.AIR = true
-        node.clearance.LAND = ProbeClearance(node, cfg, IsLandNodeUsable)
-        node.clearance.SEA = ProbeClearance(node, cfg, IsSeaNodeUsable)
+        node.clearance.LAND = ProbeClearance(node, cfg, landUsable)
+        node.clearance.SEA = ProbeClearance(node, cfg, seaUsable)
 
         if node.reachability.LAND then
             if node.clearance.LAND < cfg.inflationHardBlock then
@@ -502,8 +527,8 @@ local function BuildMissionGraph(area, opts)
 end
 
 local function EnsureScenarioGraph(area, opts)
-    local key = ResolveMapKey(GetPlayableArea(area))
-    local requestedConfig = ResolveConfig(opts)
+    local key = ResolveMapKey(GetMapArea())
+    local requestedConfig = opts and ResolveConfig(opts) or (GraphCache and GraphCache.config) or ResolveConfig(nil)
     if not GraphCache
         or GraphCache.key ~= key
         or not ConfigMatches(GraphCache.config, requestedConfig)
@@ -602,11 +627,14 @@ function InitializeMissionGraph(area, opts)
 end
 
 function GetScenarioGraph(area)
-    return EnsureScenarioGraph(area)
+    return GraphCache
 end
 
 function FindGraphRoute(area, layer, startPos, targetPos, opts)
-    local graph = EnsureScenarioGraph(area, opts and opts.GraphConfig)
+    local graph = GraphCache
+    if not graph then
+        return nil
+    end
     graph.metrics.routeQueries = graph.metrics.routeQueries + 1
     local startedAt = GetGameTimeSeconds and GetGameTimeSeconds() or 0
 
@@ -661,18 +689,24 @@ function FindGraphRoute(area, layer, startPos, targetPos, opts)
 end
 
 function ReportPathToFallback()
-    local graph = EnsureScenarioGraph()
+    local graph = GraphCache
+    if not graph then
+        return
+    end
     graph.metrics.fallbackPathTo = graph.metrics.fallbackPathTo + 1
     graph.metrics.pathToCalls = graph.metrics.pathToCalls + 1
 end
 
 function RecordPathToCall()
-    local graph = EnsureScenarioGraph()
+    local graph = GraphCache
+    if not graph then
+        return
+    end
     graph.metrics.pathToCalls = graph.metrics.pathToCalls + 1
 end
 
 function GetMetrics(area)
-    local graph = EnsureScenarioGraph(area)
+    local graph = GraphCache
     return graph and graph.metrics or {}
 end
 
@@ -689,8 +723,8 @@ local function DeepCopyVariantSpecs(specs)
 end
 
 function GetVariantSpecs(area, opts)
-    local cache = EnsureScenarioGraph(area)
-    local specs = DeepCopyVariantSpecs(cache.variantSpecs)
+    local cache = GraphCache
+    local specs = DeepCopyVariantSpecs(cache and cache.variantSpecs or {})
     if opts and opts.FlankPreference == 'left' then
         table.sort(specs, function(a, b)
             return (a.sideSign or 0) < (b.sideSign or 0)

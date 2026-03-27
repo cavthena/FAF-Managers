@@ -108,6 +108,7 @@ local PlatoonTraversalQueueWindow = 3
 local RouteStuckTimeout = 10
 local ActiveRouteBuildContext = false
 local MissionGraphInitialized = false
+local MissionGraphConfig = false
 
 local function RouteBuildClock()
     return GetGameTimeSeconds()
@@ -766,23 +767,31 @@ local function ShouldUseGraphRouting(platoon, opts)
     return true, 'standard'
 end
 
-local function EnsureMissionRoutingGraph(platoon, opts, area)
-    if MissionGraphInitialized and not (opts and opts.ForceGraphRebuild) then
+local function EnsureMissionRoutingGraph(platoon, opts, area, allowInitialize)
+    if MissionGraphInitialized then
         if opts and opts.Debug and LOG then
-            local cfg = ResolveGraphConfig(opts, platoon)
+            local cfg = MissionGraphConfig or ResolveGraphConfig(opts, platoon)
             LOG(('[PlatoonRouting] GraphInit skipped (already initialized) requestedResolution=%s requestedHard=%s requestedSoft=%s forceRebuild=%s'):format(
                 tostring(cfg and cfg.resolution),
                 tostring(cfg and cfg.inflationHardBlock),
                 tostring(cfg and cfg.inflationSoftPenalty),
-                tostring(opts and opts.ForceGraphRebuild and true or false)
+                tostring(false)
             ))
         end
-        return
+        return true
+    end
+
+    if not allowInitialize then
+        if opts and opts.Debug and LOG then
+            LOG('[PlatoonRouting] GraphInit skipped (InitializeRoutingSystem() has not been called)')
+        end
+        return false
     end
 
     local graphConfig = ResolveGraphConfig(opts, platoon)
     RoutingGraph.InitializeMissionGraph(area or GetPlayableArea(), graphConfig)
     MissionGraphInitialized = true
+    MissionGraphConfig = graphConfig
     if opts and opts.Debug and LOG then
         local metrics = RoutingGraph.GetMetrics(area or GetPlayableArea()) or {}
         LOG(('[PlatoonRouting] GraphInit applied resolution=%s hard=%s soft=%s totalNodes=%s validLand=%s validSea=%s validAir=%s buildSeconds=%s componentsLand=%s componentsSea=%s'):format(
@@ -798,6 +807,7 @@ local function EnsureMissionRoutingGraph(platoon, opts, area)
             tostring(metrics and metrics.componentCounts and metrics.componentCounts.SEA or false)
         ))
     end
+    return true
 end
 
 local function PositionInPlayableArea(pos, area)
@@ -2961,7 +2971,11 @@ function BuildPlatoonRoute(platoon, destination, opts)
     end
 
     local useGraphRouting, graphPolicyReason = ShouldUseGraphRouting(platoon, opts)
-    EnsureMissionRoutingGraph(platoon, opts, area)
+    local graphReady = EnsureMissionRoutingGraph(platoon, opts, area, false)
+    if not graphReady then
+        useGraphRouting = false
+        graphPolicyReason = 'graph-not-initialized'
+    end
     if opts and opts.Debug then
         local chainRequest = opts.RouteChain or opts.Chain or opts.ChainName or opts.MarkerChain
         if LOG then
@@ -3708,8 +3722,7 @@ function RecomputePathWithFallback(platoon, layer, destination, opts)
 end
 
 function InitializeRoutingSystem(opts)
-    MissionGraphInitialized = false
-    EnsureMissionRoutingGraph(nil, opts, GetPlayableArea())
+    EnsureMissionRoutingGraph(nil, opts, GetPlayableArea(), true)
     return RoutingGraph.GetMetrics(GetPlayableArea())
 end
 
