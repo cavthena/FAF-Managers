@@ -396,7 +396,7 @@ local function BuildCellState(graph)
 end
 
 local function BuildGraph(area, config)
-    local started = GetSystemTimeSeconds and GetSystemTimeSeconds() or 0
+    local started = GetGameTimeSeconds()
     local width, height = GridDimensions(area, config.resolution)
 
     local graph = {
@@ -419,7 +419,7 @@ local function BuildGraph(area, config)
 
     BuildCellState(graph)
 
-    local finished = GetSystemTimeSeconds and GetSystemTimeSeconds() or started
+    local finished = GetGameTimeSeconds()
     graph.metrics.buildSeconds = math.max(0, finished - started)
     graph.metrics.totalNodes = table.getn(graph.cells)
     graph.metrics.validLand = graph.validCells.Land
