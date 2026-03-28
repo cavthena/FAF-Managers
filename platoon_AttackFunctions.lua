@@ -1657,12 +1657,36 @@ local function AttackTargetArea(platoon, target, opts)
     local routeSource = ReadStoredValue(platoon, 'RouteSource', opts.RouteSource)
     local startSource = ReadStoredValue(platoon, 'StartSource', ReadStoredValue(platoon, 'StartPositionSource', nil))
 
+    local disableIngress = ReadStoredValue(platoon, 'DisableIngress', opts.DisableIngress)
     local startPos = liveStartPos
     if storedStartedOutside then
         if IsValidPositionVector(storedStartPos) then
             startPos = CopyVector(storedStartPos)
         else
             RoutingLog('Warning: StartedOutsidePlayableArea=true but StartPosition missing/malformed; falling back to live position')
+        end
+    end
+
+    if storedStartedOutside and area and not disableIngress and layer ~= 'Air' then
+        local ingressMoved = select(1, MoveToNearestPlayableIngress(platoon, layer, area, opts.Formation, targetPos))
+        if ingressMoved then
+            local elapsed = 0
+            while PlatoonAlive(platoon) and elapsed < PlayableIngressTimeout do
+                local ingressPos = GetPlatoonPosition(platoon)
+                if ingressPos and PositionInPlayableArea(ingressPos, area) then
+                    startPos = ingressPos
+                    break
+                end
+
+                WaitSeconds(1)
+                elapsed = elapsed + 1
+            end
+        else
+            RoutingLog('Warning: ingress move could not be issued; continuing with clamped route start')
+        end
+
+        if area and not PositionInPlayableArea(startPos, area) then
+            startPos = ClampToPlayableArea(startPos, area, PlayableIngressBuffer)
         end
     end
 
@@ -1683,7 +1707,7 @@ local function AttackTargetArea(platoon, target, opts)
         Amphibious = opts.Amphibious,
         RandomizeRoute = opts.RandomizeRoute and true or false,
         RequireFinalStaging = opts.RequireFinalStaging and true or false,
-        DisableIngress = ReadStoredValue(platoon, 'DisableIngress', opts.DisableIngress),
+        DisableIngress = disableIngress,
         Debug = opts.Debug,
         RouteLayer = layer,
         RouteSource = routeSource,
