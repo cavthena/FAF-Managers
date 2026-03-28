@@ -310,7 +310,7 @@ end
 -- -----------------------------------------------------------------------------
 -- Clearance / midpoint scoring
 -- -----------------------------------------------------------------------------
-function Routing.ScoreWaypointClearance(position, movementLayer, options)
+function ScoreWaypointClearance(position, movementLayer, options)
     if not (IsVec(position) and movementLayer) then
         return -999
     end
@@ -388,7 +388,7 @@ local function BuildMidpointCandidates(fromPos, toPos)
     return candidates
 end
 
-function Routing.SelectIntermediateWaypoint(platoon, fromPos, toPos, options)
+function SelectIntermediateWaypoint(platoon, fromPos, toPos, options)
     if not (platoon and IsVec(fromPos) and IsVec(toPos)) then
         return nil
     end
@@ -411,7 +411,7 @@ function Routing.SelectIntermediateWaypoint(platoon, fromPos, toPos, options)
             if segB then
                 local pathCost = Dist(fromPos, candidate) + Dist(candidate, toPos)
                 local progressPenalty = math.max(0, pathCost - baseDist)
-                local clearance = Routing.ScoreWaypointClearance(candidate, layer, {
+                local clearance = ScoreWaypointClearance(candidate, layer, {
                     AvoidDef = opts.AvoidDef,
                     Brain = brain,
                 })
@@ -437,7 +437,7 @@ end
 -- -----------------------------------------------------------------------------
 -- Region relation
 -- -----------------------------------------------------------------------------
-function Routing.GetRegionRelation(platoon, startPos, endPos, movementLayer, options)
+function GetRegionRelation(platoon, startPos, endPos, movementLayer, options)
     Metrics.regionQueries = Metrics.regionQueries + 1
 
     if not (platoon and IsVec(startPos) and IsVec(endPos)) then
@@ -480,7 +480,7 @@ end
 -- -----------------------------------------------------------------------------
 -- Public compatibility helpers
 -- -----------------------------------------------------------------------------
-function Routing.CanPathBetween(layer, a, b)
+function CanPathBetween(layer, a, b)
     if layer == 'Air' then
         return IsVec(a) and IsVec(b)
     end
@@ -495,7 +495,7 @@ function Routing.CanPathBetween(layer, a, b)
     return IsVec(a) and IsVec(b) and DistSq(a, b) <= (160 * 160)
 end
 
-function Routing.CanPathTo(platoon, layer, destination)
+function CanPathTo(platoon, layer, destination)
     if not (platoon and IsVec(destination)) then
         return false
     end
@@ -517,7 +517,7 @@ function Routing.CanPathTo(platoon, layer, destination)
     return TryGenerateEnginePath(platoon, useLayer, start, destination) ~= nil
 end
 
-function Routing.BuildPathSegment(layer, startPos, destination)
+function BuildPathSegment(layer, startPos, destination)
     if not (IsVec(startPos) and IsVec(destination)) then
         return nil
     end
@@ -555,7 +555,7 @@ local function ExtractPath(route)
     return path
 end
 
-function Routing.BuildRoute(platoon, startPos, endPos, options)
+function BuildRoute(platoon, startPos, endPos, options)
     Metrics.routeQueries = Metrics.routeQueries + 1
 
     local opts = options or {}
@@ -579,7 +579,7 @@ function Routing.BuildRoute(platoon, startPos, endPos, options)
     end
     Metrics.routeCacheMisses = Metrics.routeCacheMisses + 1
 
-    local relation = Routing.GetRegionRelation(platoon, start, destination, layer, opts)
+    local relation = GetRegionRelation(platoon, start, destination, layer, opts)
     if relation == 'unreachable' then
         Metrics.unreachableFastFails = Metrics.unreachableFastFails + 1
         RLog('fast-fail unreachable', tostring(layer), tostring(opts.RouteSource or 'unknown'))
@@ -600,7 +600,7 @@ function Routing.BuildRoute(platoon, startPos, endPos, options)
         Metrics.directPathSuccesses = Metrics.directPathSuccesses + 1
     else
         -- 2) Midpoint-assisted route if direct path is not available/reliable.
-        local mid = Routing.SelectIntermediateWaypoint(platoon, start, destination, opts)
+        local mid = SelectIntermediateWaypoint(platoon, start, destination, opts)
         if mid and mid.segA and mid.segB then
             finalPath = {}
             for _, p in ipairs(mid.segA) do
@@ -648,7 +648,7 @@ function Routing.BuildRoute(platoon, startPos, endPos, options)
     return route
 end
 
-function Routing.FindSafePath(platoon, layer, destination, startOverride, options)
+function FindSafePath(platoon, layer, destination, startOverride, options)
     local startPos = startOverride
     if not IsVec(startPos) then
         startPos = platoon and platoon.GetPlatoonPosition and platoon:GetPlatoonPosition() or nil
@@ -658,7 +658,7 @@ function Routing.FindSafePath(platoon, layer, destination, startOverride, option
         return nil
     end
 
-    local route = Routing.BuildRoute(platoon, startPos, destination, {
+    local route = BuildRoute(platoon, startPos, destination, {
         RouteLayer = layer,
         Amphibious = options and options.Amphibious,
         AvoidDef = options and options.AvoidDef,
@@ -676,12 +676,12 @@ function Routing.FindSafePath(platoon, layer, destination, startOverride, option
     return ExtractPath(route)
 end
 
-function Routing.RecomputePathWithFallback(platoon, layer, destination, options)
+function RecomputePathWithFallback(platoon, layer, destination, options)
     Metrics.repaths = Metrics.repaths + 1
     local opts = options or {}
     opts.ForceRepath = true
 
-    local path = Routing.FindSafePath(platoon, layer, destination, nil, opts)
+    local path = FindSafePath(platoon, layer, destination, nil, opts)
     if path then
         return path
     end
@@ -697,7 +697,7 @@ end
 -- -----------------------------------------------------------------------------
 -- Movement / follow
 -- -----------------------------------------------------------------------------
-function Routing.MoveAlongPath(platoon, path, formation, aggressiveFinal, layer, aggressiveRoute)
+function MoveAlongPath(platoon, path, formation, aggressiveFinal, layer, aggressiveRoute)
     if not (platoon and type(path) == 'table' and table.getn(path) > 0) then
         return false
     end
@@ -752,7 +752,7 @@ local function ShouldRepathInternal(progressState)
     return false, nil
 end
 
-function Routing.ShouldRepath(platoon, routeOrState, options)
+function ShouldRepath(platoon, routeOrState, options)
     if options and options.ForceRepath then
         return true, 'forced'
     end
@@ -773,7 +773,7 @@ local function QuantizedCell(pos)
     return QuantizePos(pos, 6)
 end
 
-function Routing.FollowRoute(platoon, route, options)
+function FollowRoute(platoon, route, options)
     local opts = options or {}
     if not (platoon and route and route.waypoints and table.getn(route.waypoints) > 0) then
         return 'repath'
@@ -784,7 +784,7 @@ function Routing.FollowRoute(platoon, route, options)
         return 'repath'
     end
 
-    if not Routing.MoveAlongPath(platoon, path, opts.Formation, false, route.layer, opts.AggressiveMove) then
+    if not MoveAlongPath(platoon, path, opts.Formation, false, route.layer, opts.AggressiveMove) then
         return 'repath'
     end
 
@@ -832,7 +832,7 @@ function Routing.FollowRoute(platoon, route, options)
             state.progress.oscillationHits = repeats
         end
 
-        local repathNeeded, reason = Routing.ShouldRepath(platoon, state, opts)
+        local repathNeeded, reason = ShouldRepath(platoon, state, opts)
         if repathNeeded then
             Metrics.stuckDetections = Metrics.stuckDetections + 1
 
@@ -843,7 +843,7 @@ function Routing.FollowRoute(platoon, route, options)
 
             local current = platoon:GetPlatoonPosition()
             local destination = route.destination or goal
-            local repath = Routing.RecomputePathWithFallback(platoon, route.layer, destination, opts)
+            local repath = RecomputePathWithFallback(platoon, route.layer, destination, opts)
             if not repath then
                 return 'repath'
             end
@@ -851,7 +851,7 @@ function Routing.FollowRoute(platoon, route, options)
             state.repaths = state.repaths + 1
             route.repathCount = (route.repathCount or 0) + 1
 
-            if not Routing.MoveAlongPath(platoon, repath, opts.Formation, false, route.layer, opts.AggressiveMove) then
+            if not MoveAlongPath(platoon, repath, opts.Formation, false, route.layer, opts.AggressiveMove) then
                 return 'repath'
             end
 
@@ -868,7 +868,7 @@ function Routing.FollowRoute(platoon, route, options)
     return 'repath'
 end
 
-function Routing.MoveToNearestPlayableIngress(platoon, layer, area, formation, destination)
+function MoveToNearestPlayableIngress(platoon, layer, area, formation, destination)
     if not platoon then
         return false, nil, nil
     end
@@ -883,27 +883,106 @@ function Routing.MoveToNearestPlayableIngress(platoon, layer, area, formation, d
         return false, nil, nil
     end
 
-    -- Clamp position into playable bounds, then bias toward requested destination
-    -- so ingress does not shove platoons to a far corner when they spawn outside.
-    local ingress = {
-        math.max(playArea[1], math.min(playArea[3], pos[1])),
-        pos[2],
-        math.max(playArea[2], math.min(playArea[4], pos[3])),
-    }
+    local safeBuffer = 4
+    local dest = IsVec(destination) and ClampToPlayable(destination, 0) or nil
+    local ingressCandidates = {}
 
-    if IsVec(destination) then
-        local clampedDest = ClampToPlayable(destination, 0)
-        ingress[1] = (ingress[1] * 0.7) + (clampedDest[1] * 0.3)
-        ingress[3] = (ingress[3] * 0.7) + (clampedDest[3] * 0.3)
+    local function AddCandidate(candidate)
+        if not IsVec(candidate) then
+            return
+        end
+
+        candidate = ClampToPlayable(candidate, safeBuffer)
+        for _, existing in ipairs(ingressCandidates) do
+            if DistSq(existing, candidate) <= 4 then
+                return
+            end
+        end
+
+        table.insert(ingressCandidates, candidate)
     end
 
-    ingress = ClampToPlayable(ingress, 1)
-    local path = { ingress }
-    local moved = Routing.MoveAlongPath(platoon, path, formation, false, layer, false)
-    return moved and true or false, ingress, moved and path or nil
+    local minX, minZ, maxX, maxZ = playArea[1], playArea[2], playArea[3], playArea[4]
+    local edgePoint = {
+        math.max(minX, math.min(maxX, pos[1])),
+        pos[2],
+        math.max(minZ, math.min(maxZ, pos[3])),
+    }
+    AddCandidate(edgePoint)
+
+    local leftDist = math.abs(pos[1] - minX)
+    local rightDist = math.abs(pos[1] - maxX)
+    local bottomDist = math.abs(pos[3] - minZ)
+    local topDist = math.abs(pos[3] - maxZ)
+
+    local edge = 'left'
+    local bestEdgeDist = leftDist
+    if rightDist < bestEdgeDist then edge = 'right'; bestEdgeDist = rightDist end
+    if bottomDist < bestEdgeDist then edge = 'bottom'; bestEdgeDist = bottomDist end
+    if topDist < bestEdgeDist then edge = 'top'; bestEdgeDist = topDist end
+
+    local ratios = { 0.2, 0.5, 0.8 }
+    if edge == 'left' or edge == 'right' then
+        local x = edge == 'left' and (minX + safeBuffer) or (maxX - safeBuffer)
+        AddCandidate({ x, pos[2], math.max(minZ, math.min(maxZ, pos[3])) })
+        for _, r in ipairs(ratios) do
+            AddCandidate({ x, pos[2], minZ + ((maxZ - minZ) * r) })
+        end
+        if dest then
+            AddCandidate({ x, pos[2], dest[3] })
+        end
+    else
+        local z = edge == 'bottom' and (minZ + safeBuffer) or (maxZ - safeBuffer)
+        AddCandidate({ math.max(minX, math.min(maxX, pos[1])), pos[2], z })
+        for _, r in ipairs(ratios) do
+            AddCandidate({ minX + ((maxX - minX) * r), pos[2], z })
+        end
+        if dest then
+            AddCandidate({ dest[1], pos[2], z })
+        end
+    end
+
+    if dest then
+        AddCandidate(dest)
+    end
+
+    local bestPath = nil
+    local bestIngress = nil
+    local bestScore = (math.huge or 1e9)
+    local routeLayer = GetLayer(platoon, layer)
+    for _, candidate in ipairs(ingressCandidates) do
+        local candidatePath = nil
+        if routeLayer == 'Air' then
+            candidatePath = { CopyVector(candidate) }
+        else
+            candidatePath = BuildPathSegmentForPlatoon(platoon, routeLayer, pos, candidate)
+            if candidatePath and table.getn(candidatePath) > 1 and DistSq(candidatePath[1], pos) <= 4 then
+                table.remove(candidatePath, 1)
+            end
+        end
+
+        if candidatePath and table.getn(candidatePath) > 0 then
+            local score = DistSq(pos, candidate)
+            if dest then
+                score = score + (DistSq(candidate, dest) * 0.35)
+            end
+            if score < bestScore then
+                bestScore = score
+                bestIngress = candidate
+                bestPath = candidatePath
+            end
+        end
+    end
+
+    if not (bestIngress and bestPath and table.getn(bestPath) > 0) then
+        return false, nil, nil
+    end
+
+    local moved = MoveAlongPath(platoon, bestPath, formation, false, routeLayer, false)
+    return moved and true or false, bestIngress, moved and bestPath or nil
 end
 
-function Routing.GetRoutingMetrics()
+function GetRoutingMetrics()
     return {
         routeQueries = Metrics.routeQueries,
         routeCacheHits = Metrics.routeCacheHits,
