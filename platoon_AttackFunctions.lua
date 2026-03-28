@@ -1276,7 +1276,12 @@ local function LeastDefendedStructures(brain, layer, structures)
     return selected
 end
 
-local CanPathTo
+local function CanPathTo(platoon, layer, destination)
+    if not (Routing and Routing.CanPathTo) then
+        return false
+    end
+    return Routing.CanPathTo(platoon, layer, destination)
+end
 local DebugAttackRoute
 
 local function ChooseBestArea(brain, platoon, opts, layer, areaRadius, mode, category)
@@ -1474,13 +1479,6 @@ local function AmphibiousSurfaceHeight(layer, x, z)
         return GetSurfaceHeight(x, z)
     end
     return GetTerrainHeight(x, z)
-end
-
-CanPathTo = function(platoon, layer, destination)
-    if not (Routing and Routing.CanPathTo) then
-        return false
-    end
-    return Routing.CanPathTo(platoon, layer, destination)
 end
 
 local function CanPathBetween(layer, a, b)
