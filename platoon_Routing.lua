@@ -43,12 +43,28 @@ local function BoolOrFalse(value)
     return value and true or false
 end
 
+local function ResolveDebugTag(attackData, routingData)
+    local tag = attackData.SpawnerTag
+        or attackData.BuilderTag
+        or routingData.SpawnerTag
+        or routingData.BuilderTag
+        or routingData.PlatoonTag
+
+    if tag == nil or tag == '' then
+        return 'unknown-tag'
+    end
+
+    return tostring(tag)
+end
+
 function ReceiveAttackData(attackData)
     attackData = attackData or {}
 
     local routingData = {
         Platoon = attackData.Platoon,
         PlatoonTag = attackData.PlatoonTag or attackData.Tag,
+        SpawnerTag = attackData.SpawnerTag,
+        BuilderTag = attackData.BuilderTag,
         AttackType = attackData.AttackType or attackData.Type,
         StartPosition = CopyVector(attackData.StartPosition),
         CurrentPosition = CopyVector(attackData.CurrentPosition),
@@ -62,16 +78,20 @@ function ReceiveAttackData(attackData)
     }
 
     if attackData.Debug then
+        local debugTag = ResolveDebugTag(attackData, routingData)
+        local prefix = ('[%s] '):format(debugTag)
         response.Debug = {
-            'Routing section 1 handoff received from AttackFunctions:',
-            ('  Platoon = %s'):format(tostring(routingData.Platoon)),
-            ('  PlatoonTag = %s'):format(tostring(routingData.PlatoonTag)),
-            ('  AttackType = %s'):format(tostring(routingData.AttackType)),
-            ('  StartPosition = %s'):format(FormatPosition(routingData.StartPosition)),
-            ('  CurrentPosition = %s'):format(FormatPosition(routingData.CurrentPosition)),
-            ('  TargetPosition = %s'):format(FormatPosition(routingData.TargetPosition)),
-            ('  InsidePlayableArea = %s'):format(tostring(routingData.InsidePlayableArea)),
-            ('  AggressiveMove = %s'):format(tostring(routingData.AggressiveMove)),
+            ('%sRouting section 1 handoff received from AttackFunctions:'):format(prefix),
+            ('%s  Platoon = %s'):format(prefix, tostring(routingData.Platoon)),
+            ('%s  PlatoonTag = %s'):format(prefix, tostring(routingData.PlatoonTag)),
+            ('%s  SpawnerTag = %s'):format(prefix, tostring(routingData.SpawnerTag)),
+            ('%s  BuilderTag = %s'):format(prefix, tostring(routingData.BuilderTag)),
+            ('%s  AttackType = %s'):format(prefix, tostring(routingData.AttackType)),
+            ('%s  StartPosition = %s'):format(prefix, FormatPosition(routingData.StartPosition)),
+            ('%s  CurrentPosition = %s'):format(prefix, FormatPosition(routingData.CurrentPosition)),
+            ('%s  TargetPosition = %s'):format(prefix, FormatPosition(routingData.TargetPosition)),
+            ('%s  InsidePlayableArea = %s'):format(prefix, tostring(routingData.InsidePlayableArea)),
+            ('%s  AggressiveMove = %s'):format(prefix, tostring(routingData.AggressiveMove)),
         }
     end
 
