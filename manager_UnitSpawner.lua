@@ -372,6 +372,8 @@ local function MetadataDebugLog(params, message)
     end
 end
 
+local ResolveAttackFunctionName
+
 local function ApplyPlatoonMetadata(platoon, params, context)
     if not platoon then
         return nil
@@ -428,7 +430,7 @@ local function ApplyPlatoonMetadata(platoon, params, context)
         platoonData.AttackData = attackData
     end
     if platoonData.AttackFunction == nil and params and params.attackFn ~= nil then
-        platoonData.AttackFunction = tostring(params.attackFn)
+        platoonData.AttackFunction = ResolveAttackFunctionName(params.attackFn) or tostring(params.attackFn)
     end
 
     MetadataDebugLog(params, ('ApplyPlatoonMetadata routeSource=%s startSource=%s startPosition=%s startedOutsidePlayableArea=%s disableIngress=%s'):format(
@@ -448,6 +450,22 @@ local function ResolveAttackFunction(attackFn)
         return _G and rawget(_G, attackFn)
     end
     return attackFn
+end
+
+ResolveAttackFunctionName = function(attackFn)
+    if type(attackFn) == 'string' and attackFn ~= '' then
+        return attackFn
+    end
+
+    if type(attackFn) == 'function' and _G then
+        for key, value in pairs(_G) do
+            if value == attackFn then
+                return tostring(key)
+            end
+        end
+    end
+
+    return nil
 end
 
 local function LaunchAttackThread(platoon, attackFn, attackData, warnFn)
@@ -713,11 +731,15 @@ end
 
      while not self.stopped do
         if not platoon or not self.brain:PlatoonExists(platoon) then
-            local alive = countComplete((platoon and platoon.GetPlatoonUnits and platoon:GetPlatoonUnits()) or {})
-            alive = countComplete(platoon:GetPlatoonUnits() or {})
             return
         end
-         local alive = countComplete(platoon:GetPlatoonUnits() or {})
+
+        local alive = 0
+        for _, unit in ipairs(spawnedUnits or {}) do
+            if unit and not unit.Dead then
+                alive = alive + 1
+            end
+        end
          local lost = math.max(0, wantTotal - alive)
          local frac = (wantTotal > 0) and (lost / wantTotal) or 1
         if frac >= thr then

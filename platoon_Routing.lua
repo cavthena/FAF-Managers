@@ -43,6 +43,53 @@ local function BoolOrFalse(value)
     return value and true or false
 end
 
+local function GetPlayableArea()
+    if ScenarioInfo and ScenarioInfo.PlayableArea then
+        return ScenarioInfo.PlayableArea
+    end
+
+    local size = ScenarioInfo and (ScenarioInfo.size or ScenarioInfo.MapSize)
+    if size then
+        return { 0, 0, size[1], size[2] }
+    end
+
+    return nil
+end
+
+local function PositionInPlayableArea(position, area)
+    if not (position and area) then
+        return nil
+    end
+
+    return position[1] >= area[1]
+        and position[1] <= area[3]
+        and position[3] >= area[2]
+        and position[3] <= area[4]
+end
+
+local function ResolveInsidePlayableArea(attackData, currentPosition, startPosition)
+    if attackData.InsidePlayableArea ~= nil then
+        return attackData.InsidePlayableArea and true or false
+    end
+
+    if attackData.StartedOutsidePlayableArea ~= nil then
+        return not (attackData.StartedOutsidePlayableArea and true or false)
+    end
+
+    local area = GetPlayableArea()
+    local currentInside = PositionInPlayableArea(currentPosition, area)
+    if currentInside ~= nil then
+        return currentInside and true or false
+    end
+
+    local startInside = PositionInPlayableArea(startPosition, area)
+    if startInside ~= nil then
+        return startInside and true or false
+    end
+
+    return true
+end
+
 local function ResolveDebugTag(attackData, routingData)
     local tag = attackData.SpawnerTag
         or attackData.BuilderTag
@@ -59,6 +106,9 @@ end
 
 function ReceiveAttackData(attackData)
     attackData = attackData or {}
+    local startPosition = CopyVector(attackData.StartPosition)
+    local currentPosition = CopyVector(attackData.CurrentPosition)
+    local targetPosition = CopyVector(attackData.TargetPosition)
 
     local routingData = {
         Platoon = attackData.Platoon,
@@ -68,10 +118,10 @@ function ReceiveAttackData(attackData)
         AttackType = attackData.AttackType or attackData.Type,
         AttackFunction = attackData.AttackFunction or attackData.attackFn,
         StartSource = attackData.StartSource or attackData.StartPositionSource,
-        StartPosition = CopyVector(attackData.StartPosition),
-        CurrentPosition = CopyVector(attackData.CurrentPosition),
-        TargetPosition = CopyVector(attackData.TargetPosition),
-        InsidePlayableArea = BoolOrFalse(attackData.InsidePlayableArea),
+        StartPosition = startPosition,
+        CurrentPosition = currentPosition,
+        TargetPosition = targetPosition,
+        InsidePlayableArea = ResolveInsidePlayableArea(attackData, currentPosition, startPosition),
         AggressiveMove = BoolOrFalse(attackData.AggresiveMove or attackData.AggressiveMove),
     }
 

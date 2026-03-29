@@ -50,6 +50,14 @@ local function EmitRoutingDebug(platoon, opts, targetPosition)
     opts._routingDebugEmitted = true
 
     local payload = CopyData(opts)
+    if type(payload.AttackFunction) == 'function' then
+        for key, value in pairs(_G or {}) do
+            if value == payload.AttackFunction then
+                payload.AttackFunction = tostring(key)
+                break
+            end
+        end
+    end
     payload.Platoon = platoon
     payload.CurrentPosition = payload.CurrentPosition or (platoon and platoon.GetPlatoonPosition and platoon:GetPlatoonPosition())
     payload.TargetPosition = payload.TargetPosition or targetPosition
@@ -193,6 +201,9 @@ local function AttackTargetLoop(platoon, opts, selector)
         if target and not target.Dead then
             local pos = target:GetPosition()
             if pos then
+                opts.CurrentPosition = platoon:GetPlatoonPosition()
+                opts.TargetPosition = { pos[1], pos[2], pos[3] }
+                EmitRoutingDebug(platoon, opts, pos)
                 IssuePlatoonMove(platoon, pos, formation, opts.AggressiveMove)
                 SafeWait(0.8)
                 IssueAttackUnit(platoon, target)
@@ -321,7 +332,6 @@ function WaveAttack(platoon, data)
     local brain = platoon and platoon:GetBrain()
     if not brain then return end
     local opts = MergeAttackData(platoon, data)
-    EmitRoutingDebug(platoon, opts)
     AttackTargetLoop(platoon, opts, function()
         return FindWaveTarget(brain, platoon, opts)
     end)
@@ -331,7 +341,6 @@ function RaidAttack(platoon, data)
     local brain = platoon and platoon:GetBrain()
     if not brain then return end
     local opts = MergeAttackData(platoon, data)
-    EmitRoutingDebug(platoon, opts)
     AttackTargetLoop(platoon, opts, function()
         return FindRaidTarget(brain, platoon, opts)
     end)
@@ -341,7 +350,6 @@ function HuntAttack(platoon, data)
     local brain = platoon and platoon:GetBrain()
     if not brain then return end
     local opts = MergeAttackData(platoon, data)
-    EmitRoutingDebug(platoon, opts)
 
     local idlePos = ResolveMarkerPosition(opts.Marker or opts.IdleMarker)
     AttackTargetLoop(platoon, opts, function()
@@ -355,11 +363,13 @@ end
 
 function ScoutAttack(platoon, data)
     local opts = MergeAttackData(platoon, data)
-    EmitRoutingDebug(platoon, opts)
     local formation = opts.Formation or 'NoFormation'
 
     while PlatoonAlive(platoon) do
         local destination = RandomPointInPlayableArea()
+        opts.CurrentPosition = platoon:GetPlatoonPosition()
+        opts.TargetPosition = { destination[1], destination[2], destination[3] }
+        EmitRoutingDebug(platoon, opts, destination)
         IssuePlatoonMove(platoon, destination, formation, false)
         SafeWait(6)
     end
@@ -367,7 +377,6 @@ end
 
 function AreaPatrol(platoon, data)
     local opts = MergeAttackData(platoon, data)
-    EmitRoutingDebug(platoon, opts)
     local formation = opts.Formation or DEFAULT_FORMATION
     local chain = opts.Chain or opts.ChainName
     if not chain then return end
@@ -378,6 +387,9 @@ function AreaPatrol(platoon, data)
 
     IssueClearCommands(units)
     for _, p in ipairs(markers) do
+        opts.CurrentPosition = platoon:GetPlatoonPosition()
+        opts.TargetPosition = { p[1], p[2], p[3] }
+        EmitRoutingDebug(platoon, opts, p)
         if formation ~= 'NoFormation' then
             IssueFormAggressiveMove(units, p, formation, 0)
         else
@@ -394,7 +406,6 @@ function DefensePatrol(platoon, data)
     local brain = platoon and platoon:GetBrain()
     if not brain then return end
     local opts = MergeAttackData(platoon, data)
-    EmitRoutingDebug(platoon, opts)
 
     local basePos = ResolveMarkerPosition(opts.BaseMarker or opts.BasePosition) or platoon:GetPlatoonPosition()
     if not basePos then return end
@@ -408,6 +419,9 @@ function DefensePatrol(platoon, data)
         if target then
             local pos = target:GetPosition()
             if pos then
+                opts.CurrentPosition = platoon:GetPlatoonPosition()
+                opts.TargetPosition = { pos[1], pos[2], pos[3] }
+                EmitRoutingDebug(platoon, opts, pos)
                 IssuePlatoonMove(platoon, pos, formation, true)
                 SafeWait(1)
                 IssueAttackUnit(platoon, target)
