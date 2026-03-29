@@ -59,7 +59,12 @@ function OnStart(scenario)
 
     ScenarioFramework.CreateTimerTrigger(function()
         CybranSpawn_NW()
+        CybranBuild_Main()
     end, 10)
+
+    ScenarioFramework.CreateTimerTrigger(function()
+        CybranBuild_Main()
+    end, 15)
 end
 
 function CybranBase_AI()
@@ -86,7 +91,7 @@ end
 function CybranSpawn_NW()
     ScenarioInfo.CybranNWAttack = SpawnMgr.Start{
         brain = ArmyBrains[ScenarioInfo.Cybran],
-        spawnMarker = 'Spawn_TopWest',
+        spawnMarker = 'CybranBase_Rally1',
         composition = {
             {'url0106', 3},
         },
@@ -103,4 +108,32 @@ function CybranSpawn_NW()
         spawnSpread = 2,
         debug = true,
     }
+end
+
+function CybranBuild_Main()
+    ScenarioInfo.CybranBuildAtk = BuildMgr.Start({
+        brain = ArmyBrains[ScenarioInfo.Cybran],
+        baseMarker = 'CybranBase',
+        domain = 'LAND',
+        composition = {
+            {'url0107', 4},
+        },
+        baseHandle = ScenarioInfo.CBEngi,
+        wantFactories = 2,
+        priority = 100,
+        radius = 26,
+        rallyMarker = 'CybranBase_Rally2',
+        waveCooldown = 5,
+        attackFn = plaAtk.WaveAttack,
+        attackData = {
+            Formation = 'AttackFormation',
+            Type = 'closest',
+            AggresiveMove = true,
+            Debug = true,
+        },
+        builderTag = 'CybranBuildAtk',
+        mode = 2,
+        mode2LossThreshold = 1,
+        debug = true,
+    })
 end

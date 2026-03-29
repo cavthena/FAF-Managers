@@ -417,7 +417,7 @@ local function ResolveBuilderStartPositionContext(builder, platoon, platoonData)
     if not position and params and params.rallyMarker ~= nil then
         position = markerPos(params.rallyMarker)
         if position then
-            source = 'rallyMarker'
+            source = tostring(params.rallyMarker)
         end
     end
 
@@ -517,6 +517,9 @@ local function ApplyBuilderPlatoonMetadata(builder, platoon, label)
     end
     if mergedAttackData and platoonData.AttackData == nil then
         platoonData.AttackData = mergedAttackData
+    end
+    if platoonData.AttackFunction == nil and params.attackFn ~= nil then
+        platoonData.AttackFunction = tostring(params.attackFn)
     end
 
     platoon.PlatoonData = platoonData
