@@ -499,6 +499,11 @@ Spawner.__index = Spawner
 
 function Spawner:Log(msg) LOG(('[US:%s] %s'):format(self.tag, msg)) end
  function Spawner:Warn(msg) WARN(('[US:%s] %s'):format(self.tag, msg)) end
+function Spawner:Debug(msg)
+    if self.params and self.params.debug then
+        LOG(('[US:%s][DEBUG] %s'):format(self.tag, msg))
+    end
+end
 
  function Spawner:GetEntryCount(entry)
      return ResolveEntryCount(entry, self.params.difficulty)

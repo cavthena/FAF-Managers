@@ -1,4 +1,5 @@
 local ScenarioUtils = import('/lua/sim/ScenarioUtilities.lua')
+local Routing = import('/maps/Platoon_testing.v0001/platoon_Routing.lua')
 
 local DEFAULT_FORMATION = 'GrowthFormation'
 local RAID_RADIUS = 220
@@ -37,6 +38,28 @@ local function MergeAttackData(platoon, callData)
         merged[k] = v
     end
     return merged
+end
+
+local function EmitRoutingDebug(platoon, opts, targetPosition)
+    if not (opts and opts.Debug and Routing and Routing.ReceiveAttackData) then
+        return
+    end
+    if opts._routingDebugEmitted then
+        return
+    end
+    opts._routingDebugEmitted = true
+
+    local payload = CopyData(opts)
+    payload.Platoon = platoon
+    payload.CurrentPosition = payload.CurrentPosition or (platoon and platoon.GetPlatoonPosition and platoon:GetPlatoonPosition())
+    payload.TargetPosition = payload.TargetPosition or targetPosition
+
+    local response = Routing.ReceiveAttackData(payload)
+    if type(response) == 'table' and type(response.Debug) == 'table' then
+        for _, line in ipairs(response.Debug) do
+            LOG(tostring(line))
+        end
+    end
 end
 
 local function GetPlayableArea()
@@ -298,6 +321,7 @@ function WaveAttack(platoon, data)
     local brain = platoon and platoon:GetBrain()
     if not brain then return end
     local opts = MergeAttackData(platoon, data)
+    EmitRoutingDebug(platoon, opts)
     AttackTargetLoop(platoon, opts, function()
         return FindWaveTarget(brain, platoon, opts)
     end)
@@ -307,6 +331,7 @@ function RaidAttack(platoon, data)
     local brain = platoon and platoon:GetBrain()
     if not brain then return end
     local opts = MergeAttackData(platoon, data)
+    EmitRoutingDebug(platoon, opts)
     AttackTargetLoop(platoon, opts, function()
         return FindRaidTarget(brain, platoon, opts)
     end)
@@ -316,6 +341,7 @@ function HuntAttack(platoon, data)
     local brain = platoon and platoon:GetBrain()
     if not brain then return end
     local opts = MergeAttackData(platoon, data)
+    EmitRoutingDebug(platoon, opts)
 
     local idlePos = ResolveMarkerPosition(opts.Marker or opts.IdleMarker)
     AttackTargetLoop(platoon, opts, function()
@@ -329,6 +355,7 @@ end
 
 function ScoutAttack(platoon, data)
     local opts = MergeAttackData(platoon, data)
+    EmitRoutingDebug(platoon, opts)
     local formation = opts.Formation or 'NoFormation'
 
     while PlatoonAlive(platoon) do
@@ -340,6 +367,7 @@ end
 
 function AreaPatrol(platoon, data)
     local opts = MergeAttackData(platoon, data)
+    EmitRoutingDebug(platoon, opts)
     local formation = opts.Formation or DEFAULT_FORMATION
     local chain = opts.Chain or opts.ChainName
     if not chain then return end
@@ -366,6 +394,7 @@ function DefensePatrol(platoon, data)
     local brain = platoon and platoon:GetBrain()
     if not brain then return end
     local opts = MergeAttackData(platoon, data)
+    EmitRoutingDebug(platoon, opts)
 
     local basePos = ResolveMarkerPosition(opts.BaseMarker or opts.BasePosition) or platoon:GetPlatoonPosition()
     if not basePos then return end
