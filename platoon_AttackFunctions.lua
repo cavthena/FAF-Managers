@@ -1631,6 +1631,33 @@ local function RebuildAttackRoute(platoon, startPos, targetPos, routeOpts)
     return Routing.BuildRoute(platoon, startPos, targetPos, routeOpts)
 end
 
+local function SendRoutingHandoffSection1(platoon, opts, startPos, currentPos, targetPos, insidePlayableArea)
+    local handoffFn = _G and _G.ReceiveAttackData or nil
+    if type(handoffFn) ~= 'function' then
+        return nil
+    end
+
+    local handoff = handoffFn({
+        Platoon = platoon,
+        PlatoonTag = opts and (opts.RouteCacheTag or opts.Tag) or nil,
+        AttackType = opts and (opts.AttackType or opts.Type or opts.RouteMode) or nil,
+        StartPosition = startPos,
+        CurrentPosition = currentPos,
+        TargetPosition = targetPos,
+        InsidePlayableArea = insidePlayableArea and true or false,
+        AggresiveMove = opts and opts.AggressiveMove or false,
+        Debug = opts and opts.Debug or false,
+    })
+
+    if opts and opts.Debug and handoff and handoff.Debug then
+        for _, message in ipairs(handoff.Debug) do
+            DebugAttackRoute(opts, tostring(message))
+        end
+    end
+
+    return handoff
+end
+
 local function AttackTargetArea(platoon, target, opts)
     local brain = platoon:GetBrain()
     if not brain or not target or not target.position then
@@ -1724,6 +1751,12 @@ local function AttackTargetArea(platoon, target, opts)
         RouteMode = opts.RouteMode or 'AttackMove',
         RoutePhase = 'TRANSIT',
     }
+
+    local insidePlayableArea = true
+    if area and liveStartPos then
+        insidePlayableArea = PositionInPlayableArea(liveStartPos, area) and true or false
+    end
+    SendRoutingHandoffSection1(platoon, routeOpts, startPos, liveStartPos, targetPos, insidePlayableArea)
 
     local bombardRange = nil
     if opts.Bombard then
