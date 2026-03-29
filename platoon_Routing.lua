@@ -43,6 +43,14 @@ local function BoolOrFalse(value)
     return value and true or false
 end
 
+local function BuildDebugBlock(debugLines)
+    if type(debugLines) ~= 'table' or table.getn(debugLines) == 0 then
+        return nil
+    end
+
+    return table.concat(debugLines, '\n')
+end
+
 local function GetPlayableArea()
     if ScenarioInfo and ScenarioInfo.PlayableArea then
         return ScenarioInfo.PlayableArea
@@ -151,7 +159,8 @@ function ReceiveAttackData(attackData)
             ('%s  InsidePlayableArea = %s'):format(prefix, tostring(routingData.InsidePlayableArea)),
             ('%s  AggressiveMove = %s'):format(prefix, tostring(routingData.AggressiveMove)),
         }
+        response.DebugBlock = BuildDebugBlock(response.Debug)
     end
 
-    return response
+    return response, response.DebugBlock, response.Debug, response.Data
 end

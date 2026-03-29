@@ -59,7 +59,6 @@ function OnStart(scenario)
 
     ScenarioFramework.CreateTimerTrigger(function()
         CybranSpawn_NW()
-        CybranBuild_Main()
     end, 10)
 
     ScenarioFramework.CreateTimerTrigger(function()

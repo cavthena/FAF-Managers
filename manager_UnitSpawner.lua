@@ -730,10 +730,6 @@ end
      end
 
      while not self.stopped do
-        if not platoon or not self.brain:PlatoonExists(platoon) then
-            return
-        end
-
         local alive = 0
         for _, unit in ipairs(spawnedUnits or {}) do
             if unit and not unit.Dead then
@@ -744,6 +740,9 @@ end
          local frac = (wantTotal > 0) and (lost / wantTotal) or 1
         if frac >= thr then
             self:InvokeBooleanCallbacks('OnMode2ThresholdMet', true, platoon, alive, wantTotal, thr)
+            return
+        end
+        if alive <= 0 then
             return
         end
          WaitSeconds(2)
