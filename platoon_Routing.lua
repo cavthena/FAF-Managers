@@ -75,6 +75,37 @@ local function PositionInPlayableArea(position, area)
         and position[3] <= area[4]
 end
 
+local function ClampToPlayableArea(position, area)
+    if not (position and area) then
+        return nil
+    end
+
+    local x = position[1]
+    local z = position[3]
+    if type(x) ~= 'number' or type(z) ~= 'number' then
+        return nil
+    end
+
+    if x < area[1] then
+        x = area[1]
+    elseif x > area[3] then
+        x = area[3]
+    end
+
+    if z < area[2] then
+        z = area[2]
+    elseif z > area[4] then
+        z = area[4]
+    end
+
+    local y = position[2]
+    if type(y) ~= 'number' then
+        y = 0
+    end
+
+    return { x, y, z }
+end
+
 local function ResolveInsidePlayableArea(attackData, currentPosition, startPosition)
     if attackData.InsidePlayableArea ~= nil then
         return attackData.InsidePlayableArea and true or false
@@ -112,6 +143,68 @@ local function ResolveDebugTag(attackData, routingData)
     return tostring(tag)
 end
 
+--[[
+================================================================================
+Section 2
+    Ingress routing. If a platoon starts outside the playable area, route first
+    to the nearest point inside the playable area, then continue toward target.
+================================================================================
+]]
+function BuildIngressRoute(routingData)
+    routingData = routingData or {}
+
+    local startPosition = CopyVector(routingData.StartPosition)
+        or CopyVector(routingData.CurrentPosition)
+    local currentPosition = CopyVector(routingData.CurrentPosition)
+        or CopyVector(routingData.StartPosition)
+    local targetPosition = CopyVector(routingData.TargetPosition)
+
+    local area = GetPlayableArea()
+    local insidePlayableArea = ResolveInsidePlayableArea(routingData, currentPosition, startPosition)
+    local ingressPosition = nil
+
+    if area and not insidePlayableArea then
+        ingressPosition = ClampToPlayableArea(startPosition or currentPosition, area)
+    end
+
+    local route = {}
+    if ingressPosition then
+        table.insert(route, ingressPosition)
+    end
+    if targetPosition then
+        table.insert(route, targetPosition)
+    end
+
+    local result = {
+        StartPosition = startPosition,
+        CurrentPosition = currentPosition,
+        TargetPosition = targetPosition,
+        PlayableArea = area,
+        StartedOutsidePlayableArea = not insidePlayableArea,
+        IngressPosition = ingressPosition,
+        Route = route,
+    }
+
+    if routingData.Debug then
+        local debugTag = ResolveDebugTag(routingData, routingData)
+        local prefix = ('[%s] '):format(debugTag)
+
+        result.Debug = {
+            ('%sRouting section 2 ingress route:'):format(prefix),
+            ('%s  StartPosition = %s'):format(prefix, FormatPosition(startPosition)),
+            ('%s  CurrentPosition = %s'):format(prefix, FormatPosition(currentPosition)),
+            ('%s  TargetPosition = %s'):format(prefix, FormatPosition(targetPosition)),
+            ('%s  StartedOutsidePlayableArea = %s'):format(prefix, tostring(result.StartedOutsidePlayableArea)),
+            ('%s  IngressPosition = %s'):format(prefix, FormatPosition(ingressPosition)),
+            ('%s  RouteWaypoints = %d'):format(prefix, table.getn(route)),
+        }
+
+        result.DebugBlock = BuildDebugBlock(result.Debug)
+    end
+
+    return result, result.DebugBlock, result.Debug
+end
+
 function ReceiveAttackData(attackData)
     attackData = attackData or {}
     local startPosition = CopyVector(attackData.StartPosition)
@@ -133,9 +226,12 @@ function ReceiveAttackData(attackData)
         AggressiveMove = BoolOrFalse(attackData.AggresiveMove or attackData.AggressiveMove),
     }
 
-    local response = {
-        Data = routingData,
-    }
+    local ingress = BuildIngressRoute(routingData)
+    routingData.IngressPosition = ingress.IngressPosition
+    routingData.Route = ingress.Route
+    routingData.StartedOutsidePlayableArea = ingress.StartedOutsidePlayableArea
+
+    local response = { Data = routingData }
 
     if attackData.Debug then
         local debugTag = ResolveDebugTag(attackData, routingData)
@@ -157,8 +253,14 @@ function ReceiveAttackData(attackData)
             ('%s  TargetPosition = %s'):format(prefix, FormatPosition(routingData.TargetPosition)),
             ('%s  --- Flags ---'):format(prefix),
             ('%s  InsidePlayableArea = %s'):format(prefix, tostring(routingData.InsidePlayableArea)),
+            ('%s  StartedOutsidePlayableArea = %s'):format(prefix, tostring(routingData.StartedOutsidePlayableArea)),
             ('%s  AggressiveMove = %s'):format(prefix, tostring(routingData.AggressiveMove)),
+            ('%s  IngressPosition = %s'):format(prefix, FormatPosition(routingData.IngressPosition)),
+            ('%s  RouteWaypoints = %d'):format(prefix, table.getn(routingData.Route or {})),
         }
+        for _, line in ipairs(ingress.Debug or {}) do
+            table.insert(response.Debug, line)
+        end
         response.DebugBlock = BuildDebugBlock(response.Debug)
     end
 

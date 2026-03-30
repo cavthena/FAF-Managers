@@ -405,6 +405,13 @@ local function ApplyPlatoonMetadata(platoon, params, context)
     platoonData.StartedOutsidePlayableArea = startedOutside
     platoonData.Formation = platoonData.Formation or (params and params.formation) or 'GrowthFormation'
     platoonData.StartPositionSource = startPosSource
+    if platoonData.Debug == nil then
+        if attackData and attackData.Debug ~= nil then
+            platoonData.Debug = attackData.Debug and true or false
+        elseif params and params.debug ~= nil then
+            platoonData.Debug = params.debug and true or false
+        end
+    end
     if disableIngress ~= nil then
         platoonData.DisableIngress = disableIngress
     end
@@ -428,6 +435,9 @@ local function ApplyPlatoonMetadata(platoon, params, context)
     end
     if attackData and platoonData.AttackData == nil then
         platoonData.AttackData = attackData
+    end
+    if type(platoonData.AttackData) == 'table' and platoonData.AttackData.Debug == nil and platoonData.Debug ~= nil then
+        platoonData.AttackData.Debug = platoonData.Debug
     end
     if platoonData.AttackFunction == nil and params and params.attackFn ~= nil then
         platoonData.AttackFunction = ResolveAttackFunctionName(params.attackFn) or tostring(params.attackFn)

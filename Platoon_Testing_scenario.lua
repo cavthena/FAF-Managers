@@ -1,7 +1,7 @@
 version = 3 -- Lua Version. Dont touch this
 ScenarioInfo = {
     name = "Platoon_Testing",
-    description = "Testing Environment",
+    description = "",
     preview = '',
     map_version = 1,
     type = 'campaign_coop',
@@ -22,9 +22,6 @@ ScenarioInfo = {
             },
             customprops = {
                 ['ExtraArmies'] = STRING( 'ARMY_17 NEUTRAL_CIVILIAN' ),
-            },
-            factions = {
-                {'uef'},
             },
         },
     },

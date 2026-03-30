@@ -90,7 +90,7 @@ end
 function CybranSpawn_NW()
     ScenarioInfo.CybranNWAttack = SpawnMgr.Start{
         brain = ArmyBrains[ScenarioInfo.Cybran],
-        spawnMarker = 'CybranBase_Rally1',
+        spawnMarker = 'Spawn_TopWest',
         composition = {
             {'url0106', 3},
         },

@@ -1013,7 +1013,7 @@ Scenario = {
         ['ARMY_17'] = 
         {
             personality = '',
-            plans = '/lua/ai/OpAI/DefaultBlankPlanlist.lua',
+            plans = '',
             color = 0,
             faction = 0,
             Economy = {
@@ -1040,7 +1040,7 @@ Scenario = {
         ['NEUTRAL_CIVILIAN'] = 
         {
             personality = '',
-            plans = '/lua/ai/OpAI/DefaultBlankPlanlist.lua',
+            plans = '',
             color = 0,
             faction = 0,
             Economy = {
