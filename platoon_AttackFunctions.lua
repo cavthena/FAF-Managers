@@ -187,6 +187,64 @@ local function IssuePlatoonMove(platoon, destination, formation, aggressive)
     end
 end
 
+local function IsRoutePosition(position)
+    return type(position) == 'table'
+        and type(position[1]) == 'number'
+        and type(position[3]) == 'number'
+end
+
+local function ResolveMovementRoute(platoon, opts, destination)
+    if not IsRoutePosition(destination) then
+        return {}
+    end
+
+    local route = { destination }
+    if not (Routing and Routing.ReceiveAttackData) then
+        return route
+    end
+
+    local payload = CopyData(opts)
+    payload.Debug = false
+    payload.Platoon = platoon
+    payload.CurrentPosition = payload.CurrentPosition
+        or (platoon and platoon.GetPlatoonPosition and platoon:GetPlatoonPosition())
+    payload.TargetPosition = { destination[1], destination[2], destination[3] }
+
+    local response = Routing.ReceiveAttackData(payload)
+    local routed = response
+        and response.Data
+        and response.Data.Route
+
+    if type(routed) ~= 'table' or table.getn(routed) == 0 then
+        return route
+    end
+
+    route = {}
+    for _, waypoint in ipairs(routed) do
+        if IsRoutePosition(waypoint) then
+            table.insert(route, { waypoint[1], waypoint[2] or 0, waypoint[3] })
+        end
+    end
+
+    if table.getn(route) == 0 then
+        table.insert(route, destination)
+    end
+
+    return route
+end
+
+local function IssuePlatoonRoute(platoon, route, formation, aggressive)
+    local units = platoon:GetPlatoonUnits() or {}
+    if table.getn(units) == 0 or table.getn(route or {}) == 0 then
+        return
+    end
+
+    IssueClearCommands(units)
+    for _, waypoint in ipairs(route) do
+        IssuePlatoonMove(platoon, waypoint, formation, aggressive)
+    end
+end
+
 local function IssueAttackUnit(platoon, target)
     if not target or target.Dead then return end
     local units = platoon:GetPlatoonUnits() or {}
@@ -204,7 +262,8 @@ local function AttackTargetLoop(platoon, opts, selector)
                 opts.CurrentPosition = platoon:GetPlatoonPosition()
                 opts.TargetPosition = { pos[1], pos[2], pos[3] }
                 EmitRoutingDebug(platoon, opts, pos)
-                IssuePlatoonMove(platoon, pos, formation, opts.AggressiveMove)
+                local route = ResolveMovementRoute(platoon, opts, pos)
+                IssuePlatoonRoute(platoon, route, formation, opts.AggressiveMove)
                 SafeWait(0.8)
                 IssueAttackUnit(platoon, target)
             end
@@ -370,7 +429,8 @@ function ScoutAttack(platoon, data)
         opts.CurrentPosition = platoon:GetPlatoonPosition()
         opts.TargetPosition = { destination[1], destination[2], destination[3] }
         EmitRoutingDebug(platoon, opts, destination)
-        IssuePlatoonMove(platoon, destination, formation, false)
+        local route = ResolveMovementRoute(platoon, opts, destination)
+        IssuePlatoonRoute(platoon, route, formation, false)
         SafeWait(6)
     end
 end
@@ -390,10 +450,13 @@ function AreaPatrol(platoon, data)
         opts.CurrentPosition = platoon:GetPlatoonPosition()
         opts.TargetPosition = { p[1], p[2], p[3] }
         EmitRoutingDebug(platoon, opts, p)
-        if formation ~= 'NoFormation' then
-            IssueFormAggressiveMove(units, p, formation, 0)
-        else
-            IssueAggressiveMove(units, p)
+        local route = ResolveMovementRoute(platoon, opts, p)
+        for _, waypoint in ipairs(route) do
+            if formation ~= 'NoFormation' then
+                IssueFormAggressiveMove(units, waypoint, formation, 0)
+            else
+                IssueAggressiveMove(units, waypoint)
+            end
         end
     end
 
@@ -422,12 +485,14 @@ function DefensePatrol(platoon, data)
                 opts.CurrentPosition = platoon:GetPlatoonPosition()
                 opts.TargetPosition = { pos[1], pos[2], pos[3] }
                 EmitRoutingDebug(platoon, opts, pos)
-                IssuePlatoonMove(platoon, pos, formation, true)
+                local route = ResolveMovementRoute(platoon, opts, pos)
+                IssuePlatoonRoute(platoon, route, formation, true)
                 SafeWait(1)
                 IssueAttackUnit(platoon, target)
             end
         else
-            IssuePlatoonMove(platoon, basePos, formation, true)
+            local route = ResolveMovementRoute(platoon, opts, basePos)
+            IssuePlatoonRoute(platoon, route, formation, true)
         end
         SafeWait(3)
     end
