@@ -350,6 +350,9 @@ function RoutePlatoonToTarget(platoon, attackData)
 
     local response = ReceiveAttackData(payload)
     local route = response and response.Data and response.Data.Route or {}
+    if table.getn(route) == 0 and targetPosition then
+        route = { CopyVector(targetPosition) }
+    end
 
     local units = platoon:GetPlatoonUnits() or {}
     if table.getn(units) > 0 then
@@ -369,6 +372,7 @@ end
 
 function ReceiveAttackData(attackData)
     attackData = attackData or {}
+    local debugEnabled = (attackData.Debug or attackData.debug) and true or false
     local startPosition = CopyVector(attackData.StartPosition)
     local currentPosition = CopyVector(attackData.CurrentPosition)
     local targetPosition = CopyVector(attackData.TargetPosition)
@@ -388,6 +392,7 @@ function ReceiveAttackData(attackData)
         AggressiveMove = (attackData.AggresiveMove or attackData.AggressiveMove) and true or false,
         RandomizeRoute = attackData.RandomizeRoute and true or false,
         MovementLayer = attackData.MovementLayer or attackData.Layer,
+        Debug = debugEnabled,
     }
 
     local ingress = BuildIngressRoute(routingData)
@@ -398,7 +403,7 @@ function ReceiveAttackData(attackData)
 
     local response = { Data = routingData }
 
-    if attackData.Debug then
+    if debugEnabled then
         local debugTag = ResolveDebugTag(attackData, routingData)
         local prefix = ('[%s] '):format(debugTag)
         response.Debug = {

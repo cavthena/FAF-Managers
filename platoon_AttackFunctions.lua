@@ -41,7 +41,8 @@ local function MergeAttackData(platoon, callData)
 end
 
 local function EmitRoutingDebug(platoon, opts, targetPosition)
-    if not (opts and opts.Debug and Routing and Routing.ReceiveAttackData) then
+    local debugEnabled = opts and (opts.Debug or opts.debug)
+    if not (debugEnabled and Routing and Routing.ReceiveAttackData) then
         return
     end
     if opts._routingDebugEmitted then
