@@ -67,6 +67,7 @@ local NavUtils = import('/lua/sim/NavUtils.lua')
 -- ============================================================
 local ASSAULT_DISTANCE  = 80
 local DEFAULT_FORMATION = 'NoFormation'
+local INGRESS_MARGIN    = 1   -- units inside the boundary for the ingress waypoint
 
 -- ============================================================
 --  Utility helpers
@@ -123,6 +124,12 @@ local function ClampToPlayableArea(position, area)
     local y = position[2]
     if type(y) ~= 'number' then y = 0 end
     return { x, y, z }
+end
+
+local function Clamp(value, minValue, maxValue)
+    if value < minValue then return minValue end
+    if value > maxValue then return maxValue end
+    return value
 end
 
 -- ============================================================
@@ -240,6 +247,73 @@ local function IsLandPosition(pos)
     return GetSurfaceHeight(pos[1], pos[3]) <= GetTerrainHeight(pos[1], pos[3]) + 0.5
 end
 
+-- Find a nearby point in the desired terrain domain.
+-- Returns nil when no suitable point is found within searchRadius.
+local function FindNearestDomainPoint(position, wantLand, area, searchRadius, step)
+    if not position then return nil end
+    if wantLand and IsLandPosition(position) then
+        return CopyVector(position)
+    elseif (not wantLand) and IsWaterPosition(position) then
+        return CopyVector(position)
+    end
+
+    local radiusMax = searchRadius or 56
+    local ringStep  = step or 4
+    local angleStep = math.rad(15)
+
+    for r = ringStep, radiusMax, ringStep do
+        local angle = 0
+        while angle < (math.pi * 2) do
+            local candidate = {
+                position[1] + math.cos(angle) * r,
+                position[2],
+                position[3] + math.sin(angle) * r,
+            }
+            if area then
+                candidate[1] = Clamp(candidate[1], area[1], area[3])
+                candidate[3] = Clamp(candidate[3], area[2], area[4])
+            end
+
+            if wantLand then
+                if IsLandPosition(candidate) then return candidate end
+            else
+                if IsWaterPosition(candidate) then return candidate end
+            end
+            angle = angle + angleStep
+        end
+    end
+
+    return nil
+end
+
+-- Find the nearest position (to `position`) from which NavUtils can reach
+-- `targetPos` on `navLayer`.  Only positions inside `area` are considered.
+-- Returns nil when no accessible point is found within searchRadius.
+local function FindNearestNavAccessiblePoint(position, targetPos, navLayer, area, searchRadius, step)
+    if not (position and targetPos and navLayer) then return nil end
+    local radiusMax = searchRadius or 64
+    local ringStep  = step or 4
+    local angleStep = math.rad(15)
+
+    for r = ringStep, radiusMax, ringStep do
+        local angle = 0
+        while angle < (math.pi * 2) do
+            local x = position[1] + math.cos(angle) * r
+            local z = position[3] + math.sin(angle) * r
+            if area then
+                x = Clamp(x, area[1] + INGRESS_MARGIN, area[3] - INGRESS_MARGIN)
+                z = Clamp(z, area[2] + INGRESS_MARGIN, area[4] - INGRESS_MARGIN)
+            end
+            local candidate = { x, position[2], z }
+            if TryCanPath(navLayer, candidate, targetPos) then
+                return candidate
+            end
+            angle = angle + angleStep
+        end
+    end
+    return nil
+end
+
 -- Returns true when the straight line between fromPos and toPos passes over water.
 local function SegmentCrossesWater(fromPos, toPos)
     if not (fromPos and toPos) then return false end
@@ -280,11 +354,14 @@ local function SegmentCrossesLand(fromPos, toPos)
     return false
 end
 
--- Remove any waypoints that sit in water, then verify no segment in the
--- remaining path crosses water.  Returns the clean path, or nil if the
--- path cannot be made water-free.
+-- Remove any waypoints that sit in water.  Returns the clean path, or nil
+-- when no land waypoints remain.
+-- NOTE: inter-waypoint segment checks are intentionally omitted.  NavUtils
+-- waypoints are turn-points on a curved around-water path; the straight chord
+-- between two adjacent turn-points routinely crosses the very water the route
+-- avoids, causing false rejections of valid paths.  Trusting NavUtils is
+-- correct here -- individual waypoint filtering is enough.
 local function ValidateLandPath(fromPos, path)
-    -- Strip individual water waypoints.
     local clean = {}
     for _, p in ipairs(path or {}) do
         if not IsWaterPosition(p) then
@@ -292,23 +369,12 @@ local function ValidateLandPath(fromPos, path)
         end
     end
     if table.getn(clean) == 0 then return nil end
-
-    -- Check that no segment between consecutive waypoints crosses water.
-    local prev = fromPos or clean[1]
-    for _, p in ipairs(clean) do
-        if SegmentCrossesWater(prev, p) then
-            return nil
-        end
-        prev = p
-    end
     return clean
 end
 
--- Remove any waypoints that sit on land, then verify no segment in the
--- remaining path crosses land.  Returns the clean path, or nil if the
--- path cannot be made land-free.
+-- Remove any waypoints that sit on land.  Returns the clean path, or nil
+-- when no water waypoints remain.
 local function ValidateSeaPath(fromPos, path)
-    -- Strip individual land waypoints.
     local clean = {}
     for _, p in ipairs(path or {}) do
         if not IsLandPosition(p) then
@@ -316,15 +382,6 @@ local function ValidateSeaPath(fromPos, path)
         end
     end
     if table.getn(clean) == 0 then return nil end
-
-    -- Check that no segment between consecutive waypoints crosses land.
-    local prev = fromPos or clean[1]
-    for _, p in ipairs(clean) do
-        if SegmentCrossesLand(prev, p) then
-            return nil
-        end
-        prev = p
-    end
     return clean
 end
 
@@ -458,13 +515,18 @@ local function ResolveInsidePlayableArea(routingData, currentPosition, startPosi
     if routingData.InsidePlayableArea ~= nil then
         return routingData.InsidePlayableArea and true or false
     end
-    if routingData.StartedOutsidePlayableArea ~= nil then
-        return not (routingData.StartedOutsidePlayableArea and true or false)
-    end
 
+    -- Check the live current position first.  A platoon that has already
+    -- entered the playable area must not be routed back to the boundary even
+    -- if it originally spawned outside (StartedOutsidePlayableArea = true is
+    -- permanent in platoonData and must not override real-time state).
     local area = GetPlayableArea()
     local insideCurrent = PositionInPlayableArea(currentPosition, area)
     if insideCurrent ~= nil then return insideCurrent end
+
+    if routingData.StartedOutsidePlayableArea ~= nil then
+        return not (routingData.StartedOutsidePlayableArea and true or false)
+    end
 
     local insideStart = PositionInPlayableArea(startPosition, area)
     if insideStart ~= nil then return insideStart end
@@ -519,16 +581,47 @@ function BuildIngressRoute(routingData)
     local insidePlayable   = ResolveInsidePlayableArea(routingData, currentPosition, startPosition)
     local ingressPosition  = nil
     local ingressStart     = currentPosition
+    local layer            = ResolveLayer(routingData.Platoon, routingData)
+    local navLayer         = ResolveNavLayer(layer)
 
     if area and not insidePlayable then
-        ingressPosition = ClampToPlayableArea(startPosition or currentPosition, area)
+        -- Clamp to a point just inside (not on) the boundary so the unit
+        -- actually crosses the edge before beginning normal route-finding.
+        local raw = ClampToPlayableArea(startPosition or currentPosition, area)
+        if raw then
+            raw[1] = math.max(area[1] + INGRESS_MARGIN, math.min(area[3] - INGRESS_MARGIN, raw[1]))
+            raw[3] = math.max(area[2] + INGRESS_MARGIN, math.min(area[4] - INGRESS_MARGIN, raw[3]))
+        end
+        ingressPosition = raw
         ingressStart    = ingressPosition or currentPosition
     end
 
-    local layer    = ResolveLayer(routingData.Platoon, routingData)
-    local navLayer = ResolveNavLayer(layer)
+    -- Avoid handing LAND/SEA platoons an ingress point in the wrong domain.
+    if ingressPosition and layer == 'LAND' and IsWaterPosition(ingressPosition) then
+        ingressPosition = FindNearestDomainPoint(ingressPosition, true, area)
+        ingressStart = ingressPosition or currentPosition
+    elseif ingressPosition and layer == 'SEA' and IsLandPosition(ingressPosition) then
+        ingressPosition = FindNearestDomainPoint(ingressPosition, false, area)
+        ingressStart = ingressPosition or currentPosition
+    end
+
     -- AIR platoons and Transport-enabled platoons do not need ground pathfinding
     local skipNav  = (layer == 'AIR') or (routingData.Transport and true or false)
+
+    -- Verify the ingress point is on the nav mesh.  Boundary-clamping can place
+    -- it inside a cliff or other impassable (non-water) terrain block, causing
+    -- NavUtils to fail and the game engine to route around the obstacle in the
+    -- wrong direction.  Search outward until finding a position from which the
+    -- target is nav-mesh-reachable.
+    if ingressPosition and targetPosition and not skipNav then
+        if not TryCanPath(navLayer, ingressPosition, targetPosition) then
+            local accessible = FindNearestNavAccessiblePoint(ingressPosition, targetPosition, navLayer, area)
+            if accessible then
+                ingressPosition = accessible
+                ingressStart    = ingressPosition
+            end
+        end
+    end
 
     local route = {}
     if ingressPosition then
@@ -579,9 +672,22 @@ function RoutePlatoonToTarget(platoon, attackData)
 
     local currentPosition = platoon.GetPlatoonPosition and platoon:GetPlatoonPosition() or nil
     local targetPosition  = CopyVector(attackData and attackData.TargetPosition)
+    if not targetPosition then
+        return {
+            Assault       = false,
+            Distance      = math.huge,
+            Route         = {},
+            MovementLayer = ResolveLayer(platoon, attackData or {}),
+        }
+    end
     local distance        = Distance2D(currentPosition, targetPosition)
 
-    if distance <= ASSAULT_DISTANCE then
+    local assaultDistance = ASSAULT_DISTANCE
+    if attackData and type(attackData.AssaultDistance) == 'number' then
+        assaultDistance = math.max(1, attackData.AssaultDistance)
+    end
+
+    if distance <= assaultDistance then
         return {
             Assault       = true,
             Distance      = distance,
@@ -600,7 +706,7 @@ function RoutePlatoonToTarget(platoon, attackData)
     local layer    = response and response.Data and response.Data.MovementLayer or 'LAND'
     -- Only fall back to a direct target waypoint for AIR / transport layers.
     -- Ground and naval layers must not blindly route through impassable terrain.
-    if table.getn(route) == 0 and targetPosition and layer == 'AIR' then
+    if table.getn(route) == 0 and targetPosition and (layer == 'AIR' or (attackData and attackData.Transport)) then
         route = { CopyVector(targetPosition) }
     end
 
@@ -615,7 +721,7 @@ function RoutePlatoonToTarget(platoon, attackData)
     end
 
     return {
-        Assault       = false,
+        Assault       = (distance <= assaultDistance),
         Distance      = distance,
         Route         = route,
         MovementLayer = response and response.Data and response.Data.MovementLayer,

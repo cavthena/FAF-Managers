@@ -383,9 +383,15 @@ end
 -- ============================================================
 --  Domain validation
 -- ============================================================
-local function IsValidDomain(platoon, targetPos, opts, layer)
+local function IsNavalTarget(unit)
+    if not unit then return false end
+    return EntityCategoryContains(categories.NAVAL, unit)
+end
+
+local function IsValidDomain(platoon, unit, targetPos, opts, layer)
     layer = layer or GetPlatoonLayer(platoon)
     local inWater = IsPositionInWater(targetPos[1], targetPos[3])
+    local isNaval = IsNavalTarget(unit)
 
     -- Bombard: cross-domain allowed when target is within weapon range
     if opts.Bombard then
@@ -400,7 +406,7 @@ local function IsValidDomain(platoon, targetPos, opts, layer)
 
     if layer == 'AIR'        then return true       end
     if layer == 'AMPHIBIOUS' then return true       end
-    if layer == 'LAND'       then return not inWater end
+    if layer == 'LAND'       then return (not inWater) and (not isNaval) end
     if layer == 'SEA'        then return inWater    end
     return true
 end
@@ -456,7 +462,7 @@ local function FilterValidTargets(brain, platoon, units, opts, layer)
     for _, u in ipairs(units) do
         if u and not u.Dead then
             local pos = u:GetPosition()
-            if pos and IsValidDomain(platoon, pos, opts, layer) and IsReachable(platoon, pos, opts, layer) then
+            if pos and IsValidDomain(platoon, u, pos, opts, layer) and IsReachable(platoon, pos, opts, layer) then
                 table.insert(out, u)
             end
         end
