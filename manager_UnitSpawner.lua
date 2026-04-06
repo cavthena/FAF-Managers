@@ -331,28 +331,28 @@ local function ResolveStartPositionContext(params, context, platoon, platoonData
     if not position and params and params.position ~= nil then
         position = markerPos(params.position)
         if position then
-            source = source or 'position'
+            source = source or tostring(params.position)
         end
     end
 
     if not position and params and params.spawnMarker ~= nil then
         position = markerPos(params.spawnMarker)
         if position then
-            source = source or 'spawnMarker'
+            source = source or tostring(params.spawnMarker)
         end
     end
 
     if not position then
         position = platoon and platoon._spawnerStartPosition
         if position then
-            source = source or 'spawnMarker'
+            source = source or tostring((platoonData and platoonData.SpawnMarker) or (params and params.spawnMarker) or 'spawnMarker')
         end
     end
 
     if not position and platoonData and platoonData.SpawnPosition then
         position = platoonData.SpawnPosition
         if position then
-            source = source or 'storedSpawnPosition'
+            source = source or tostring(platoonData.SpawnMarker or 'storedSpawnPosition')
         end
     end
 
@@ -371,6 +371,8 @@ local function MetadataDebugLog(params, message)
         LOG(('[US:%s] %s'):format(tostring(params.spawnerTag or '?'), message))
     end
 end
+
+local ResolveAttackFunctionName
 
 local function ApplyPlatoonMetadata(platoon, params, context)
     if not platoon then
@@ -403,6 +405,13 @@ local function ApplyPlatoonMetadata(platoon, params, context)
     platoonData.StartedOutsidePlayableArea = startedOutside
     platoonData.Formation = platoonData.Formation or (params and params.formation) or 'GrowthFormation'
     platoonData.StartPositionSource = startPosSource
+    if platoonData.Debug == nil then
+        if attackData and attackData.Debug ~= nil then
+            platoonData.Debug = attackData.Debug and true or false
+        elseif params and params.debug ~= nil then
+            platoonData.Debug = params.debug and true or false
+        end
+    end
     if disableIngress ~= nil then
         platoonData.DisableIngress = disableIngress
     end
@@ -427,6 +436,12 @@ local function ApplyPlatoonMetadata(platoon, params, context)
     if attackData and platoonData.AttackData == nil then
         platoonData.AttackData = attackData
     end
+    if type(platoonData.AttackData) == 'table' and platoonData.AttackData.Debug == nil and platoonData.Debug ~= nil then
+        platoonData.AttackData.Debug = platoonData.Debug
+    end
+    if platoonData.AttackFunction == nil and params and params.attackFn ~= nil then
+        platoonData.AttackFunction = ResolveAttackFunctionName(params.attackFn) or tostring(params.attackFn)
+    end
 
     MetadataDebugLog(params, ('ApplyPlatoonMetadata routeSource=%s startSource=%s startPosition=%s startedOutsidePlayableArea=%s disableIngress=%s'):format(
         tostring(routeSource),
@@ -445,6 +460,22 @@ local function ResolveAttackFunction(attackFn)
         return _G and rawget(_G, attackFn)
     end
     return attackFn
+end
+
+ResolveAttackFunctionName = function(attackFn)
+    if type(attackFn) == 'string' and attackFn ~= '' then
+        return attackFn
+    end
+
+    if type(attackFn) == 'function' and _G then
+        for key, value in pairs(_G) do
+            if value == attackFn then
+                return tostring(key)
+            end
+        end
+    end
+
+    return nil
 end
 
 local function LaunchAttackThread(platoon, attackFn, attackData, warnFn)
@@ -496,6 +527,11 @@ Spawner.__index = Spawner
 
 function Spawner:Log(msg) LOG(('[US:%s] %s'):format(self.tag, msg)) end
  function Spawner:Warn(msg) WARN(('[US:%s] %s'):format(self.tag, msg)) end
+function Spawner:Debug(msg)
+    if self.params and self.params.debug then
+        LOG(('[US:%s][DEBUG] %s'):format(self.tag, msg))
+    end
+end
 
  function Spawner:GetEntryCount(entry)
      return ResolveEntryCount(entry, self.params.difficulty)
@@ -636,9 +672,29 @@ function Spawner:HandOffToAttack(platoon)
         spawnPos = platoon and platoon._spawnerStartPosition,
     })
 
-    return LaunchAttackThread(platoon, attackFn, platoonData or self.params.attackData, function(msg)
+    self:Debug(('Handoff metadata begin: label=%s')
+        :format(tostring(platoonData and platoonData.PlatoonLabel or (platoon and platoon.GetPlatoonLabel and platoon:GetPlatoonLabel()) or 'unknown')))
+    self:Debug(('  startPos=(%.2f, %.2f, %.2f) startSource=%s')
+        :format(
+            (platoonData and platoonData.StartPosition and platoonData.StartPosition[1]) or 0,
+            (platoonData and platoonData.StartPosition and platoonData.StartPosition[2]) or 0,
+            (platoonData and platoonData.StartPosition and platoonData.StartPosition[3]) or 0,
+            tostring(platoonData and platoonData.StartPositionSource or 'unknown')
+        ))
+    self:Debug(('  startedOutside=%s routeSource=%s')
+        :format(
+            tostring(platoonData and platoonData.StartedOutsidePlayableArea),
+            tostring(platoonData and platoonData.RouteSource or 'UnitSpawner')
+        ))
+    self:Debug(('  attackFn=%s'):format(tostring(platoonData and platoonData.AttackFunction or attackFn)))
+    self:Debug('Handoff metadata end')
+
+    local launchOk = LaunchAttackThread(platoon, attackFn, platoonData or self.params.attackData, function(msg)
         self:Warn(msg)
     end)
+    self:Debug(('Handoff attack launch: label=%s success=%s')
+        :format(tostring(platoonData and platoonData.PlatoonLabel or (platoon and platoon.GetPlatoonLabel and platoon:GetPlatoonLabel()) or 'unknown'), tostring(launchOk)))
+    return launchOk
 end
 
 function Spawner:SpawnWave(waveNo, wanted)
@@ -676,7 +732,7 @@ function Spawner:SpawnWave(waveNo, wanted)
     return platoon, spawned, unitCount, wanted, attackLaunched
 end
 
- function Spawner:WaitForLossGate(platoon, expectedCount)
+ function Spawner:WaitForLossGate(platoon, spawnedUnits, expectedCount)
      local thr = math.max(0, math.min(1, self.params.mode2LossThreshold or 0.5))
      local wantTotal = expectedCount or 0
      if wantTotal <= 0 then
@@ -684,16 +740,19 @@ end
      end
 
      while not self.stopped do
-        if not platoon or not self.brain:PlatoonExists(platoon) then
-            local alive = countComplete((platoon and platoon.GetPlatoonUnits and platoon:GetPlatoonUnits()) or {})
-            self:InvokeBooleanCallbacks('OnMode2ThresholdMet', true, platoon, alive, wantTotal, thr)
-            return
+        local alive = 0
+        for _, unit in ipairs(spawnedUnits or {}) do
+            if unit and not unit.Dead then
+                alive = alive + 1
+            end
         end
-         local alive = countComplete(platoon:GetPlatoonUnits() or {})
          local lost = math.max(0, wantTotal - alive)
          local frac = (wantTotal > 0) and (lost / wantTotal) or 1
         if frac >= thr then
             self:InvokeBooleanCallbacks('OnMode2ThresholdMet', true, platoon, alive, wantTotal, thr)
+            return
+        end
+        if alive <= 0 then
             return
         end
          WaitSeconds(2)
@@ -739,7 +798,7 @@ function Spawner:RunMode2()
             self:Stop()
         end
         if self.stopped then break end
-        self:WaitForLossGate(platoon, unitCount)
+        self:WaitForLossGate(platoon, units, unitCount)
         if self.stopped then break end
         WaitSeconds(math.max(0, self.params.waveCooldown or 0))
     end

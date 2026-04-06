@@ -417,7 +417,7 @@ local function ResolveBuilderStartPositionContext(builder, platoon, platoonData)
     if not position and params and params.rallyMarker ~= nil then
         position = markerPos(params.rallyMarker)
         if position then
-            source = 'rallyMarker'
+            source = tostring(params.rallyMarker)
         end
     end
 
@@ -501,6 +501,13 @@ local function ApplyBuilderPlatoonMetadata(builder, platoon, label)
     platoonData.StartPositionSource = startPosSource
     platoonData.StartSource = platoonData.StartPositionSource
     platoonData.StartedOutsidePlayableArea = startedOutside
+    if platoonData.Debug == nil then
+        if mergedAttackData and mergedAttackData.Debug ~= nil then
+            platoonData.Debug = mergedAttackData.Debug and true or false
+        elseif params.debug ~= nil then
+            platoonData.Debug = params.debug and true or false
+        end
+    end
     if disableIngress ~= nil then
         platoonData.DisableIngress = disableIngress
     end
@@ -517,6 +524,12 @@ local function ApplyBuilderPlatoonMetadata(builder, platoon, label)
     end
     if mergedAttackData and platoonData.AttackData == nil then
         platoonData.AttackData = mergedAttackData
+    end
+    if type(platoonData.AttackData) == 'table' and platoonData.AttackData.Debug == nil and platoonData.Debug ~= nil then
+        platoonData.AttackData.Debug = platoonData.Debug
+    end
+    if platoonData.AttackFunction == nil and params.attackFn ~= nil then
+        platoonData.AttackFunction = tostring(params.attackFn)
     end
 
     platoon.PlatoonData = platoonData
