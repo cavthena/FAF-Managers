@@ -96,7 +96,7 @@ function CybranSpawn_NW()
         },
         attackFn = plaAtk.WaveAttack,
         attackData = {
-            Type = 'closest',
+            Type = 'Closest',
             Formation = 'NoFormation',
             Debug = true,
         },
@@ -125,9 +125,9 @@ function CybranBuild_Main()
         waveCooldown = 5,
         attackFn = plaAtk.WaveAttack,
         attackData = {
+            Type = 'Value',
             Formation = 'AttackFormation',
-            Type = 'closest',
-            AggresiveMove = true,
+            AggressiveMove = true,
             Debug = true,
         },
         builderTag = 'CybranBuildAtk',
