@@ -7,7 +7,7 @@ local BuildMgr = import('/maps/Platoon_testing.v0001/manager_UnitBuilder.lua')
 local SpawnMgr = import('/maps/Platoon_testing.v0001/manager_UnitSpawner.lua')
 local EngiMgr = import('/maps/Platoon_testing.v0001/manager_BaseEngineer.lua')
 local plaAtk = import('/maps/Platoon_testing.v0001/platoon_AttackFunctions.lua')
-local Routing = import('/maps/Platoon_testing.v0001/platoon_Routing.lua')
+--local Routing = import('/maps/Platoon_testing.v0001/platoon_Routing.lua')
 
 --Locals
 local Difficulty = ScenarioInfo.Options.Difficulty

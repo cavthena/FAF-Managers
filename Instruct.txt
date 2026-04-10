@@ -1,0 +1,55 @@
+Rebuild platoon_AttackFunctions.lua, for lua 5.0 and FAF.
+AttackFunctions handles attack behavior and target finding. Connects to platoon_Routing.lua for platoon routing and movement.
+Must be compatible with manager_UnitSpawner.lua and manager_UnitBuilder.lua
+
+Create a comment block with instructions and examples for each attack.
+
+Attacks respect domain and pathability. A LAND platoon will not attempt to target Navy structures for example, and will not pick a target that cannot be reached.
+When an attack has a platoon waiting at a marker and if the platoon is made up of air units, then the units will circle the marker instead of stopping to wait.
+
+Global options used for all attacks:
+- TargetArmy, default omitted. If a list is provided the function will target the provided list of armies. If omitted then the function will target all enemies.
+- AggressiveMove, Default false. If true the platoons move aggressively.
+- Formation, Default 'NoFormation'. When platoons are ordered to move they will move in the formation provided.
+- IntelOnly, Default false. If true targeting will respect the intelmap and the AI will only target structures or units they have detected.
+- RandomizeRoute, default false. If true routing will take a rondom route approach to the target. It will mix between attacking as normal or approaching from a flank.
+- Transport, default false. If true the platoon is allowed to use transports to reach the target. Targeting respects this value and will not pick a target that is not reachable if this is false.
+- Bombard, default false. If true allow the function to pick targets that are in range but may not be in the same domain. An example would be navy units bombarding structures on the shore.
+- Debug, default false. If true provide a series of useful debug logs.
+
+Attack Functions:
+WaveAttack: This attack is a basic attack designed to keep constant pressure on the target. Platoons move to the target, defined by 'Type', clear the area, then move to the next valid target. This attack uses the following:
+    - Type: 'Closest' target the closest enemy structure cluster to the platoon's current location. 'Value' targets the cluster of enemy structures with the highest total value. Avoids targeting single or groups of 5 or less structures unless there are no other valid targets.
+
+RaidAttack: This attack is designed to target specific categories of structures. It will target based on the closest distance from the platoon's current location. Target categories use the following priority: Specified > ECO > INT > BLD > DEF. If one category has no targets it will move to the next priority.
+    - Type: 'ECO' target eco related structures. Mass Extracters, Power Generators, Mass Fabricators.
+            'BLD' target construction related structures. Factories, Engineering Bays.
+            'INT' target intelligent gathering structures. Radars, Sonars.
+            'DEF' target defensive turrets. Point Defenses, AA defenses, artillery, missile launchers, Nuke launchers and defenders.
+    - AvoidDef: If true do not target structures that are within range of defenses unless there are no other valid targets remaining outside of defensive range.
+
+HuntAttack: This attack provides a list of specific units or categories to attack. The platoon will target the closest valid target, clear it and the area then move to the next target. If there are no valid targets the platoon will wait at a marker until a target is found.
+    - List: A list of unit BPs or categories that can be targeted.
+    - AvoidDef: If true, do not attack targets within the range of defenses.
+    - WaitMarker: The marker the platoon will wait at if there are no valid targets.
+
+ScoutAttack: Units will randomly move around the playable area scouting. They have a 25% chance to move to the coolest point on the intelmap.
+
+DefensePatrol: This patrol is designed to have a platoon follow a marker chain repeatidly.
+    - Loop: If true, the platoon will follow the chain from the first marker to the last then repeat from the first marker in a circle. If false, the platoon will follow the chain from the first maker to the last then return along the chain back to the first marker before looping.
+    - Investigate: If true, the platoon will move off the chain to engage any enemy units that get to close to the chain.
+
+Firebase: Orders a platoon of engineers to move to a list of base markers. If there are structures missing they will construct them. Then move to the next marker. They will repeat.
+    - Markers: List of string names of markers indicating a firebase's location.
+    - Groups: List of string names of unit groups from the editor that indicate what buildings need to be built.
+
+BaseBuild: Orders a platoon of engineers to move to a base location marker. The engineers are then assigned to the base. The engineers are not sent to the base unless the base has no factories and engineers.
+    - BaseMarker: The marker used for the base.
+    - BaseTag: The tag used by manager_BaseEngineer
+
+
+Rebuild platoon_Routing.lua, for lua 5.0 and FAF.
+Routing handles route finding and movement orders for units and platoons being used in AttackFunctions.
+
+A simple route creation that respects blocked terrain and water, domain, and options from AttackFunctions.
+Routes will move the platoon from it's current location to a distance of 40 from the target area. Where the platoon will switch to "assault mode" and clear out the target area of structures.
