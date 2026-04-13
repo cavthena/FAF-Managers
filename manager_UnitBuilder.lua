@@ -1170,6 +1170,15 @@ end
 function Builder:BeginWaveLoop()
     if self.stopped then return end
 
+    -- For BaseBuild scenarios: do not spend factory capacity until the target
+    -- base actually needs a new engineer delivery.
+    while not self.stopped do
+        if self:_TargetBaseNeedsBuild() then break end
+        self:Dbg('BeginWaveLoop: target base does not need engineers yet; deferring wave start')
+        WaitSeconds(10)
+    end
+    if self.stopped then return end
+
     self.wave = (self.wave or 0) + 1
     self.wanted = self:GetWantedForWave(self.wave)
     self.stagingName   = string.format('%s_Stage_%d', self.tag, self.wave)
@@ -1644,26 +1653,37 @@ function Builder:RunCleanup()
     self:_HandOffPlatoon(idle, label)
 end
 
--- Returns true when the target base (from attackData.BaseTag) has no live factories
--- AND no live engineers — i.e. it needs a new delivery.  Returns true when no base
--- tag is configured so non-BaseBuild use-cases are unaffected.
+-- Returns true when the target base (from attackData.BaseTag) has no live factory
+-- structures — i.e. it needs a new engineer delivery.  Uses a direct spatial scan
+-- so the result is independent of the engineer manager's internal lease state
+-- (the lease is released when the EM is satisfied, which would otherwise cause
+-- a false positive from an empty self.leased table).
+-- Returns true when no base tag is configured so non-BaseBuild builders are unaffected.
 function Builder:_TargetBaseNeedsBuild()
     local ad  = self.params and self.params.attackData
     local tag = ad and ad.BaseTag
     if not tag then return true end
     local bh = BaseManager and BaseManager.GetBase(tag)
     if not bh then return true end
-    local em = bh.GetEngineerHandle and bh:GetEngineerHandle()
-    if not em then return true end
-    local factories = em:_FactoriesList()
-    if not factories[1] then return true end   -- no factories
-    local engineers = em:_GetLiveEngineers()
-    return not engineers[1]                    -- no engineers
+    local basePos = bh.basePos
+    if not basePos then return true end
+    local radius = bh.radius or 70
+    local units = self.brain:GetUnitsAroundPoint(
+        categories.FACTORY * categories.STRUCTURE, basePos, radius, 'Ally') or {}
+    for _, f in ipairs(units) do
+        if not f.Dead then return false end
+    end
+    return true
 end
 
 function Builder:WaitForMode2Gate(p)
     local thr = math.max(0, math.min(1, self.params.mode2LossThreshold or 0.5))
     local wantTotal = sumCounts(self.wanted)
+    -- For BaseBuild scenarios: also exit if the base was active (had factories/engineers)
+    -- but now needs new engineers.  Guards against built engineers idling alive at a
+    -- destroyed base indefinitely.
+    local isBaseBuild = (self.params and self.params.attackData and self.params.attackData.BaseTag) ~= nil
+    local baseWasActive = false
     while not self.stopped do
         if not p or not self.brain:PlatoonExists(p) then
             break
@@ -1673,6 +1693,15 @@ function Builder:WaitForMode2Gate(p)
         local lost = math.max(0, wantTotal - alive)
         local frac = (wantTotal > 0) and (lost / wantTotal) or 1
         if frac >= thr then break end
+        if isBaseBuild then
+            local needsBuild = self:_TargetBaseNeedsBuild()
+            if not needsBuild then
+                baseWasActive = true
+            elseif baseWasActive then
+                self:Dbg('WaitForMode2Gate: base was active but now needs engineers; exiting early')
+                break
+            end
+        end
         WaitSeconds(2)
     end
     -- For BaseBuild-style use: also wait until the target base actually needs

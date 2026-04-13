@@ -739,6 +739,12 @@ end
          return
      end
 
+    -- For BaseBuild scenarios: also exit if the base was active (had factories/engineers)
+    -- but now needs new engineers.  Guards against spawned engineers idling alive at a
+    -- destroyed base indefinitely.
+    local hasBaseTag = (self.params and self.params.attackData and self.params.attackData.BaseTag) ~= nil
+    local baseWasActive = false
+
      while not self.stopped do
         local alive = 0
         for _, unit in ipairs(spawnedUnits or {}) do
@@ -755,6 +761,15 @@ end
         if alive <= 0 then
             return
         end
+        if hasBaseTag then
+            local needsBuild = self:_TargetBaseNeedsBuild()
+            if not needsBuild then
+                baseWasActive = true
+            elseif baseWasActive then
+                self:Debug('WaitForLossGate: base was active but now needs engineers; exiting early')
+                return
+            end
+        end
          WaitSeconds(2)
      end
  end
@@ -770,8 +785,36 @@ end
      return remaining
  end
 
+-- Returns true when the target base (from attackData.BaseTag) has no live factory
+-- structures — i.e. it needs a new engineer delivery.  Uses a direct spatial scan
+-- so the result is independent of the engineer manager's internal lease state.
+-- Returns true when no BaseTag is configured so non-BaseBuild spawners are unaffected.
+function Spawner:_TargetBaseNeedsBuild()
+    local ad  = self.params and self.params.attackData
+    local tag = ad and ad.BaseTag
+    if not tag then return true end
+    local bm = ScenarioInfo and ScenarioInfo.BaseManagers
+    local bh = bm and bm[tag]
+    if not bh then return true end
+    local basePos = bh.basePos
+    if not basePos then return true end
+    local radius = bh.radius or 70
+    local units = bh.brain:GetUnitsAroundPoint(
+        categories.FACTORY * categories.STRUCTURE, basePos, radius, 'Ally') or {}
+    for _, f in ipairs(units) do
+        if not f.Dead then return false end
+    end
+    return true
+end
+
 function Spawner:RunMode1()
     while not self.stopped do
+        while not self.stopped do
+            if self:_TargetBaseNeedsBuild() then break end
+            self:Debug('RunMode1: target base does not need engineers yet; deferring spawn')
+            WaitSeconds(10)
+        end
+        if self.stopped then break end
         self.wave = (self.wave or 0) + 1
         local platoon, units, unitCount, wanted = self:SpawnWave(self.wave, self:BuildWantedForWave(self.wave))
         local keepRunning = self:InvokeBooleanCallbacks('OnWaveNumber', true, self.wave, platoon, unitCount, wanted)
@@ -788,6 +831,12 @@ end
 
 function Spawner:RunMode2()
     while not self.stopped do
+        while not self.stopped do
+            if self:_TargetBaseNeedsBuild() then break end
+            self:Debug('RunMode2: target base does not need engineers yet; deferring spawn')
+            WaitSeconds(10)
+        end
+        if self.stopped then break end
         self.wave = (self.wave or 0) + 1
         local platoon, units, unitCount, wanted = self:SpawnWave(self.wave, self:BuildWantedForWave(self.wave))
         local keepRunning = self:InvokeBooleanCallbacks('OnWaveNumber', true, self.wave, platoon, unitCount, wanted)

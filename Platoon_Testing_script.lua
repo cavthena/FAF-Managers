@@ -59,7 +59,7 @@ function OnStart(scenario)
     CybranOutpost_AI()
 
     ScenarioFramework.CreateTimerTrigger(function()
-        --CybranSpawn_NW()
+        CybranSpawn_NW()
     end, 10)
 
     ScenarioFramework.CreateTimerTrigger(function()
@@ -115,21 +115,20 @@ function CybranSpawn_NW()
         brain = ArmyBrains[ScenarioInfo.Cybran],
         spawnMarker = 'Spawn_TopWest',
         composition = {
-            {'url0208', 3},
-            {'url0105', 3},
+            {'url0106', 3},
         },
-        attackFn = plaAtk.BaseBuild,
+        attackFn = plaAtk.WaveAttack,
         attackData = {
-            BaseMarker = 'CybranOutpost',
-            BaseTag = 'COBase',
-            Debug = true,
+            Type = 'Closest',
+            Formation = 'NoFormation',
+            Debug = false,
         },
         waveCooldown = 5,
         mode = 2,
         mode2LossThreshold = 1,
         spawnerTag = 'CybranNWAttack',
         spawnSpread = 2,
-        debug = true,
+        debug = false,
     }
 end
 
