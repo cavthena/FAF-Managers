@@ -268,10 +268,22 @@ local function PlatoonAlive(platoon)
         return false
     end
     local brain = platoon:GetBrain()
-    if not brain or not brain.PlatoonExists then
-        return false
+    if brain and brain.PlatoonExists then
+        if brain:PlatoonExists(platoon) then
+            return true
+        end
     end
-    return brain:PlatoonExists(platoon)
+
+    -- UnitSpawner-created platoons can lose their platoon registration while
+    -- their units are still alive and commandable. Fall back to checking unit
+    -- membership so long-running attack threads (e.g. DefensePatrol) continue.
+    local units = platoon:GetPlatoonUnits() or {}
+    for _, unit in ipairs(units) do
+        if unit and not unit.Dead then
+            return true
+        end
+    end
+    return false
 end
 
 -- ---------------------------------------------------------------------------
@@ -1724,10 +1736,16 @@ local function IssueUpgradesAndAssist(brain, engineers, groupEntries, debugOn)
 end
 
 -- Waits until no structure near any group-entry position is in the Upgrading state.
+-- Always yields at least one interval before the first check so the engine has
+-- time to register the Upgrading state after IssueUpgrade is called. Without
+-- this initial yield the function can return immediately (upgrade not yet
+-- registered) and the caller enters a zero-yield tight loop.
 local function WaitForStructureUpgrades(brain, platoon, groupEntries, timeoutSecs)
     local elapsed  = 0
     local interval = 1
     timeoutSecs    = timeoutSecs or 180
+    WaitSeconds(interval)
+    elapsed = elapsed + interval
     while PlatoonAlive(platoon) and elapsed < timeoutSecs do
         local busy = false
         for _, entry in ipairs(groupEntries) do
@@ -1956,16 +1974,31 @@ function Firebase(platoon, data)
     end
 end
 
-local function BaseIsSelfSustaining(brain, basePos, radius)
+local function BaseIsSelfSustaining(brain, basePos, radius, baseHandle)
+    if baseHandle then
+        -- Use the base manager's own tracking — immune to nearby bases
+        local em = baseHandle.GetEngineerHandle and baseHandle:GetEngineerHandle()
+        if not em then return false end
+        local factories = em:_FactoriesList()
+        if not factories[1] then return false end
+        local engineers = em:_GetLiveEngineers()
+        return engineers[1] ~= nil
+    end
+    -- Fallback spatial scan when no base handle is available
     radius = radius or 70
     local factories = brain:GetUnitsAroundPoint(
         categories.FACTORY * categories.STRUCTURE, basePos, radius, 'Ally') or {}
-    if table.getn(factories) < 1 then
-        return false
+    local hasFactory = false
+    for _, f in ipairs(factories) do
+        if IsAlive(f) then hasFactory = true; break end
     end
+    if not hasFactory then return false end
     local engineers = brain:GetUnitsAroundPoint(
         categories.ENGINEER, basePos, radius, 'Ally') or {}
-    return table.getn(engineers) > 0
+    for _, e in ipairs(engineers) do
+        if IsAlive(e) then return true end
+    end
+    return false
 end
 
 function BaseBuild(platoon, data)
@@ -1989,11 +2022,25 @@ function BaseBuild(platoon, data)
         return
     end
 
+    local baseHandle = BaseManager and BaseManager.GetBase(data.BaseTag)
+
+    -- Move to the base first, then wait for actual arrival
+    DLog(data.Debug, 'BaseBuild', 'moving engineers to ' .. tostring(data.BaseMarker))
+    MovePlatoonTo(platoon, data.BaseMarker, data)
+    WaitForPlatoonIdle(platoon, data.ArrivalTimeout or 120)
+
+    if not PlatoonAlive(platoon) then
+        return
+    end
+
+    -- At the base: wait here until the base needs engineers, then assign.
+    -- Waiting on-site keeps the units alive so the spawner does not trigger
+    -- a replacement wave prematurely.
     while PlatoonAlive(platoon) do
-        if not BaseIsSelfSustaining(brain, basePos, data.Radius or 70) then
+        if not BaseIsSelfSustaining(brain, basePos, data.Radius or 70, baseHandle) then
             break
         end
-        DLog(data.Debug, 'BaseBuild', 'base already self-sustaining; waiting')
+        DLog(data.Debug, 'BaseBuild', 'base already self-sustaining; waiting at base')
         WaitSeconds(10)
     end
 
@@ -2001,28 +2048,17 @@ function BaseBuild(platoon, data)
         return
     end
 
-    DLog(data.Debug, 'BaseBuild', 'moving engineers to ' .. tostring(data.BaseMarker))
-    MovePlatoonTo(platoon, data.BaseMarker, data)
-    WaitSeconds(2)
-
-    if not PlatoonAlive(platoon) then
-        return
-    end
-
-    if BaseManager then
-        local baseHandle = BaseManager.GetBase(data.BaseTag)
-        if baseHandle and baseHandle.AssignEngineerUnit then
-            local units = PlatoonUnits(platoon)
-            for _, unit in ipairs(units) do
-                if IsAlive(unit) and EntityCategoryContains(categories.ENGINEER, unit) then
-                    DLog(data.Debug, 'BaseBuild', 'assigning engineer to base')
-                    baseHandle:AssignEngineerUnit(unit)
-                end
+    if baseHandle and baseHandle.AssignEngineerUnit then
+        local units = PlatoonUnits(platoon)
+        for _, unit in ipairs(units) do
+            if IsAlive(unit) and EntityCategoryContains(categories.ENGINEER, unit) then
+                DLog(data.Debug, 'BaseBuild', 'assigning engineer to base')
+                baseHandle:AssignEngineerUnit(unit)
             end
-        else
-            DLog(data.Debug, 'BaseBuild', 'no base handle found for tag ' .. tostring(data.BaseTag))
         end
-    else
+    elseif not BaseManager then
         DLog(data.Debug, 'BaseBuild', 'BaseManager module not available')
+    else
+        DLog(data.Debug, 'BaseBuild', 'no base handle found for tag ' .. tostring(data.BaseTag))
     end
 end

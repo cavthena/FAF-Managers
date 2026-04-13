@@ -56,13 +56,14 @@ function OnStart(scenario)
 
     --Start Cybran Base
     CybranBase_AI()
+    CybranOutpost_AI()
 
     ScenarioFramework.CreateTimerTrigger(function()
-        CybranSpawn_NW()
+        --CybranSpawn_NW()
     end, 10)
 
     ScenarioFramework.CreateTimerTrigger(function()
-        --CybranBuild_Main()
+        CybranBuild_Main()
     end, 15)
 end
 
@@ -82,7 +83,29 @@ function CybranBase_AI()
         engineerFactoryPriority = 200,
         engineerFactoryCount = 1,
         tasks = {
-            weights = {BUILD = 1.5, ASIST = 1, EXP = 0},
+            weights = {BUILD = 1.5, ASSIST = 1, EXP = 0},
+        },
+    })
+end
+
+function CybranOutpost_AI()
+    ScenarioInfo.COEngi = EngiMgr.Start({
+        brain = ArmyBrains[ScenarioInfo.Cybran],
+        baseMarker = 'CybranOutpost',
+        baseTag = 'COBase',
+        radius = 15,
+        structGroups = {'ExpandBase'},
+        engineers = {
+            T1 = 1,
+            T2 = 2,
+            T3 = 0,
+            SCU = 0,
+        },
+        empty = true,
+        engineerFactoryPriority = 200,
+        engineerFactoryCount = 1,
+        tasks = {
+            weights = {BUILD = 1.5, ASSIST = 1, EXP = 0},
         },
     })
 end
@@ -95,12 +118,10 @@ function CybranSpawn_NW()
             {'url0208', 3},
             {'url0105', 3},
         },
-        attackFn = plaAtk.Firebase,
+        attackFn = plaAtk.BaseBuild,
         attackData = {
-            Markers = {
-                {'CybranOutpost',  'ExpandBase'},
-                {'CybranFirebase', 'Firebase'},
-            },
+            BaseMarker = 'CybranOutpost',
+            BaseTag = 'COBase',
             Debug = true,
         },
         waveCooldown = 5,
@@ -118,8 +139,8 @@ function CybranBuild_Main()
         baseMarker = 'CybranBase',
         domain = 'LAND',
         composition = {
-            {'url0208', 3},
-            {'url0105', 3},
+            {'url0208', 1},
+            {'url0105', 1},
         },
         baseHandle = ScenarioInfo.CBEngi,
         wantFactories = 2,
@@ -127,18 +148,15 @@ function CybranBuild_Main()
         radius = 26,
         rallyMarker = 'CybranBase_Rally2',
         waveCooldown = 5,
-        SpawnFirstPlatoonAtRally = true,
-        attackFn = plaAtk.Firebase,
+        attackFn = plaAtk.BaseBuild,
         attackData = {
-            Markers = {
-                {'CybranOutpost',  'ExpandBase'},
-                {'CybranFirebase', 'Firebase'},
-            },
-            Debug = false,
+            BaseMarker = 'CybranOutpost',
+            BaseTag = 'COBase',
+            Debug = true,
         },
         builderTag = 'CybranBuildAtk',
         mode = 2,
         mode2LossThreshold = 1,
-        debug = false,
+        debug = true,
     })
 end

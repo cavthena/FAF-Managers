@@ -632,8 +632,8 @@ local function _RallySweep(self)
         if u and not u.Dead and isComplete(u) and u:GetAIBrain()==self.brain then
             local bp = unitBpId(u)
             if self.wanted and self.wanted[bp] then
-                -- only touch unowned or ours
-                if (not u.ub_tag) or (u.ub_tag == self.tag) then
+                -- only touch unowned (and not managed by BaseEngineer) or ours
+                if ((not u.ub_tag) and (not u.be_tag)) or (u.ub_tag == self.tag) then
                     local pos = u:GetPosition()
                     if dist2d(pos, rpos) > 18 then
                         local q = (u.GetCommandQueue and u:GetCommandQueue()) or {}
@@ -1337,10 +1337,10 @@ function Builder:CollectorLoop()
             aliveTbl = countCompleteByBp(self.stagingPlatoon:GetPlatoonUnits() or {}, self.tag)
         end
 
-        -- collect untagged roll-offs ONLY if needed
+        -- collect untagged roll-offs ONLY if needed (skip units owned by BaseEngineer)
         for _, u in ipairs(nearby) do
             if not self.stagingPlatoon then break end
-            if u and not u.Dead and not u.ub_tag and u:GetAIBrain() == self.brain then
+            if u and not u.Dead and not u.ub_tag and not u.be_tag and u:GetAIBrain() == self.brain then
                 local bp   = unitBpId(u)
                 local want = self.wanted[bp]
                 local have = aliveTbl[bp] or 0
@@ -1644,19 +1644,42 @@ function Builder:RunCleanup()
     self:_HandOffPlatoon(idle, label)
 end
 
+-- Returns true when the target base (from attackData.BaseTag) has no live factories
+-- AND no live engineers — i.e. it needs a new delivery.  Returns true when no base
+-- tag is configured so non-BaseBuild use-cases are unaffected.
+function Builder:_TargetBaseNeedsBuild()
+    local ad  = self.params and self.params.attackData
+    local tag = ad and ad.BaseTag
+    if not tag then return true end
+    local bh = BaseManager and BaseManager.GetBase(tag)
+    if not bh then return true end
+    local em = bh.GetEngineerHandle and bh:GetEngineerHandle()
+    if not em then return true end
+    local factories = em:_FactoriesList()
+    if not factories[1] then return true end   -- no factories
+    local engineers = em:_GetLiveEngineers()
+    return not engineers[1]                    -- no engineers
+end
+
 function Builder:WaitForMode2Gate(p)
     local thr = math.max(0, math.min(1, self.params.mode2LossThreshold or 0.5))
     local wantTotal = sumCounts(self.wanted)
     while not self.stopped do
         if not p or not self.brain:PlatoonExists(p) then
-            return
+            break
         end
         local alive = 0
         for _, u in ipairs(p:GetPlatoonUnits() or {}) do if isComplete(u) then alive = alive + 1 end end
         local lost = math.max(0, wantTotal - alive)
         local frac = (wantTotal > 0) and (lost / wantTotal) or 1
-        if frac >= thr then return end
+        if frac >= thr then break end
         WaitSeconds(2)
+    end
+    -- For BaseBuild-style use: also wait until the target base actually needs
+    -- new engineers (no factories OR no engineers alive there).
+    while not self.stopped do
+        if self:_TargetBaseNeedsBuild() then return end
+        WaitSeconds(10)
     end
 end
 
@@ -1725,7 +1748,7 @@ function Builder:_CollectFromMaster(platoon, haveTbl)
         local tookThisPass = 0
         for _, u in ipairs(list) do
             if u and not u.Dead and isComplete(u) and u:GetAIBrain() == self.brain then
-                if not u.ub_tag then
+                if not u.ub_tag and not u.be_tag then
                     local bp = unitBpId(u)
                     local want = self.wanted[bp]
                     local have = haveTbl[bp] or 0
@@ -1813,7 +1836,7 @@ function Builder:CollectForPlatoon(platoon)
     -- Attach matching units that are unowned or already ours (tag matches)
     for _, u in ipairs(nearby) do
         if u and not u.Dead and isComplete(u) and u:GetAIBrain() == self.brain then
-            local allowed = (not u.ub_tag) or (u.ub_tag == self.tag)
+            local allowed = ((not u.ub_tag) and (not u.be_tag)) or (u.ub_tag == self.tag)
             if allowed then
                 local bp   = unitBpId(u)
                 local want = self.wanted[bp]
