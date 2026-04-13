@@ -1355,6 +1355,21 @@ local function FindGroupNode(node, targetName)
     return nil
 end
 
+local function CollectGroupEntries(node, out)
+    if not (node and node.Units) then
+        return
+    end
+    for _, child in pairs(node.Units) do
+        if type(child) == 'table' then
+            if child.type and child.Position then
+                table.insert(out, { bp = child.type, pos = child.Position })
+            elseif child.Units then
+                CollectGroupEntries(child, out)
+            end
+        end
+    end
+end
+
 local function GetGroupUnits(armyName, groupName)
     if not Scenario or not Scenario.Armies then
         return {}
@@ -1372,11 +1387,7 @@ local function GetGroupUnits(armyName, groupName)
         return {}
     end
     local out = {}
-    for _, unitData in pairs(group.Units) do
-        if unitData.type and unitData.Position then
-            table.insert(out, { bp = unitData.type, pos = unitData.Position })
-        end
-    end
+    CollectGroupEntries(group, out)
     return out
 end
 
@@ -1427,6 +1438,16 @@ local function StructureTier(bp)
     return 1
 end
 
+local function EngineerUnits(units)
+    local out = {}
+    for _, u in ipairs(units or {}) do
+        if IsAlive(u) and EntityCategoryContains(categories.ENGINEER, u) then
+            table.insert(out, u)
+        end
+    end
+    return out
+end
+
 local function BuildMissingStructures(brain, engineers, groupEntries, debugOn)
     -- Only collect entries where the position is completely empty.
     -- Positions that already have any structure (even a lower-tier one) are
@@ -1445,6 +1466,7 @@ local function BuildMissingStructures(brain, engineers, groupEntries, debugOn)
 
     local numEng     = table.getn(engineers)
     local numMissing = table.getn(missing)
+    if numEng < 1 then return 0 end
 
     -- Cache each engineer's tier once
     local engTier = {}
@@ -1510,20 +1532,11 @@ local function WaitForEngineers(platoon, timeoutSecs)
     timeoutSecs    = timeoutSecs or 120
     while PlatoonAlive(platoon) and elapsed < timeoutSecs do
         local busy = false
-        for _, unit in ipairs(PlatoonUnits(platoon)) do
-            if IsAlive(unit) then
-                -- Engineers in a persistent guard/assist are ignored; only
-                -- engineers with real work (build, move-to-site, etc.) count.
-                local ok, guarding = pcall(function()
-                    return unit:IsUnitState('Guarding')
-                end)
-                if not (ok and guarding) then
-                    local cmds = unit:GetCommandQueue()
-                    if cmds and table.getn(cmds) > 0 then
-                        busy = true
-                        break
-                    end
-                end
+        for _, unit in ipairs(EngineerUnits(PlatoonUnits(platoon))) do
+            local cmds = unit:GetCommandQueue()
+            if cmds and table.getn(cmds) > 0 then
+                busy = true
+                break
             end
         end
         if not busy then return end
@@ -1604,6 +1617,7 @@ local function IssueUpgradesAndAssist(brain, engineers, groupEntries, debugOn)
     -- Assign engineers round-robin across upgrading structures to assist
     local numEng = table.getn(engineers)
     local numTgt = table.getn(targets)
+    if numEng < 1 then return numTgt end
     for i = 1, numEng do
         local tgt = targets[Mod(i - 1, numTgt) + 1]
         IssueGuard({engineers[i]}, tgt)
@@ -1701,8 +1715,7 @@ function Firebase(platoon, data)
             while PlatoonAlive(platoon) and not AllStructuresComplete(brain, groupEntries) do
 
                 -- Phase 1: build any empty positions that need a structure
-                IssueClearCommands(PlatoonUnits(platoon))
-                local engineers = PlatoonUnits(platoon)
+                local engineers = EngineerUnits(PlatoonUnits(platoon))
                 local issued = BuildMissingStructures(brain, engineers, groupEntries, data.Debug)
                 if issued > 0 then
                     DLog(data.Debug, 'Firebase', 'issued ' .. issued .. ' build orders; waiting')
@@ -1712,8 +1725,7 @@ function Firebase(platoon, data)
                 if not PlatoonAlive(platoon) then break end
 
                 -- Phase 2: upgrade any structures below their target tier
-                IssueClearCommands(PlatoonUnits(platoon))
-                engineers = PlatoonUnits(platoon)
+                engineers = EngineerUnits(PlatoonUnits(platoon))
                 local upgrades = IssueUpgradesAndAssist(brain, engineers, groupEntries, data.Debug)
                 if upgrades > 0 then
                     DLog(data.Debug, 'Firebase', 'issued ' .. upgrades .. ' upgrade orders; waiting')
@@ -1721,7 +1733,6 @@ function Firebase(platoon, data)
                 end
 
                 if not PlatoonAlive(platoon) then break end
-                IssueClearCommands(PlatoonUnits(platoon))
                 WaitSeconds(2)
             end
 
