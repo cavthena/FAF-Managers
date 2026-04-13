@@ -984,7 +984,7 @@ function Builder:EarlyHandoff(aliveList)
         self:WaitForMode2Gate(attackPlatoon)
     end
 
-        WaitSeconds(math.max(0, self.params.waveCooldown or 0))
+        self:WaitForWaveCooldownAndRecheck()
     self:RunCleanup()
 
     if not self.stopped then
@@ -1155,7 +1155,7 @@ function Builder:Start()
                     self:WaitForMode2Gate(p)
                 end
                 if self.stopped then return end
-                WaitSeconds(math.max(0, self.params.waveCooldown or 0))
+                self:WaitForWaveCooldownAndRecheck()
                 self:RunCleanup()
                 if not self.stopped then
                     self:BeginWaveLoop()
@@ -1477,7 +1477,7 @@ function Builder:MonitorLoop()
                     self:WaitForMode2Gate(attackPlatoon)
                 end
 
-                WaitSeconds(math.max(0, self.params.waveCooldown or 0))
+                self:WaitForWaveCooldownAndRecheck()
                 self:RunCleanup()
                 if not self.stopped then
                     self:_EndWaveThreads()
@@ -1708,6 +1708,18 @@ function Builder:WaitForMode2Gate(p)
     -- new engineers (no factories OR no engineers alive there).
     while not self.stopped do
         if self:_TargetBaseNeedsBuild() then return end
+        WaitSeconds(10)
+    end
+end
+
+function Builder:WaitForWaveCooldownAndRecheck()
+    local cooldown = math.max(0, self.params.waveCooldown or 0)
+    if cooldown > 0 then
+        WaitSeconds(cooldown)
+    end
+    while not self.stopped do
+        if self:_TargetBaseNeedsBuild() then return end
+        self:Dbg('WaitForWaveCooldownAndRecheck: target base does not need engineers yet; deferring wave start')
         WaitSeconds(10)
     end
 end

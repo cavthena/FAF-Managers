@@ -807,6 +807,20 @@ function Spawner:_TargetBaseNeedsBuild()
     return true
 end
 
+function Spawner:WaitForWaveCooldownAndRecheck()
+    local cooldown = math.max(0, self.params.waveCooldown or 0)
+    if cooldown > 0 then
+        WaitSeconds(cooldown)
+    end
+    while not self.stopped do
+        if self:_TargetBaseNeedsBuild() then
+            return
+        end
+        self:Debug('WaitForWaveCooldownAndRecheck: target base does not need engineers yet; deferring spawn')
+        WaitSeconds(10)
+    end
+end
+
 function Spawner:RunMode1()
     while not self.stopped do
         while not self.stopped do
@@ -825,7 +839,7 @@ function Spawner:RunMode1()
             self:Stop()
             break
         end
-        WaitSeconds(math.max(0, self.params.waveCooldown or 0))
+        self:WaitForWaveCooldownAndRecheck()
     end
 end
 
@@ -849,7 +863,7 @@ function Spawner:RunMode2()
         if self.stopped then break end
         self:WaitForLossGate(platoon, units, unitCount)
         if self.stopped then break end
-        WaitSeconds(math.max(0, self.params.waveCooldown or 0))
+        self:WaitForWaveCooldownAndRecheck()
     end
 end
 
