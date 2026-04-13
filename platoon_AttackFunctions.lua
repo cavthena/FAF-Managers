@@ -1430,12 +1430,24 @@ local function EngineerTier(u)
 end
 
 -- Infers the required build tier from a structure blueprint ID.
--- Standard FAF IDs embed the tier as the 3rd character: ue1xxx=T1, ur2xxx=T2, xa3xxx=T3.
+-- FAF structure IDs are typically like "ueb1101"/"urb0201"; the tier is the
+-- 5th character (1/2/3).
 local function StructureTier(bp)
-    local c = string.sub(bp, 3, 3)
+    local c = string.sub(string.lower(bp or ''), 5, 5)
     if c == '3' then return 3 end
     if c == '2' then return 2 end
     return 1
+end
+
+-- Firebase special-case:
+-- If the target is a T2 land factory (e.g. urb0201), build its T1 base first,
+-- then let upgrade logic raise it to the target.
+local function InitialBuildBlueprint(targetBp)
+    local bp = string.lower(targetBp or '')
+    if string.find(bp, '0201$', 1, false) then
+        return string.gsub(bp, '0201$', '0101')
+    end
+    return bp
 end
 
 local function EngineerUnits(units)
@@ -1456,8 +1468,9 @@ local function BuildMissingStructures(brain, engineers, groupEntries, debugOn)
     for _, entry in ipairs(groupEntries) do
         if not StructureExistsAt(brain, entry.pos, entry.bp, 2) then
             if not AnyStructureAt(brain, entry.pos, 2) then
-                DLog(debugOn, 'Firebase', 'build missing ' .. tostring(entry.bp))
-                table.insert(missing, entry)
+                local buildBp = InitialBuildBlueprint(entry.bp)
+                DLog(debugOn, 'Firebase', 'build missing ' .. tostring(buildBp) .. ' (target ' .. tostring(entry.bp) .. ')')
+                table.insert(missing, { pos = entry.pos, bp = buildBp })
             end
         end
     end
@@ -1526,6 +1539,31 @@ local function BuildMissingStructures(brain, engineers, groupEntries, debugOn)
     return numMissing
 end
 
+local function AssistIdleEngineers(platoon)
+    local engineers = EngineerUnits(PlatoonUnits(platoon))
+    local activeBuilders = {}
+    local idleEngineers  = {}
+
+    for _, eng in ipairs(engineers) do
+        local cmds = eng:GetCommandQueue()
+        local queued = cmds and table.getn(cmds) > 0
+        local ok, isBuilding = pcall(function() return eng:IsUnitState('Building') end)
+        if (ok and isBuilding) or queued then
+            table.insert(activeBuilders, eng)
+        else
+            table.insert(idleEngineers, eng)
+        end
+    end
+
+    if table.getn(activeBuilders) < 1 then return end
+
+    local numBuilders = table.getn(activeBuilders)
+    for i = 1, table.getn(idleEngineers) do
+        local target = activeBuilders[Mod(i - 1, numBuilders) + 1]
+        IssueGuard({idleEngineers[i]}, target)
+    end
+end
+
 local function WaitForEngineers(platoon, timeoutSecs)
     local elapsed  = 0
     local interval = 2
@@ -1540,6 +1578,7 @@ local function WaitForEngineers(platoon, timeoutSecs)
             end
         end
         if not busy then return end
+        AssistIdleEngineers(platoon)
         WaitSeconds(interval)
         elapsed = elapsed + interval
     end
