@@ -62,7 +62,7 @@ function OnStart(scenario)
     end, 10)
 
     ScenarioFramework.CreateTimerTrigger(function()
-        CybranBuild_Main()
+        --CybranBuild_Main()
     end, 15)
 end
 
@@ -92,12 +92,15 @@ function CybranSpawn_NW()
         brain = ArmyBrains[ScenarioInfo.Cybran],
         spawnMarker = 'Spawn_TopWest',
         composition = {
-            {'url0106', 3},
+            {'url0208', 3},
+            {'url0105', 3},
         },
-        attackFn = plaAtk.WaveAttack,
+        attackFn = plaAtk.Firebase,
         attackData = {
-            Type = 'Closest',
-            Formation = 'NoFormation',
+            Markers = {
+                {'CybranOutpost',  'ExpandBase'},
+                {'CybranFirebase', 'Firebase'},
+            },
             Debug = true,
         },
         waveCooldown = 5,
@@ -115,7 +118,8 @@ function CybranBuild_Main()
         baseMarker = 'CybranBase',
         domain = 'LAND',
         composition = {
-            {'url0107', 4},
+            {'url0208', 3},
+            {'url0105', 3},
         },
         baseHandle = ScenarioInfo.CBEngi,
         wantFactories = 2,
@@ -123,16 +127,18 @@ function CybranBuild_Main()
         radius = 26,
         rallyMarker = 'CybranBase_Rally2',
         waveCooldown = 5,
-        attackFn = plaAtk.WaveAttack,
+        SpawnFirstPlatoonAtRally = true,
+        attackFn = plaAtk.Firebase,
         attackData = {
-            Type = 'Value',
-            Formation = 'AttackFormation',
-            AggressiveMove = true,
-            Debug = true,
+            Markers = {
+                {'CybranOutpost',  'ExpandBase'},
+                {'CybranFirebase', 'Firebase'},
+            },
+            Debug = false,
         },
         builderTag = 'CybranBuildAtk',
         mode = 2,
         mode2LossThreshold = 1,
-        debug = true,
+        debug = false,
     })
 end

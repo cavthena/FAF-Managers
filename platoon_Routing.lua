@@ -109,6 +109,166 @@ local function GetNavLayer(domain)
     return 'Land'
 end
 
+-- Sample (steps+1) evenly-spaced points along the segment fromPos→toPos.
+-- Returns false as soon as an impassable point is found.
+--   AIR / AMPHIBIOUS : always returns true.
+-- Primary check  : NavUtils.GetLabel on the domain navmesh layer.
+--   A label of -1 means the point is off the navmesh (blocked terrain OR
+--   water), so this catches cliffs and steep slopes as well as water.
+-- Fallback check : height-based water detection when NavUtils is unavailable.
+--   LAND  — fails on water (surfaceH > terrainH + 0.5).
+--   NAVAL — fails on non-water.
+local function SegmentIsPassable(fromPos, toPos, domain, steps)
+    domain = string.upper(domain or 'LAND')
+
+    if domain == 'AIR' or domain == 'AMPHIBIOUS' then
+        return true
+    end
+
+    steps = steps or 8
+    local navLayer     = GetNavLayer(domain)
+    local useNavLabel  = NavUtils and NavUtils.GetLabel
+
+    local x1 = fromPos[1]
+    local z1 = fromPos[3]
+    local x2 = toPos[1]
+    local z2 = toPos[3]
+
+    for i = 0, steps do
+        local t  = i / steps
+        local sx = x1 + (x2 - x1) * t
+        local sz = z1 + (z2 - z1) * t
+        local sy = GetSurfaceHeight(sx, sz)
+
+        if useNavLabel then
+            -- NavMesh check: label == -1 means off-navmesh (blocked terrain or water).
+            local ok, label = pcall(NavUtils.GetLabel, navLayer, { sx, sy, sz })
+            if ok and label == -1 then
+                return false
+            end
+        else
+            -- Fallback: height-based water detection only.
+            local terrainH = GetTerrainHeight(sx, sz)
+            local overWater = sy > terrainH + 0.5
+
+            if domain == 'LAND' and overWater then
+                return false
+            elseif domain == 'NAVAL' and not overWater then
+                return false
+            end
+        end
+    end
+
+    return true
+end
+
+-- Returns the perpendicular unit vector (px, pz) for the direction fromPos→toPos.
+-- Used to offset a midpoint sideways when trying to clear a blocked segment.
+local function SegmentPerp(fromPos, toPos)
+    local dx = toPos[1] - fromPos[1]
+    local dz = toPos[3] - fromPos[3]
+    local len = math.sqrt(dx * dx + dz * dz)
+    if len < 0.01 then
+        return 1, 0
+    end
+    return -dz / len, dx / len
+end
+
+-- Try increasing perpendicular offsets from the midpoint of fromPos→toPos until
+-- a candidate M' is found where both fromPos→M' and M'→toPos are passable.
+--   clearance   : game-unit step size per attempt.
+--   maxAttempts : number of offset multiples to try in each direction.
+-- Returns a {x,y,z} position table, or nil if no clear point is found.
+local function FindClearMidpoint(fromPos, toPos, domain, clearance, maxAttempts)
+    local mx = (fromPos[1] + toPos[1]) * 0.5
+    local mz = (fromPos[3] + toPos[3]) * 0.5
+    local px, pz = SegmentPerp(fromPos, toPos)
+
+    for attempt = 1, maxAttempts do
+        local offset = clearance * attempt
+        for _, sign in ipairs({ 1, -1 }) do
+            local cx = mx + px * offset * sign
+            local cz = mz + pz * offset * sign
+            local candidate = { cx, GetSurfaceHeight(cx, cz), cz }
+            if SegmentIsPassable(fromPos, candidate, domain)
+                and SegmentIsPassable(candidate, toPos, domain)
+            then
+                return candidate
+            end
+        end
+    end
+
+    return nil
+end
+
+-- Recursively resolve the segment fromPos→toPos into passable sub-segments,
+-- inserting clearance waypoints as needed.
+--   clearance / maxAttempts : passed to FindClearMidpoint.
+--   depth / maxDepth        : recursion guard.
+-- Results (excluding fromPos) are appended to `out`; toPos is always appended
+-- as the terminal point of this call so the original destination is preserved.
+local function ClearSegmentInto(fromPos, toPos, domain, clearance, maxAttempts, depth, maxDepth, out)
+    -- Segment already passable: nothing to do.
+    if SegmentIsPassable(fromPos, toPos, domain) then
+        table.insert(out, toPos)
+        return
+    end
+
+    -- Recursion limit reached: accept the endpoint as-is.
+    if depth >= maxDepth then
+        table.insert(out, toPos)
+        return
+    end
+
+    -- Try to resolve the whole blocked segment with a single offset waypoint.
+    local mid = FindClearMidpoint(fromPos, toPos, domain, clearance, maxAttempts)
+    if mid then
+        ClearSegmentInto(fromPos, mid,  domain, clearance, maxAttempts, depth + 1, maxDepth, out)
+        ClearSegmentInto(mid,   toPos,  domain, clearance, maxAttempts, depth + 1, maxDepth, out)
+        return
+    end
+
+    -- Single waypoint not enough; bisect the segment and recurse on both halves.
+    local bx = (fromPos[1] + toPos[1]) * 0.5
+    local bz = (fromPos[3] + toPos[3]) * 0.5
+    local bisect = { bx, GetSurfaceHeight(bx, bz), bz }
+
+    ClearSegmentInto(fromPos, bisect, domain, clearance, maxAttempts, depth + 1, maxDepth, out)
+    ClearSegmentInto(bisect,  toPos,  domain, clearance, maxAttempts, depth + 1, maxDepth, out)
+end
+
+-- Build a safe route from a list of positions, inserting clearance waypoints
+-- to route around blocked terrain or water wherever a direct segment fails.
+-- The first position is always kept unchanged.
+--   steps       : sample resolution passed to SegmentIsPassable (default 8).
+--   clearance   : perpendicular offset step in game units (default 12).
+--   maxAttempts : perpendicular attempts per side before bisecting (default 10).
+--   maxDepth    : recursion depth limit for ClearSegmentInto (default 4).
+local function BuildSafeRoute(positions, domain, steps)
+    if not positions or table.getn(positions) < 1 then
+        return positions
+    end
+
+    local clearance   = 12
+    local maxAttempts = 10
+    local maxDepth    = 4
+
+    local out  = { positions[1] }
+    local prev = positions[1]
+
+    for i = 2, table.getn(positions) do
+        local curr = positions[i]
+        if SegmentIsPassable(prev, curr, domain, steps) then
+            table.insert(out, curr)
+        else
+            ClearSegmentInto(prev, curr, domain, clearance, maxAttempts, 0, maxDepth, out)
+        end
+        prev = out[table.getn(out)]
+    end
+
+    return out
+end
+
 -- Issues a single movement command.  Formation takes priority over plain
 -- move/aggressive-move so only one command is queued per waypoint.
 local function IssueMovement(units, destination, aggressive, formation)
@@ -205,6 +365,20 @@ local function MovePlatoonTo(platoon, destination, options)
     return true
 end
 
+-- Issue a move-along-route command sequence (queued, no stop between waypoints).
+local function MoveAlongRoute(platoon, waypoints, options)
+    local n = table.getn(waypoints)
+    if n < 1 then return end
+    local units = PlatoonUnits(platoon)
+    if table.getn(units) < 1 then return end
+    local aggressive = options and options.AggressiveMove and true or false
+    local formation  = (options and options.Formation) or 'NoFormation'
+    IssueClearCommands(units)
+    for i = 1, n do
+        IssueMovement(units, waypoints[i], aggressive, formation)
+    end
+end
+
 local function AttackMoveToTarget(platoon, targetUnit, options)
     options = options or {}
     if not IsAlive(targetUnit) then
@@ -221,13 +395,18 @@ local function AttackMoveToTarget(platoon, targetUnit, options)
         return false
     end
 
-    IssueClearCommands(units)
-    IssueMovement(
-        units,
-        targetPos,
-        options.AggressiveMove and true or false,
-        options.Formation or 'NoFormation'
-    )
+    -- Build a routed path so the platoon navigates around terrain/water corners
+    -- instead of relying solely on the engine pathfinder for the straight line.
+    local domain = options.Domain or GetDomain(platoon)
+    local start  = GetPlatoonCenter(platoon)
+    local route
+    if start then
+        route = BuildSafeRoute({ start, targetPos }, domain)
+    else
+        route = { targetPos }
+    end
+
+    MoveAlongRoute(platoon, route, options)
     IssueAttack(units, targetUnit)
     return true
 end
@@ -292,6 +471,8 @@ end
 return {
     GetDomain                 = GetDomain,
     GetPosition               = GetPosition,
+    SegmentIsPassable         = SegmentIsPassable,
+    BuildSafeRoute            = BuildSafeRoute,
     CanReachPosition          = CanReachPosition,
     CanUnitDomainAttackTarget = CanUnitDomainAttackTarget,
     MovePlatoonTo             = MovePlatoonTo,
