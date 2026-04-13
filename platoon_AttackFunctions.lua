@@ -163,11 +163,20 @@ Example
  Attack: Firebase(platoon, data)
 ================================================================================
 Description
-    Engineer patrol that constructs and upgrades forward firebases in order.
-    For each entry in Markers the engineers move to the named marker, build
-    every structure defined in the paired group (including upgrades), and only
-    advance to the next entry once the site is fully complete. After the last
-    entry the loop restarts from the first.
+    Engineer patrol that constructs and upgrades forward firebases.
+
+    Sequential mode (no WaitMarker): engineers visit each marker in order,
+    build every structure in the paired group (including upgrades), and only
+    advance to the next marker once the site is fully complete. After the last
+    marker the loop restarts from the first.
+
+    Wait-marker mode (WaitMarker set): engineers hold at WaitMarker until any
+    firebase is missing a structure or upgrade. They then move to that firebase
+    and complete all outstanding build and upgrade tasks. Afterwards they check
+    whether another firebase needs work and move directly to it without returning
+    to WaitMarker first. Only when all firebases are complete do they return to
+    WaitMarker. Engineers will not be rerouted while en route to a marker; they
+    must finish their current task before they can be directed to a new one.
 
 Data options
     Markers         (required)
@@ -175,8 +184,21 @@ Data options
                     the location to move to and the editor unit-group that
                     defines the structures to build/upgrade there.
 
-Example
+    WaitMarker      (optional)
+                    Marker name where the platoon holds between tasks.
+                    When provided, enables wait-marker mode (see above).
+
+Example (sequential)
     Firebase(platoon, {
+        Markers = {
+            { 'Firebase_North', 'FirebaseLayout_T1' },
+            { 'Firebase_East',  'FirebaseWalls'     },
+        },
+    })
+
+Example (wait-marker)
+    Firebase(platoon, {
+        WaitMarker = 'Engineer_Hold',
         Markers = {
             { 'Firebase_North', 'FirebaseLayout_T1' },
             { 'Firebase_East',  'FirebaseWalls'     },
@@ -1429,25 +1451,61 @@ local function EngineerTier(u)
     return 1
 end
 
--- Infers the required build tier from a structure blueprint ID.
--- FAF structure IDs are typically like "ueb1101"/"urb0201"; the tier is the
--- 5th character (1/2/3).
+-- Returns the required build tier (1/2/3) for a structure blueprint.
+-- Prefer blueprint categories because IDs like "urb2303" are TECH2 even though
+-- the 5th character is "3". Falls back to the ID heuristic if blueprint data
+-- is unavailable.
 local function StructureTier(bp)
-    local c = string.sub(string.lower(bp or ''), 5, 5)
+    local id = string.lower(bp or '')
+    local data = __blueprints and (__blueprints[id] or __blueprints[bp or ''])
+
+    local catHash = data and data.CategoriesHash
+    if catHash then
+        if catHash.TECH3 then return 3 end
+        if catHash.TECH2 then return 2 end
+        if catHash.TECH1 then return 1 end
+    end
+
+    local cats = data and data.Categories
+    if cats then
+        for _, cat in ipairs(cats) do
+            local c = string.upper(cat or '')
+            if c == 'TECH3' then return 3 end
+            if c == 'TECH2' then return 2 end
+            if c == 'TECH1' then return 1 end
+        end
+    end
+
+    local c = string.sub(id, 5, 5)
     if c == '3' then return 3 end
     if c == '2' then return 2 end
     return 1
 end
 
--- Firebase special-case:
--- If the target is a T2 land factory (e.g. urb0201), build its T1 base first,
--- then let upgrade logic raise it to the target.
+-- Walk the UpgradesFrom chain in __blueprints backwards from targetBp until a
+-- unit with no predecessor is found -- that is the base buildable blueprint.
+-- Example: urb4205 (T3 Shield) -> urb4204 -> urb4202; returns 'urb4202'.
+-- Example: urb0301 (T3 Factory) -> urb0201 -> urb0101; returns 'urb0101'.
+-- Falls back to targetBp unchanged when blueprint data is unavailable.
 local function InitialBuildBlueprint(targetBp)
     local bp = string.lower(targetBp or '')
-    if string.find(bp, '0201$', 1, false) then
-        return string.gsub(bp, '0201$', '0101')
+    if not __blueprints then return bp end
+
+    local current = bp
+    local seen    = { [current] = true }
+    while true do
+        local data = __blueprints[current]
+        local from = data and data.General and data.General.UpgradesFrom
+        if not (type(from) == 'string' and from ~= '' and string.lower(from) ~= 'none') then
+            break
+        end
+        local prev = string.lower(from)
+        if seen[prev] then break end  -- cycle guard
+        seen[prev] = true
+        current    = prev
     end
-    return bp
+
+    return current
 end
 
 local function EngineerUnits(units)
@@ -1566,7 +1624,7 @@ end
 
 local function WaitForEngineers(platoon, timeoutSecs)
     local elapsed  = 0
-    local interval = 2
+    local interval = 1
     timeoutSecs    = timeoutSecs or 120
     while PlatoonAlive(platoon) and elapsed < timeoutSecs do
         local busy = false
@@ -1668,7 +1726,7 @@ end
 -- Waits until no structure near any group-entry position is in the Upgrading state.
 local function WaitForStructureUpgrades(brain, platoon, groupEntries, timeoutSecs)
     local elapsed  = 0
-    local interval = 3
+    local interval = 1
     timeoutSecs    = timeoutSecs or 180
     while PlatoonAlive(platoon) and elapsed < timeoutSecs do
         local busy = false
@@ -1684,6 +1742,29 @@ local function WaitForStructureUpgrades(brain, platoon, groupEntries, timeoutSec
                 end
             end
             if busy then break end
+        end
+        if not busy then return end
+        WaitSeconds(interval)
+        elapsed = elapsed + interval
+    end
+end
+
+-- Waits until every unit in the platoon has an empty command queue (arrived/idle).
+-- Used to block new orders until the platoon finishes its current move.
+local function WaitForPlatoonIdle(platoon, timeoutSecs)
+    local elapsed  = 0
+    local interval = 2
+    timeoutSecs    = timeoutSecs or 60
+    while PlatoonAlive(platoon) and elapsed < timeoutSecs do
+        local busy = false
+        for _, unit in ipairs(PlatoonUnits(platoon)) do
+            if IsAlive(unit) then
+                local cmds = unit:GetCommandQueue()
+                if cmds and table.getn(cmds) > 0 then
+                    busy = true
+                    break
+                end
+            end
         end
         if not busy then return end
         WaitSeconds(interval)
@@ -1718,6 +1799,45 @@ local function AllStructuresComplete(brain, groupEntries)
     return true
 end
 
+-- Runs one full build-then-upgrade cycle for a firebase site.
+-- Upgrade tiers are chained in an inner loop so there is no fixed wait between
+-- consecutive tiers -- only the 1-second poll interval separates them.
+-- A 2-second guard fires only when neither phase found any work to do, which
+-- handles the edge case of a structure still mid-construction by another unit.
+local function FirebaseBuildCycle(brain, platoon, groupEntries, debugOn)
+    while PlatoonAlive(platoon) and not AllStructuresComplete(brain, groupEntries) do
+
+        -- Phase 1: build any empty positions that need a structure.
+        local engineers = EngineerUnits(PlatoonUnits(platoon))
+        local issued = BuildMissingStructures(brain, engineers, groupEntries, debugOn)
+        if issued > 0 then
+            DLog(debugOn, 'Firebase', 'issued ' .. issued .. ' build orders; waiting')
+            WaitForEngineers(platoon, 120)
+        end
+
+        if not PlatoonAlive(platoon) then break end
+
+        -- Phase 2: chain all pending upgrade tiers without going back to the
+        -- outer loop between each tier.
+        engineers = EngineerUnits(PlatoonUnits(platoon))
+        local upgrades = IssueUpgradesAndAssist(brain, engineers, groupEntries, debugOn)
+        while PlatoonAlive(platoon) and upgrades > 0 do
+            DLog(debugOn, 'Firebase', 'issued ' .. upgrades .. ' upgrade orders; waiting')
+            WaitForStructureUpgrades(brain, platoon, groupEntries, 180)
+            if not PlatoonAlive(platoon) then break end
+            engineers = EngineerUnits(PlatoonUnits(platoon))
+            upgrades = IssueUpgradesAndAssist(brain, engineers, groupEntries, debugOn)
+        end
+
+        if not PlatoonAlive(platoon) then break end
+
+        -- Only pause when neither phase issued any orders.
+        if issued == 0 and upgrades == 0 then
+            WaitSeconds(2)
+        end
+    end
+end
+
 function Firebase(platoon, data)
     data = NormalizeData(data)
     data.Markers = data.Markers or {}
@@ -1731,54 +1851,108 @@ function Firebase(platoon, data)
     local brain    = platoon:GetBrain()
     local armyName = GetArmyName(brain)
 
-    while PlatoonAlive(platoon) do
-        for _, entry in ipairs(data.Markers) do
-            if not PlatoonAlive(platoon) then break end
+    -- Pre-resolve all group entries so GetGroupUnits is not called every loop tick.
+    local markerGroups = {}
+    for _, entry in ipairs(data.Markers) do
+        table.insert(markerGroups, {
+            markerName   = entry[1],
+            groupName    = entry[2],
+            groupEntries = GetGroupUnits(armyName, entry[2]),
+        })
+    end
 
-            local markerName   = entry[1]
-            local groupName    = entry[2]
-            local groupEntries = GetGroupUnits(armyName, groupName)
-
-            DLog(data.Debug, 'Firebase',
-                'moving to ' .. tostring(markerName) ..
-                ' (group ' .. tostring(groupName) .. ', ' ..
-                table.getn(groupEntries) .. ' entries)')
-
-            MovePlatoonTo(platoon, markerName, data)
-            WaitSeconds(2)
-
-            if not PlatoonAlive(platoon) then break end
-
-            -- Keep working until every target structure is fully built and upgraded.
-            -- Only advance to the next marker once AllStructuresComplete is true.
-            while PlatoonAlive(platoon) and not AllStructuresComplete(brain, groupEntries) do
-
-                -- Phase 1: build any empty positions that need a structure
-                local engineers = EngineerUnits(PlatoonUnits(platoon))
-                local issued = BuildMissingStructures(brain, engineers, groupEntries, data.Debug)
-                if issued > 0 then
-                    DLog(data.Debug, 'Firebase', 'issued ' .. issued .. ' build orders; waiting')
-                    WaitForEngineers(platoon, 120)
-                end
-
+    -- -------------------------------------------------------------------------
+    -- Sequential mode (no WaitMarker): visit each marker in order.
+    -- -------------------------------------------------------------------------
+    if not data.WaitMarker then
+        while PlatoonAlive(platoon) do
+            for _, mg in ipairs(markerGroups) do
                 if not PlatoonAlive(platoon) then break end
 
-                -- Phase 2: upgrade any structures below their target tier
-                engineers = EngineerUnits(PlatoonUnits(platoon))
-                local upgrades = IssueUpgradesAndAssist(brain, engineers, groupEntries, data.Debug)
-                if upgrades > 0 then
-                    DLog(data.Debug, 'Firebase', 'issued ' .. upgrades .. ' upgrade orders; waiting')
-                    WaitForStructureUpgrades(brain, platoon, groupEntries, 180)
-                end
+                DLog(data.Debug, 'Firebase',
+                    'moving to ' .. tostring(mg.markerName) ..
+                    ' (group ' .. tostring(mg.groupName) .. ', ' ..
+                    table.getn(mg.groupEntries) .. ' entries)')
 
-                if not PlatoonAlive(platoon) then break end
+                MovePlatoonTo(platoon, mg.markerName, data)
                 WaitSeconds(2)
-            end
 
-            if PlatoonAlive(platoon) then
-                DLog(data.Debug, 'Firebase', 'site complete; advancing from ' .. tostring(markerName))
+                if not PlatoonAlive(platoon) then break end
+
+                -- Keep working until every target structure is fully built and upgraded.
+                -- Only advance to the next marker once AllStructuresComplete is true.
+                FirebaseBuildCycle(brain, platoon, mg.groupEntries, data.Debug)
+
+                if PlatoonAlive(platoon) then
+                    DLog(data.Debug, 'Firebase', 'site complete; advancing from ' .. tostring(mg.markerName))
+                end
             end
         end
+        return
+    end
+
+    -- -------------------------------------------------------------------------
+    -- Wait-marker mode: hold at WaitMarker; react to firebases that need work.
+    -- After finishing one firebase the platoon moves directly to the next needy
+    -- one without returning to WaitMarker first. It only returns to WaitMarker
+    -- once all firebases are complete.
+    -- The platoon will not be rerouted while en route to a marker, and must
+    -- finish its current task before it can be directed to a new one.
+    -- -------------------------------------------------------------------------
+    while PlatoonAlive(platoon) do
+
+        -- Step 1: move to the wait marker and block until the platoon arrives.
+        DLog(data.Debug, 'Firebase', 'moving to WaitMarker: ' .. tostring(data.WaitMarker))
+        MovePlatoonTo(platoon, data.WaitMarker, data)
+        WaitForPlatoonIdle(platoon, 60)
+
+        if not PlatoonAlive(platoon) then break end
+
+        -- Step 2: poll all firebases until one is missing a structure or upgrade.
+        local needy = nil
+        while PlatoonAlive(platoon) and not needy do
+            for _, mg in ipairs(markerGroups) do
+                if not AllStructuresComplete(brain, mg.groupEntries) then
+                    needy = mg
+                    break
+                end
+            end
+            if not needy then
+                DLog(data.Debug, 'Firebase', 'all firebases complete; holding at WaitMarker')
+                WaitSeconds(10)
+            end
+        end
+
+        if not PlatoonAlive(platoon) then break end
+
+        -- Step 3: service firebases one by one without returning to WaitMarker.
+        -- After each task, immediately check whether another firebase needs work.
+        while PlatoonAlive(platoon) and needy do
+
+            -- Move to the needy firebase; no rerouting until arrived.
+            DLog(data.Debug, 'Firebase', 'firebase needs work: ' .. tostring(needy.markerName) .. '; moving')
+            MovePlatoonTo(platoon, needy.markerName, data)
+            WaitForPlatoonIdle(platoon, 60)
+
+            if not PlatoonAlive(platoon) then break end
+
+            -- Complete all build and upgrade tasks before moving on.
+            FirebaseBuildCycle(brain, platoon, needy.groupEntries, data.Debug)
+
+            DLog(data.Debug, 'Firebase', 'task complete at ' .. tostring(needy.markerName) .. '; checking other firebases')
+
+            -- Check immediately if another firebase needs work.
+            needy = nil
+            for _, mg in ipairs(markerGroups) do
+                if not AllStructuresComplete(brain, mg.groupEntries) then
+                    needy = mg
+                    break
+                end
+            end
+        end
+
+        -- All firebases are complete; loop back to WaitMarker.
+        DLog(data.Debug, 'Firebase', 'all firebases complete; returning to WaitMarker')
     end
 end
 
