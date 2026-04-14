@@ -765,14 +765,19 @@ local function AirCircleAt(platoon, markerPos, options)
     end
 
     local formation = options.Formation or 'NoFormation'
-    local r = options.CircleRadius or 24
+    local r = options.CircleRadius or 38
+    local points = options.CirclePoints or 12
 
     IssueClearCommands(units)
-    IssueFormMove(units, { markerPos[1] + r, markerPos[2], markerPos[3]     }, formation, 0)
-    IssueFormMove(units, { markerPos[1],     markerPos[2], markerPos[3] + r }, formation, 0)
-    IssueFormMove(units, { markerPos[1] - r, markerPos[2], markerPos[3]     }, formation, 0)
-    IssueFormMove(units, { markerPos[1],     markerPos[2], markerPos[3] - r }, formation, 0)
-    IssueFormMove(units, { markerPos[1] + r, markerPos[2], markerPos[3]     }, formation, 0)
+    for i = 0, points do
+        local t = (2 * math.pi * i) / points
+        local pt = {
+            markerPos[1] + (math.cos(t) * r),
+            markerPos[2],
+            markerPos[3] + (math.sin(t) * r),
+        }
+        IssueFormMove(units, pt, formation, 0)
+    end
 end
 
 local function WaitAtMarker(platoon, marker, options)
@@ -785,15 +790,33 @@ local function WaitAtMarker(platoon, marker, options)
     local domain  = string.upper(options.Domain or GetDomain(platoon))
     local radius  = options.ArriveRadius or 12
     local radiusSq = radius * radius
+    local now = GetGameTimeSeconds and GetGameTimeSeconds() or 0
+    local waitState = platoon.HuntAttackWaitState or {}
+    platoon.HuntAttackWaitState = waitState
+    local moveRefresh = options.WaitMoveRefresh or 10
+    local orbitRefresh = options.OrbitRefresh or 16
 
     if domain == 'AIR' then
         if not HasArrived(platoon, pos, radiusSq) then
-            MovePlatoonTo(platoon, pos, options)
-            WaitSeconds(2)
+            if not waitState.lastMoveOrder or (now - waitState.lastMoveOrder) >= moveRefresh then
+                MovePlatoonTo(platoon, pos, options)
+                waitState.lastMoveOrder = now
+            end
+            waitState.lastOrbitOrder = nil
+            WaitSeconds(1)
+        elseif not waitState.lastOrbitOrder or (now - waitState.lastOrbitOrder) >= orbitRefresh then
+            AirCircleAt(platoon, pos, options)
+            waitState.lastOrbitOrder = now
         end
-        AirCircleAt(platoon, pos, options)
     else
-        MovePlatoonTo(platoon, pos, options)
+        if not HasArrived(platoon, pos, radiusSq) then
+            if not waitState.lastMoveOrder or (now - waitState.lastMoveOrder) >= moveRefresh then
+                MovePlatoonTo(platoon, pos, options)
+                waitState.lastMoveOrder = now
+            end
+        else
+            waitState.lastMoveOrder = nil
+        end
     end
 
     return true
