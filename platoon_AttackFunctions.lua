@@ -236,7 +236,7 @@ if not okNav then
     NavUtils = false
 end
 
-local ok, BaseManager = pcall(import, '/maps/Platoon_Testing.v0001/manager_BaseEngineer.lua')
+local ok, BaseManager = pcall(import, '/maps/faf_coop_U01.v0001/manager_BaseEngineer.lua')
 if not ok then BaseManager = nil end
 
 local CAT = {
@@ -644,10 +644,21 @@ local function AttackMoveToTarget(platoon, targetUnit, options)
         return false
     end
 
+    local domain = options.Domain or GetDomain(platoon)
+
+    -- Air units don't need terrain routing and stutter when given intermediate
+    -- move waypoints before the attack command (the route includes the platoon's
+    -- own start position, causing a hover before flying to the target). Issue
+    -- the attack order directly so they approach and engage in one smooth pass.
+    if string.upper(domain) == 'AIR' then
+        IssueClearCommands(units)
+        IssueAttack(units, targetUnit)
+        return true
+    end
+
     -- Build a routed path so the platoon navigates around terrain/water corners
     -- instead of relying solely on the engine pathfinder for the straight line.
-    local domain = options.Domain or GetDomain(platoon)
-    local start  = GetPlatoonCenter(platoon)
+    local start = GetPlatoonCenter(platoon)
     local route
     if start then
         route = BuildSafeRoute({ start, targetPos }, domain)
@@ -757,11 +768,11 @@ local function AirCircleAt(platoon, markerPos, options)
     local r = options.CircleRadius or 24
 
     IssueClearCommands(units)
-    IssueFormMove(units, { markerPos[1] + r, markerPos[2], markerPos[3]     }, formation)
-    IssueFormMove(units, { markerPos[1],     markerPos[2], markerPos[3] + r }, formation)
-    IssueFormMove(units, { markerPos[1] - r, markerPos[2], markerPos[3]     }, formation)
-    IssueFormMove(units, { markerPos[1],     markerPos[2], markerPos[3] - r }, formation)
-    IssueFormMove(units, { markerPos[1] + r, markerPos[2], markerPos[3]     }, formation)
+    IssueFormMove(units, { markerPos[1] + r, markerPos[2], markerPos[3]     }, formation, 0)
+    IssueFormMove(units, { markerPos[1],     markerPos[2], markerPos[3] + r }, formation, 0)
+    IssueFormMove(units, { markerPos[1] - r, markerPos[2], markerPos[3]     }, formation, 0)
+    IssueFormMove(units, { markerPos[1],     markerPos[2], markerPos[3] - r }, formation, 0)
+    IssueFormMove(units, { markerPos[1] + r, markerPos[2], markerPos[3]     }, formation, 0)
 end
 
 local function WaitAtMarker(platoon, marker, options)

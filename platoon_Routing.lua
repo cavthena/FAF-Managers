@@ -273,7 +273,7 @@ end
 -- move/aggressive-move so only one command is queued per waypoint.
 local function IssueMovement(units, destination, aggressive, formation)
     if formation and formation ~= 'NoFormation' and formation ~= '' then
-        IssueFormMove(units, destination, formation)
+        IssueFormMove(units, destination, formation, 0)
     elseif aggressive then
         IssueAggressiveMove(units, destination)
     else
@@ -432,11 +432,11 @@ local function AirCircleAt(platoon, markerPos, options)
     local r = options.CircleRadius or 24
 
     IssueClearCommands(units)
-    IssueFormMove(units, { markerPos[1] + r, markerPos[2], markerPos[3]     }, formation)
-    IssueFormMove(units, { markerPos[1],     markerPos[2], markerPos[3] + r }, formation)
-    IssueFormMove(units, { markerPos[1] - r, markerPos[2], markerPos[3]     }, formation)
-    IssueFormMove(units, { markerPos[1],     markerPos[2], markerPos[3] - r }, formation)
-    IssueFormMove(units, { markerPos[1] + r, markerPos[2], markerPos[3]     }, formation)
+    IssueFormMove(units, { markerPos[1] + r, markerPos[2], markerPos[3]     }, formation, 0)
+    IssueFormMove(units, { markerPos[1],     markerPos[2], markerPos[3] + r }, formation, 0)
+    IssueFormMove(units, { markerPos[1] - r, markerPos[2], markerPos[3]     }, formation, 0)
+    IssueFormMove(units, { markerPos[1],     markerPos[2], markerPos[3] - r }, formation, 0)
+    IssueFormMove(units, { markerPos[1] + r, markerPos[2], markerPos[3]     }, formation, 0)
 end
 
 local function WaitAtMarker(platoon, marker, options)
